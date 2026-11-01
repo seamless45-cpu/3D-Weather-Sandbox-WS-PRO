@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>ATMOS//SIM — Real-time 3D Convective Atmosphere</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2302050a'/%3E%3Cpath d='M3 7h10M3 10h10' stroke='%2300ffe0' stroke-width='1.4'/%3E%3C/svg%3E" />
     <style>
       /* Critical inline styles: the page must never flash a blank white screen. */
       html, body { margin: 0; height: 100%; background: #02050a; color: #bfeeea; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
@@ -11,49 +12,100 @@
       #boot-fallback > div { max-width: 470px; border: 1px solid rgba(0, 255, 225, 0.22); background: rgba(4, 14, 24, 0.72); padding: 14px; font-size: 12px; line-height: 1.55; }
       #boot-fallback b { color: #00ffe0; }
       #boot-fallback code { color: #ffd27a; }
+      #boot-retry { margin-top: 10px; border: 1px solid rgba(0, 255, 225, 0.3); background: rgba(0, 40, 50, 0.45); color: #aef; padding: 3px 10px; font: inherit; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; }
+      #boot-retry:hover { background: rgba(0, 255, 225, 0.18); color: #fff; }
+      #boot-retry[disabled] { opacity: 0.5; cursor: default; }
+      #boot-hint { margin-top: 8px; color: rgba(140, 220, 215, 0.75); }
     </style>
   </head>
   <body>
     <div id="root"></div>
 
-    <!-- Shown only if the app never boots (opened from disk, served without Vite, or a runtime
-         failure), so the page can never be a blank screen with no explanation. -->
+    <!-- Shown only if the app never boots (server not running, opened from disk, served without
+         Vite, or a runtime failure), so the page can never be a blank screen with no explanation. -->
     <div id="boot-fallback">
       <div>
         <div><b>ATMOS//SIM COULD NOT BOOT</b></div>
         <div id="boot-reason" style="margin: 6px 0; color: #ffd27a"></div>
         <div>
-          This page needs the Vite dev server:<br />
-          <code>npm install &amp;&amp; npm run dev</code> &rarr; http://localhost:5173<br /><br />
-          Or open the prebuilt single file <code>atmos-sim-standalone.html</code> in this folder
-          (no server required; regenerate with <code>npm run build:standalone</code>).<br /><br />
-          Opening this source <code>index.html</code> from disk or from a static host cannot work:
-          browsers cannot execute <code>src/main.tsx</code> without Vite.
+          <b>If you are using the live preview:</b> the dev server is probably not running (it stops
+          when the sandbox restarts). Start it again with <code>npm install &amp;&amp; npm run dev</code>;
+          this page retries automatically every 3 s and reloads as soon as the server answers, or
+          press the button below.
         </div>
+        <div id="boot-hint">
+          <b>No server?</b> Open <code>atmos-sim-standalone.html</code> from this folder instead — it is
+          the whole app in one file and runs straight from disk (regenerate with
+          <code>npm run build:standalone</code>). Opening the source <code>index.html</code> without Vite
+          cannot work: browsers cannot execute <code>src/main.tsx</code>.
+        </div>
+        <button id="boot-retry" type="button">↻ retry</button>
+        <span id="boot-tries" style="margin-left: 8px; color: rgba(140, 220, 215, 0.6)"></span>
       </div>
     </div>
 
     <script>
       (function () {
         var shown = false;
+        var failedUrl = null;
+        var timer = null;
+        var tries = 0;
+        var MAX_TRIES = 120; // 6 minutes of automatic retrying
+
         function mounted() {
           return !!(document.querySelector('#root .hud') || document.querySelector('#root canvas'));
         }
-        function show(reason) {
+        function el(id) { return document.getElementById(id); }
+        function isHttp(u) { return /^https?:/i.test(u || ''); }
+
+        function show(reason, url) {
           if (shown || mounted()) return;
           shown = true;
-          var f = document.getElementById('boot-fallback');
-          var r = document.getElementById('boot-reason');
+          failedUrl = url || null;
+          var r = el('boot-reason');
           if (r && reason) r.textContent = String(reason).slice(0, 300);
+          var f = el('boot-fallback');
           if (f) f.style.display = 'grid';
+          if (failedUrl && isHttp(failedUrl)) startAutoRetry();
         }
+
         // Give React a beat to mount before blaming an error for the blank page.
-        function scheduleShow(reason) {
-          setTimeout(function () { show(reason); }, 1500);
+        function scheduleShow(reason, url) {
+          setTimeout(function () { show(reason, url); }, 1500);
         }
+
+        function reload(withBust) {
+          if (withBust) {
+            var u = new URL(location.href);
+            u.searchParams.set('r', String(Date.now()));
+            location.replace(u.toString());
+          } else {
+            location.reload();
+          }
+        }
+
+        // Poll the failed URL; reload the moment the server comes back.
+        function startAutoRetry() {
+          if (timer) return;
+          timer = setInterval(function () {
+            if (mounted()) { clearInterval(timer); return; }
+            if (tries++ >= MAX_TRIES) {
+              clearInterval(timer);
+              var b = el('boot-retry');
+              if (b) b.disabled = false;
+              return;
+            }
+            var t = el('boot-tries');
+            if (t) t.textContent = 'retrying… (' + tries + ')';
+            fetch(failedUrl, { method: 'HEAD', cache: 'no-store' })
+              .then(function (res) { if (res && res.ok) { clearInterval(timer); reload(true); } })
+              .catch(function () { /* still down */ });
+          }, 3000);
+        }
+
         window.addEventListener('error', function (e) {
           var t = e.target;
-          if (t && t !== window && (t.src || t.href)) scheduleShow('failed to load ' + (t.src || t.href));
+          if (t && t !== window && (t.src || t.href)) scheduleShow('failed to load ' + (t.src || t.href), t.src || t.href);
           else scheduleShow(e.message || 'script error');
         }, true);
         window.addEventListener('unhandledrejection', function (e) {
@@ -63,6 +115,11 @@
         setTimeout(function () {
           if (!mounted()) show('the app never mounted (6 s timeout)');
         }, 6000);
+
+        document.addEventListener('DOMContentLoaded', function () {
+          var b = el('boot-retry');
+          if (b) b.addEventListener('click', function () { reload(true); });
+        });
       })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
