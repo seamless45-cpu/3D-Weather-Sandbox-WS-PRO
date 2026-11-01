@@ -8,6 +8,18 @@ sounding and has to *earn* its storms: surface heating builds CAPE, convection i
 the environment allows it, and cold pools, gust fronts, hail, lightning and thunder emerge from
 the simulation rather than from scripted animation.
 
+## Live site
+
+GitHub Pages serves the prebuilt app (deployed from `main` by
+[`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml)):
+
+**https://seamless45-cpu.github.io/3D-Weather-Sandbox-WS-PRO/**
+
+GitHub Pages is a plain static host, so it cannot run `src/main.tsx`. The deployed site is the
+single-file build: the workflow publishes `atmos-sim-standalone.html` as `index.html`. When the
+source `index.html` is opened on any static host instead, it notices that Vite is absent and
+redirects itself to `atmos-sim-standalone.html` next to it.
+
 ## Quick start
 
 **Option A — dev server (recommended):**

@@ -4807,10 +4807,11 @@ void main(){
           press the button below.
         </div>
         <div id="boot-hint">
-          <b>No server?</b> Open <code>atmos-sim-standalone.html</code> from this folder instead — it is
-          the whole app in one file and runs straight from disk (regenerate with
-          <code>npm run build:standalone</code>). Opening the source <code>index.html</code> without Vite
-          cannot work: browsers cannot execute <code>src/main.tsx</code>.
+          <b>No server?</b> This page normally switches to <code>atmos-sim-standalone.html</code> by
+          itself — the whole app in one file, no server required (regenerate with
+          <code>npm run build:standalone</code>). If you are seeing this panel, that file is missing
+          next to <code>index.html</code>. Opening the source <code>index.html</code> without Vite cannot
+          work: browsers cannot execute <code>src/main.tsx</code>.
         </div>
         <button id="boot-retry" type="button">↻ retry</button>
         <span id="boot-tries" style="margin-left: 8px; color: rgba(140, 220, 215, 0.6)"></span>
@@ -4840,6 +4841,20 @@ void main(){
           var f = el('boot-fallback');
           if (f) f.style.display = 'grid';
           if (failedUrl && isHttp(failedUrl)) startAutoRetry();
+          useStandaloneBuild();
+        }
+
+        // The sources can only run under Vite (dev server). Anywhere else - GitHub Pages, a plain
+        // static host, file:// - fall through to the prebuilt single file sitting next to this page.
+        function useStandaloneBuild() {
+          var here = location.pathname || '';
+          if (/atmos-sim-standalone\.html$/.test(here)) return; // never redirect into a loop
+          var target = 'atmos-sim-standalone.html';
+          var go = function () { location.replace(target); };
+          if (location.protocol === 'file:') { go(); return; }
+          fetch(target, { method: 'HEAD', cache: 'no-store' })
+            .then(function (res) { if (res && res.ok) { var r = el('boot-reason'); if (r) r.textContent = 'starting the prebuilt single-file build…'; go(); } })
+            .catch(function () {});
         }
 
         // Give React a beat to mount before blaming an error for the blank page.
