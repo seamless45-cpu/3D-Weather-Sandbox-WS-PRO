@@ -52,6 +52,15 @@ march, then the cloud buffer, then the pixel ratio, then the step budget — and
 frames are comfortable again. The `ⓘ` panel reports tier, measured fps, pixel ratio and cloud
 scale, which is the quickest way to see what the device settled on.
 
+The cloud pass writes a second (MRT) attachment holding the scattering depth of every pixel.
+That buffer does two jobs: it reprojects the temporal history at the distance the cloud actually
+sits at (a fixed 9 km reprojection point smeared badly once a cloud came close to the camera),
+and it drives an edge-aware upsample of the reduced-resolution cloud buffer, so silhouettes stay
+crisp instead of blocky. The renderer also watches the condensate at the camera's own altitude:
+when a cloud base engulfs the viewer it skips the entry search, halves the march budget, drops
+the history blend and switches terrain/water/vegetation to a cheap shadow path — the case that
+used to cost the most frames.
+
 Diagnostics: append `?perf=low|mid|high` to force a tier and `&noadapt=1` to freeze the runtime
 degradation (useful when profiling).
 

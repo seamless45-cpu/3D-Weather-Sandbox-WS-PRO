@@ -4,6 +4,7 @@ export const COMMON = /* glsl */ `
 uniform float uTime;
 uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uSkyAmb; uniform vec3 uHorizon; uniform vec3 uGroundAmb;
 uniform float uTwilight; uniform float uDomain; uniform float uVis; uniform float uSkyScale;
+uniform float uCamCloud;   // 0 = clear air at the camera, 1 = camera inside condensate
 uniform sampler3D uCloud;
 uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
@@ -48,12 +49,12 @@ float cloudSunTrans(vec3 p){
   return exp(-(q.r * 2.6 + q.g * 1.1));
 #else
   float tau = 0.0;
-  for (int i = 0; i < 7; i++){
-    float alt = 600.0 + float(i) * 1700.0;
+  for (int i = 0; i < 5; i++){
+    float alt = 600.0 + float(i) * 1900.0;
     if (alt <= p.y) continue;
     vec3 q = p + uSunDir * ((alt - p.y) / uSunDir.y);
     vec4 s = sampleCloud(q);
-    tau += (s.r * 0.8 + s.g * 0.5) * 1700.0 * 0.016 / max(uSunDir.y, 0.15);
+    tau += (s.r * 0.8 + s.g * 0.5) * 1900.0 * 0.016 / max(uSunDir.y, 0.15);
   }
   return exp(-tau);
 #endif
@@ -65,10 +66,10 @@ float skyVisibility(vec3 p){
   return mix(0.2, 1.0, exp(-(s.r * 1.9 + s.g * 0.9)));
 #else
   float tau = 0.0;
-  for (int i = 0; i < 4; i++){
-    float alt = 1000.0 + float(i) * 3000.0;
+  for (int i = 0; i < 3; i++){
+    float alt = 1000.0 + float(i) * 3600.0;
     vec4 s = sampleCloud(vec3(p.x, alt, p.z));
-    tau += (s.r * 0.8 + s.g * 0.5) * 3000.0 * 0.0045;
+    tau += (s.r * 0.8 + s.g * 0.5) * 3600.0 * 0.0045;
   }
   return mix(0.2, 1.0, exp(-tau * 0.5));
 #endif
@@ -92,6 +93,7 @@ vec3 applyFog(vec3 col, vec3 wpos){
   vec3 dn = d / max(dist, 1e-3);
   float f = 1.0 - exp(-dist / uVis);
   f = max(f, smoothstep(13500.0, 21500.0, dist));
+  f = max(f, uCamCloud * 0.92);   // inside cloud: visibility collapses, which also hides the cheap-shadow switch
 #ifdef LOWQ
   // the low tier cannot afford a full scattering integral per surface pixel
   vec3 fogc = (uHorizon * 0.92 + uSkyAmb * 0.30) * (1.0 - 0.25 * max(dn.y, 0.0));
@@ -158,7 +160,7 @@ float heightShadow(vec3 p){
 #ifdef LOWQ
   for (int i = 1; i <= 4; i++){
 #else
-  for (int i = 1; i <= 9; i++){
+  for (int i = 1; i <= 7; i++){
 #endif
     float fi = float(i);
     float d = 30.0 + fi * fi * 20.0;
@@ -226,9 +228,14 @@ void main(){
   }
 #endif
   float ndl = max(dot(N, uSunDir), 0.0);
-  float hs = heightShadow(vWorld);
-  float cs = cloudSunTrans(vWorld);
-  float sv = skyVisibility(vWorld);
+  // When the camera is inside the cloud the ground is a fogged-out backdrop, so the
+  // 20-tap shadow/visibility stack is pure waste. Uniform branch: no divergence.
+  float hs = 0.35, cs = 0.12, sv = 0.18;
+  if (uCamCloud < 0.5){
+    hs = heightShadow(vWorld);
+    cs = cloudSunTrans(vWorld);
+    sv = skyVisibility(vWorld);
+  }
   vec3 sun = uSunCol * ndl * hs * cs;
   vec3 amb = mix(uGroundAmb, uSkyAmb, 0.5 + 0.5 * N.y) * sv;
   vec3 col = alb * (sun + amb);
@@ -264,7 +271,7 @@ varying vec3 vWorld;
 vec2 waveGrad(vec2 p, vec2 wd, float t){
   vec2 g = vec2(0.0);
   float a = 1.0; float f = 0.35; float sp = 0.7;
-  for (int i = 0; i < 4; i++){
+  for (int i = 0; i < 3; i++){
     vec2 q = p * f + wd * t * sp;
     float e = 0.05;
     g += a * vec2(vnoise2(q + vec2(e, 0.0)) - vnoise2(q - vec2(e, 0.0)), vnoise2(q + vec2(0.0, e)) - vnoise2(q - vec2(0.0, e))) / (2.0 * e) * f;
@@ -306,21 +313,26 @@ void main(){
 #endif
   // cheap cloud reflection: a few altitude slices of the simulated condensate
   float ca = 0.0;
+  if (uCamCloud < 0.5){
 #ifdef LOWQ
-  { vec4 s = sampleCloud(vWorld + R * (4000.0 / max(R.y, 0.2))); ca = s.r * 1.4 + s.g * 0.6; }
+    { vec4 s = sampleCloud(vWorld + R * (4000.0 / max(R.y, 0.2))); ca = s.r * 1.4 + s.g * 0.6; }
 #else
-  for (int i = 0; i < 5; i++){
-    float alt = 1500.0 + float(i) * 2300.0;
-    vec3 q = vWorld + R * (alt / R.y);
-    vec4 s = sampleCloud(q);
-    ca += s.r * 0.35 + s.g * 0.15;
-  }
+    for (int i = 0; i < 5; i++){
+      float alt = 1500.0 + float(i) * 2300.0;
+      vec3 q = vWorld + R * (alt / R.y);
+      vec4 s = sampleCloud(q);
+      ca += s.r * 0.35 + s.g * 0.15;
+    }
 #endif
+  }
   ca = 1.0 - exp(-ca * 1.5);
   vec3 cloudCol = (uSunCol * 0.35 + uSkyAmb * 1.5 + vec3(0.02)) * 0.8;
   vec3 refl = mix(sky, cloudCol, ca);
-  float cs = cloudSunTrans(vec3(vWorld.x, 0.0, vWorld.z));
-  float sv = skyVisibility(vec3(vWorld.x, 0.0, vWorld.z));
+  float cs = 0.12, sv = 0.18;
+  if (uCamCloud < 0.5){
+    cs = cloudSunTrans(vec3(vWorld.x, 0.0, vWorld.z));
+    sv = skyVisibility(vec3(vWorld.x, 0.0, vWorld.z));
+  }
   vec3 deep = vec3(0.012, 0.05, 0.065) * (uSunCol * 0.35 * cs + uSkyAmb * 1.4 * sv + vec3(0.01));
   float fres = 0.02 + 0.98 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
   vec3 col = mix(deep, refl, fres);
@@ -360,9 +372,18 @@ void main(){
   vW = wp;
   vCol = aColor * (0.8 + 0.4 * hh);
   vN = normalize(vec3(normal.x * ca - normal.z * sa, normal.y, normal.x * sa + normal.z * ca));
-  float cs = cloudSunTrans(vec3(c.x, gh + 8.0, c.y));
+  // Trees are tiny on screen: a 2-tap shadow/visibility estimate is indistinguishable from
+  // the 11-tap full version and saves millions of vertex fetches per frame.
+  float cs = 0.15, sv = 0.2;
+  if (uCamCloud < 0.5){
+    vec3 tp = vec3(c.x, gh + 8.0, c.y);
+    vec4 ts = sampleCloud(tp + uSunDir * (2400.0 / max(uSunDir.y, 0.2)));
+    cs = exp(-(ts.r * 2.6 + ts.g * 1.1));
+    vec4 vs = sampleCloud(vec3(c.x, 4200.0, c.y));
+    sv = mix(0.2, 1.0, exp(-(vs.r * 1.9 + vs.g * 0.9)));
+  }
   vSun = uSunCol * cs;
-  vSV = skyVisibility(vec3(c.x, gh, c.y));
+  vSV = sv;
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const treeFrag = /* glsl */ `
@@ -616,16 +637,21 @@ void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 
 export const cloudFrag = /* glsl */ `
 ${COMMON}
-uniform sampler3D uNoise; uniform sampler2D uDepth; uniform sampler2D uHist;
+uniform sampler3D uNoise; uniform sampler2D uDepth; uniform sampler2D uHist; uniform sampler2D uHistAux;
 uniform mat4 uInvProj; uniform mat4 uCamWorld; uniform mat4 uPrevVP; uniform vec3 uCamPos;
-uniform float uFrame; uniform float uBlend; uniform float uStepScale; uniform float uMaxSteps; uniform vec2 uWindOff[16];
+uniform float uFrame; uniform float uBlend; uniform float uStepScale; uniform float uMaxSteps;
+uniform vec2 uWindOff[16];
 varying vec2 vUv;
+// MRT: location 0 = premultiplied cloud radiance + transmittance, location 1 = scattering depth
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outAux;
+
 #ifdef LOWQ
 #define CLOUD_STEPS 26
-#define LOWQ_DETAIL true
+#define DETAIL_ON true
 #else
-#define CLOUD_STEPS 96
-#define LOWQ_DETAIL (t < 9000.0)
+#define CLOUD_STEPS 80
+#define DETAIL_ON (t < 7000.0)
 #endif
 
 vec2 windOffAt(float y){
@@ -634,50 +660,42 @@ vec2 windOffAt(float y){
   return mix(uWindOff[i0], uWindOff[i1], f - float(i0));
 }
 float hg(float c, float g){ float b = max(1.0 + g*g - 2.0*g*c, 1e-3); return (1.0 - g*g) / (b * sqrt(b)); }
-// two-lobe droplet phase function (strong forward peak + wide backscatter), tightened by k
+// two-lobe droplet phase function: strong forward peak (silver lining) + wide backscatter
 #ifdef LOWQ
 float phase(float c, float k){ return hg(c, 0.6 * k) * 1.15; }
 #else
 float phase(float c, float k){ return 0.78 * hg(c, 0.72 * k) + 0.22 * hg(c, -0.18 * k); }
 #endif
 
-float cloudDensity(vec3 p, out float rainD, out float iceF, bool detail){
+// 1 cloud + 2 noise fetches instead of 6: the shape/warp share one volume fetch, and two
+// octaves of erosion detail are enough to break up the 500 m simulation cells.
+float cloudDensity(vec3 p, float t, out float rainD, out float iceF, bool detail){
   vec4 s = sampleCloud(p);
   rainD = s.g; iceF = s.b;
   float base = s.r;
   if (base < 0.004) return 0.0;
   vec2 wo = windOffAt(p.y);
   vec3 np = p + vec3(wo.x, uTime * 1.2, wo.y);
-  // billows: two-scale low frequency shape modulation with a slow domain warp
-  float low = texture(uNoise, np / 5200.0).r;
-  float warp = texture(uNoise, np * 0.00011 + vec3(0.37, 0.11, 0.73)).g;
-  float shape = base * (0.42 + 0.86 * low + 0.24 * warp);
+  vec4 nA = texture(uNoise, np / 5200.0);
+  float shape = base * (0.40 + 0.92 * nA.r + 0.26 * nA.g);
   if (!detail) return clamp(shape, 0.0, 1.0);
-  // erode the edges: detail noise gets stronger where the field is weak (fractal edges, wispy bases)
-#ifdef LOWQ
-  float f2 = texture(uNoise, np / 640.0).b;
-  float edge = 1.0 - smoothstep(0.25, 0.95, base);
-  float erode = (1.0 - f2) * (0.30 + 0.40 * edge);
+  vec4 nB = texture(uNoise, np / 700.0);
+  float fine = nB.b;
+  // the finest octave only pays for itself close to the camera, where it is visible
+  if (t < 3400.0) fine = fine * 0.70 + texture(uNoise, np / 240.0).a * 0.30;
+  float edge = 1.0 - smoothstep(0.22, 0.95, base);
+  float erode = (1.0 - fine) * (0.30 + 0.44 * edge);
   return clamp((shape - erode) / (1.0 - erode + 1e-3), 0.0, 1.0);
-#else
-  float f1 = texture(uNoise, np / 1550.0).g;
-  float f2 = texture(uNoise, np / 640.0).b;
-  float f3 = texture(uNoise, np / 250.0).a;
-  float fine = f1 * 0.52 + f2 * 0.31 + f3 * 0.17;
-  float edge = 1.0 - smoothstep(0.25, 0.95, base);
-  float erode = (1.0 - fine) * (0.34 + 0.42 * edge);
-  return clamp((shape - erode) / (1.0 - erode + 1e-3), 0.0, 1.0);
-#endif
 }
 
 float sunTau(vec3 p){
-  float tau = 0.0; float st = 70.0; vec3 q = p;
-  for (int j = 0; j < 6; j++){
+  float tau = 0.0; float st = 120.0; vec3 q = p;
+  for (int j = 0; j < 5; j++){
     q += uSunDir * st;
     if (q.y > 15000.0) break;
     vec4 s = sampleCloud(q);
     tau += (s.r * 1.05 + s.g * 0.28) * 0.058 * st;
-    st *= 1.95;
+    st *= 2.2;
   }
   return tau;
 }
@@ -698,9 +716,10 @@ void main(){
   float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
   float cosT = dot(rd, uSunDir);
   vec3 L = vec3(0.0); float T = 1.0; float tHit = -1.0;
-  float t = 60.0 * jitter * uStepScale;   // dither the entry point; the history buffer averages it out
+  float tSum = 0.0, wSum = 0.0;
+  float t = 60.0 * jitter * uStepScale;
   // ---- coarse entry search: hop over the clear air before the condensate (<=9 cheap fetches)
-  {
+  if (uCamCloud < 0.35){
     float cstep = clamp(t1 * 0.09, 260.0, 1700.0) * uStepScale;
     for (int i = 0; i < 9; i++){
       if (t + cstep * 1.5 >= t1) break;
@@ -712,14 +731,19 @@ void main(){
     }
   }
   float tauC = 0.0;
+  // Engulfed by cloud: the beam is extinguished within a few hundred metres, so the
+  // remaining step budget is wasted work. Halve it.
+  float maxSteps = uMaxSteps * (1.0 - 0.5 * uCamCloud);
   for (int i = 0; i < CLOUD_STEPS; i++){
-    if (float(i) >= uMaxSteps || t > t1 || T < 0.035) break;
+    if (float(i) >= maxSteps || t > t1 || T < 0.02) break;
     vec3 p = ro + rd * t;
-    float stepLen = clamp(0.04 * t + 60.0, 60.0, 1100.0) * uStepScale;
-    // vary the step length per pixel *and* per frame: breaks slice banding without leaving a fixed pattern
-    stepLen *= 0.93 + 0.14 * fract(sin(dot(vec2(gl_FragCoord.x + uFrame * 3.11, gl_FragCoord.y + float(i) * 1.37), vec2(12.9898, 78.233))) * 43758.5453);
+    float stepLen = clamp(0.045 * t + 55.0, 55.0, 1200.0) * uStepScale;
+    // vary the step length per pixel *and* per frame: breaks slice banding without a fixed pattern
+    stepLen *= 0.92 + 0.16 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, uFrame * 3.11));
+    // optically thick cloud does not need fine steps: grow them as the beam is extinguished
+    stepLen *= mix(1.0, 2.6, 1.0 - T);
     float rainD, iceF;
-    float d = cloudDensity(p, rainD, iceF, LOWQ_DETAIL);
+    float d = cloudDensity(p, t, rainD, iceF, DETAIL_ON);
     float rainFade = smoothstep(120.0, 700.0, t);
     float sc = d * 0.085;
 #ifdef LOWQ
@@ -729,66 +753,94 @@ void main(){
 #endif
     float sig = sc + sr;
     if (sig > 1e-5){
-#ifdef LOWQ
-      if (i % 3 == 0){ vec4 st0 = sampleCloud(p + uSunDir * 2200.0); tauC = (st0.r * 1.5 + st0.g * 0.4) * 6.0; }
-#else
-      if (i % 3 == 0) tauC = sunTau(p);   // sun transmittance varies slowly, refresh every third step
-#endif
+      if (i % 4 == 0) tauC = sunTau(p);
       float tau = tauC;
-      vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0, c = 1.0;
-      for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * phase(cosT, c); a *= 0.46; b *= 0.38; c *= 0.62; }
-      sunL *= 0.56;   // keep the multi-octave sum energy-normalised instead of blowing out to white
+      // 4 octaves of a Henyey-Greenstein phase function: a cheap multiple-scattering
+      // approximation. Without it thick cloud cores go black instead of glowing grey.
+      // The phase is evaluated once per step (the anisotropy barely changes per octave).
+      float ph = phase(cosT, 1.0);
+      vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0;
+      for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * ph; a *= 0.46; b *= 0.38; }
+      sunL *= 0.56;
       float powder = mix(1.0, 1.0 - 0.72 * exp(-d * 8.0), 0.8 * (1.0 - smoothstep(0.15, 0.85, cosT)));
       float cT = max(cosT, 0.0), cT2 = cT * cT, cT4 = cT2 * cT2;
       float silver = cT4 * cT4 * cT2 * (1.0 - smoothstep(0.05, 0.5, d));
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
-#ifdef LOWQ
-      float aoU = 0.55;
-#else
+      // one-tap vertical occlusion: how much cloud sits above this sample
       float aoU = 1.0;
-      if (d > 0.025){   // skip the two extra taps inside thin wisps
-        float up1 = sampleCloud(p + vec3(0.0, 700.0, 0.0)).r;
-        float up2 = sampleCloud(p + vec3(0.0, 2600.0, 0.0)).r;
-        aoU = exp(-(up1 * 1.35 + up2 * 0.75));
-      }
-#endif
-      float hDark = mix(0.58, 1.0, smoothstep(0.04, 0.40, hF));   // cloud bases read darker than sunlit tops
-      vec3 amb = mix(uGroundAmb * 0.55, uSkyAmb, smoothstep(0.0, 0.7, hF)) * (0.15 + 0.85 * aoU) * (0.7 + 0.5 * d) * hDark;
+      if (d > 0.03) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
+      float hDark = mix(0.52, 1.0, smoothstep(0.03, 0.38, hF));
+      vec3 amb = mix(uGroundAmb * 0.6, uSkyAmb, smoothstep(0.0, 0.75, hF));
+      amb *= (0.16 + 0.84 * aoU) * (0.72 + 0.48 * d) * hDark;
+      // light that has bounced around inside the cloud: lifts the core without flattening edges
+      amb += uSunCol * sunL * (0.05 + 0.13 * d) * mix(0.35, 1.0, hF);
       vec3 fl = uFlashOn > 0.5 ? flashLight(p, vec3(0.0, 1.0, 0.0)) : vec3(0.0);
       vec3 iceTint = mix(vec3(1.0), vec3(0.95, 0.97, 1.06), iceF);
       vec3 Sc = (uSunCol * sunL * (0.6 + 0.6 * silver) * powder + amb + fl * 0.14) * iceTint;
       vec3 Sr = (uSunCol * 0.09 * sunL + amb * 0.8 + fl * 0.1) * vec3(0.78, 0.84, 0.94);
       vec3 S = (sc * Sc + sr * Sr) / sig;
       float Ts = exp(-sig * stepLen);
+      float wgt = T * (1.0 - Ts);
+      tSum += wgt * t; wSum += wgt;
       L += T * (1.0 - Ts) * S;
       T *= Ts;
       if (tHit < 0.0 && T < 0.97) tHit = t;
-      t += stepLen * (0.68 + 0.32 * clamp(sig * stepLen, 0.0, 1.0));
+      t += stepLen * (0.7 + 0.3 * clamp(sig * stepLen, 0.0, 1.0));
     } else {
-      t += stepLen * 1.25;   // clear air: stride out
+      t += stepLen * 2.0;   // clear air: stride out
     }
   }
+  float tMean = wSum > 1e-4 ? tSum / wSum : 45000.0;
   float dist = tHit > 0.0 ? tHit : min(t1, 45000.0);
   float fogF = 1.0 - exp(-dist / (uVis * 2.2));   // storms stay readable from many km away
   vec3 haze = mix(uHorizon, uSkyAmb, 0.55) * 0.85;   // air, not white fog
   L = L * (1.0 - fogF) + haze * fogF * (1.0 - T);
-  vec4 cur = vec4(L, T);
-  vec3 P = uCamPos + rd * 9000.0;
+  // ---- temporal reprojection at the real scattering depth (a fixed 9 km point smears
+  // badly once the cloud is close to the camera, which is what looked like stutter)
+  vec3 P = uCamPos + rd * tMean;
   vec4 pc = uPrevVP * vec4(P, 1.0);
   vec2 puv = pc.xy / pc.w * 0.5 + 0.5;
   float valid = (pc.w > 0.0 && puv.x > 0.0 && puv.x < 1.0 && puv.y > 0.0 && puv.y < 1.0) ? 1.0 : 0.0;
   vec4 hist = texture(uHist, puv);
+  float histD = texture(uHistAux, puv).r;
   float b2 = uBlend * valid * (1.0 - smoothstep(0.2, 0.5, abs(hist.a - T)));
-  gl_FragColor = mix(cur, hist, b2);
-}`;
+  float rel = abs(histD - tMean) / max(min(histD, tMean), 200.0);
+  b2 *= 1.0 - smoothstep(0.3, 0.9, rel);
+  b2 *= 1.0 - 0.9 * uCamCloud;   // inside cloud: trust the (cheap, short) current march
+  outColor = mix(vec4(L, T), hist, b2);
+  outAux = vec4(tMean, T, 0.0, 1.0);
+}
+`;
 
 export const compFrag = /* glsl */ `
-uniform sampler2D uScene; uniform sampler2D uCloudRT; uniform float uExposure; uniform float uTime; uniform vec2 uRes;
+uniform sampler2D uScene; uniform sampler2D uCloudRT; uniform sampler2D uCloudAux;
+uniform float uExposure; uniform float uTime; uniform vec2 uRes; uniform vec2 uCloudRes;
 varying vec2 vUv;
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+
+// Edge-aware upsample of the reduced-resolution cloud buffer. A plain bilinear fetch
+// smears cloud edges into blocky steps; weighting the 4 neighbours by scattering-depth
+// similarity keeps the silhouette crisp without ringing.
+vec4 cloudSample(vec2 uv){
+  vec2 tx = 1.0 / uCloudRes;
+  vec4 c0 = texture(uCloudRT, uv);
+  float d0 = texture(uCloudAux, uv).r;
+  vec4 acc = c0 * 2.0;
+  float wsum = 2.0;
+  for (int i = 0; i < 4; i++){
+    vec2 o = vec2(float(i == 0) - float(i == 1), float(i == 2) - float(i == 3)) * tx;
+    vec4 c = texture(uCloudRT, uv + o);
+    float d = texture(uCloudAux, uv + o).r;
+    float w = 1.0 / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
+    w *= 1.0 - 0.7 * smoothstep(0.15, 0.55, abs(c.a - c0.a));
+    acc += c * w; wsum += w;
+  }
+  return acc / wsum;
+}
+
 void main(){
   vec3 scene = texture(uScene, vUv).rgb;
-  vec4 c = texture(uCloudRT, vUv);
+  vec4 c = cloudSample(vUv);
   vec3 col = scene * c.a + c.rgb;
   col *= uExposure;
   col = aces(col);
@@ -798,4 +850,5 @@ void main(){
   float n = fract(sin(dot(vUv * uRes + fract(uTime), vec2(12.9898, 78.233))) * 43758.5453);
   col += (n - 0.5) / 255.0;
   gl_FragColor = vec4(col, 1.0);
-}`;
+}
+`;

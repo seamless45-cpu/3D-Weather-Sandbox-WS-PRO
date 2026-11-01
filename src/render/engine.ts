@@ -9,14 +9,14 @@ import * as S from './glsl';
 export type Tier = 'low' | 'mid' | 'high';
 export interface Quality {
   tier: Tier; pr: number; cloudScale: number; stepScale: number; minCloudScale: number;
-  M: number; rain: number; treeGrid: number; msaa: number; splashes: boolean; shafts: number;
+  M: number; rain: number; treeGrid: number; msaa: number; splashes: boolean; shafts: number; steps: number;
 }
 
 /** Preset for each performance tier. `low` targets entry-level mobile GPUs (Adreno 6xx, Mali-G5x). */
 export function qualityFor(tier: Tier): Quality {
-  if (tier === 'low') return { tier, pr: 0.62, cloudScale: 0.22, stepScale: 3.0, minCloudScale: 0.14, M: 256, rain: 2400, treeGrid: 22, msaa: 0, splashes: false, shafts: 12 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.32, stepScale: 1.8, minCloudScale: 0.2, M: 256, rain: 6000, treeGrid: 40, msaa: 0, splashes: true, shafts: 32 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.5, stepScale: 1.0, minCloudScale: 0.24, M: 512, rain: 12000, treeGrid: 72, msaa: 2, splashes: true, shafts: 64 };
+  if (tier === 'low') return { tier, pr: 0.62, cloudScale: 0.28, stepScale: 2.6, minCloudScale: 0.2, M: 256, rain: 2400, treeGrid: 22, msaa: 0, splashes: false, shafts: 12, steps: 24 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.5, stepScale: 1.5, minCloudScale: 0.3, M: 256, rain: 6000, treeGrid: 40, msaa: 0, splashes: true, shafts: 32, steps: 72 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.7, stepScale: 1.0, minCloudScale: 0.4, M: 512, rain: 12000, treeGrid: 72, msaa: 2, splashes: true, shafts: 64, steps: 80 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -94,7 +94,7 @@ export class Engine {
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
-  frameMs = 16; lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1;
+  lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1;
   flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0); defs?: Record<string, number>; cssW = 1; cssH = 1;
   adaptive = true;   // runtime degradation; disabled with ?noadapt for diagnostics
   fps = 60;
@@ -139,6 +139,7 @@ export class Engine {
       uWind: { value: this.localWind },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
+      uCamCloud: { value: 0 },
     };
     const U = this.U;
     // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
@@ -193,17 +194,18 @@ export class Engine {
     // ---- cloud + composite passes
     this.cloudMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.cloudFrag, depthTest: false, depthWrite: false,
+      glslVersion: THREE.GLSL3,
       ...(this.defs ? { defines: { ...this.defs } } : {}),
       uniforms: {
-        ...U, uNoise: { value: this.noiseTex }, uDepth: { value: null }, uHist: { value: null }, uInvProj: { value: new THREE.Matrix4() },
+        ...U, uNoise: { value: this.noiseTex }, uDepth: { value: null }, uHist: { value: null }, uHistAux: { value: null }, uInvProj: { value: new THREE.Matrix4() },
         uCamWorld: { value: new THREE.Matrix4() }, uPrevVP: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
-        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.tier === 'low' ? 26 : 96 }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
+        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.steps }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
       },
     });
     const cq = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.cloudMat); cq.frustumCulled = false; this.cloudScene.add(cq);
     this.compMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.compFrag, depthTest: false, depthWrite: false,
-      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } },
+      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) } },
     });
     const cp = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.compMat); cp.frustumCulled = false; this.compScene.add(cp);
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
@@ -297,7 +299,9 @@ export class Engine {
   private makeCloudRT(W: number, H: number) {
     for (const r of this.rtCloud) r.dispose();
     const cw = Math.max(2, Math.floor(W * this.cloudScale)), ch = Math.max(2, Math.floor(H * this.cloudScale));
-    this.rtCloud = [0, 1].map(() => new THREE.WebGLRenderTarget(cw, ch, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false }));
+    // count: 2 -> MRT. Attachment 0 is the cloud radiance/transmittance, attachment 1 the
+    // scattering depth used for temporal reprojection and the edge-aware upscale.
+    this.rtCloud = [0, 1].map(() => new THREE.WebGLRenderTarget(cw, ch, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false, count: 2 }));
     this.frame = 0;
   }
 
@@ -312,6 +316,28 @@ export class Engine {
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
     if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
     this.localWind.set(s.local.u, s.local.v);
+  }
+
+  /** How much condensate sits *at the camera* (0..1). Drives the cheap surface shaders and
+   *  tells the cloud march it can trust the current frame instead of the history buffer.
+   *  Only the camera's own layer is sampled: a storm base a kilometre overhead must not
+   *  switch the renderer into its "engulfed" path. */
+  private camCloudAt(x: number, y: number, z: number): number {
+    const d = this.cloudTex.image.data as Uint8Array;
+    const nx = this.nx, nz = this.nz, nxy = nx * nx;
+    const i0 = Math.min(nx - 1, Math.max(0, Math.floor((x / DOMAIN) * nx)));
+    const j0 = Math.min(nx - 1, Math.max(0, Math.floor((z / DOMAIN) * nx)));
+    const kc = Math.min(nz - 1, Math.max(0, Math.floor((y / 15000) * nz)));
+    let m = 0;
+    for (let dj = -1; dj <= 1; dj++) {
+      const j = (j0 + dj + nx) % nx;
+      for (let di = -1; di <= 1; di++) {
+        const i = (i0 + di + nx) % nx;
+        const v = d[(kc * nxy + j * nx + i) * 4] / 255;
+        if (v > m) m = v;
+      }
+    }
+    return Math.min(1, Math.max(0, (m - 0.08) / 0.32));
   }
 
   addFlash(ev: FlashEvent, cam: THREE.Vector3) {
@@ -381,7 +407,6 @@ export class Engine {
   }
 
   render(dtReal: number, cam: { x: number; y: number; z: number; yaw: number; pitch: number; fov: number }) {
-    const t0 = performance.now();
     this.time += dtReal;
     const U = this.U;
     this.camera.position.set(cam.x, cam.y, cam.z);
@@ -402,6 +427,8 @@ export class Engine {
     U.uTime.value = this.time;
     U.uVis.value = Math.max(3000, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.05 * this.rainAtCam));
     U.uCamXZ.value.set(cam.x, cam.z);
+    // camera engulfed by condensate: lets the surface shaders skip their cloud-shadow stack
+    U.uCamCloud.value = this.camCloudAt(cam.x, cam.y, cam.z);
     const sm = this.shaftMesh.material as THREE.ShaderMaterial;
     sm.uniforms.uShaftWind.value.set(this.localWind.x, this.localWind.y);
     sm.uniforms.uSnowLevel.value = this.snowLevel;
@@ -466,13 +493,16 @@ export class Engine {
     cm.uCamPos.value.copy(this.camera.position);
     cm.uDepth.value = this.rtScene.depthTexture;
     const prev = this.rtCloud[1 - this.cur], curRT = this.rtCloud[this.cur];
-    cm.uHist.value = prev.texture;
+    cm.uHist.value = prev.textures[0];
+    cm.uHistAux.value = prev.textures[1];
     this.renderer.setRenderTarget(curRT);
     this.renderer.render(this.cloudScene, this.ortho);
 
     // ---- pass 3: composite + tone mapping
     this.compMat.uniforms.uScene.value = this.rtScene.texture;
-    this.compMat.uniforms.uCloudRT.value = curRT.texture;
+    this.compMat.uniforms.uCloudRT.value = curRT.textures[0];
+    this.compMat.uniforms.uCloudAux.value = curRT.textures[1];
+    this.compMat.uniforms.uCloudRes.value.set(curRT.width, curRT.height);
     this.renderer.setRenderTarget(null);
     this.renderer.render(this.compScene, this.ortho);
     this.prevVP.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
@@ -480,22 +510,30 @@ export class Engine {
     this.frame++;
 
     // ---- dynamic resolution for the cloud pass
-    this.frameMs = this.frameMs * 0.95 + (performance.now() - t0 + dtReal * 0) * 0.05;
     if (dtReal > 1e-4) this.fps += (1 / dtReal - this.fps) * Math.min(1, dtReal * 0.15);
     const frameDt = dtReal * 1000;
     if (frameDt > 26) { this.lowTimer += dtReal; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += dtReal; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
-    // coarsen the march before dropping the cloud buffer resolution: steps are cheaper than pixels
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
-    if (this.lowTimer > 1.6) {
-      if (this.dynStep < 2.4) this.dynStep = Math.min(2.4, this.dynStep + 0.3);
-      else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.06); this.rebuildCloud(); }
-      else if (this.renderer.getPixelRatio() > 0.4) { this.renderer.setPixelRatio(Math.max(0.4, this.renderer.getPixelRatio() - 0.12)); this.resize(this.cssW, this.cssH); }
-      else { const u = this.cloudMat.uniforms.uMaxSteps; u.value = Math.max(14, u.value - 3); }
+    const uMax = this.cloudMat.uniforms.uMaxSteps;
+    // A single huge spike (a cloud swallowing the camera) reacts immediately instead of waiting
+    // for a 1.6 s average: bigger steps first, they are far cheaper than pixels.
+    if (this.adaptive && frameDt > 55) {
+      this.dynStep = Math.min(3.2, this.dynStep + 0.45);
+      uMax.value = Math.max(20, uMax.value - 6);
       this.lowTimer = 0;
     }
-    if (this.highTimer > 6) {
-      if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
-      else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.2);
+    if (this.lowTimer > 0.9) {
+      if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.35);
+      else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.06); this.rebuildCloud(); }
+      else if (this.renderer.getPixelRatio() > 0.4) { this.renderer.setPixelRatio(Math.max(0.4, this.renderer.getPixelRatio() - 0.12)); this.resize(this.cssW, this.cssH); }
+      else uMax.value = Math.max(18, uMax.value - 4);
+      this.lowTimer = 0;
+    }
+    if (this.highTimer > 4) {
+      if (uMax.value < this.q.steps) uMax.value = Math.min(this.q.steps, uMax.value + 2);
+      else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
+      else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
+      else if (this.renderer.getPixelRatio() < this.q.pr) { this.renderer.setPixelRatio(Math.min(this.q.pr, this.renderer.getPixelRatio() + 0.1)); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
     }
     this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * this.dynStep;

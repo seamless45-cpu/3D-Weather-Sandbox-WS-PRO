@@ -103,7 +103,13 @@ export default function App() {
           rt.raf = requestAnimationFrame(loop);
         };
         rt.raf = requestAnimationFrame(loop);
-        const onResize = () => engine.resize(window.innerWidth, window.innerHeight);
+        // Debounced: resize() reallocates every render target, so a burst of events
+        // (mobile address bar, window drag) must not trigger a reallocation each time.
+        let resizeT = 0;
+        const onResize = () => {
+          clearTimeout(resizeT);
+          resizeT = window.setTimeout(() => engine.resize(window.innerWidth, window.innerHeight), 140);
+        };
         window.addEventListener('resize', onResize);
       } catch (err) {
         // Surface boot failures (no WebGL, worker crash, bad grid) instead of hanging on the loader.
