@@ -4,7 +4,7 @@ import SimWorker from './sim/worker?worker&inline';
 import { Terrain } from './sim/terrain';
 import { DEFAULT_PARAMS, PARAM_SPECS, SimParams } from './sim/params';
 import { clockString } from './sim/sun';
-import { Engine, detectQuality } from './render/engine';
+import { Engine, detectQuality, detectGpuTier, gpuLabel, readTierPref } from './render/engine';
 import { Player } from './controls';
 import { AudioEngine } from './audio';
 import { drawSkewT, drawSlice } from './ui/draw';
@@ -40,6 +40,12 @@ export default function App() {
   const [locked, setLocked] = useState(false);
   const [, setTick] = useState(0);
   const [touch] = useState(() => typeof window !== 'undefined' && ('ontouchstart' in window || navigator.maxTouchPoints > 0));
+  const [perf, setPerf] = useState<string>(() => readTierPref() || 'auto');
+  const detected = useState(() => { try { return detectGpuTier(); } catch { return 'mid'; } })[0];
+  const setPerfPref = (v: string) => {
+    setPerf(v);
+    try { if (v === 'auto') localStorage.removeItem('atmos.perf'); else localStorage.setItem('atmos.perf', v); } catch { /* ignore */ }
+  };
   const [lastFlash, setLastFlash] = useState<any>(null);
 
   const send = useCallback((m: any) => rtRef.current?.worker.postMessage(m), []);
@@ -185,6 +191,17 @@ export default function App() {
               <button className="hbtn !px-1" onClick={() => setParams(DEFAULT_PARAMS)}>defaults</button>
             </div>
             <div className="mb-2 max-h-[44vh] overflow-y-auto pr-1">{paramSliders}</div>
+            <div className="mb-1 flex items-center justify-between">
+              <span className="lbl">RENDER QUALITY</span>
+              <span className="lbl truncate pl-2 text-right" title={`auto-detected: ${detected}`}>{gpuLabel()}</span>
+            </div>
+            <div className="mb-2 flex gap-1">
+              {['auto', 'low', 'mid', 'high'].map((v) => (
+                <button key={v} className={`hbtn flex-1 !px-1 ${perf === v ? 'on' : ''}`} onClick={() => setPerfPref(v)}>
+                  {v}{v === 'auto' ? ` · ${detected}` : ''}
+                </button>
+              ))}
+            </div>
             <button className="hbtn w-full !py-1 !text-[11px]" onClick={start}>▶ enter simulation</button>
             <div className="mt-2 lbl leading-snug">{touch ? 'Drag: look · Pinch: zoom · Hold ▲▼ to walk' : 'Click view: mouse-look · WASD / arrows: walk · Shift: run · wheel: zoom · Esc: release cursor'}<br />Weather starts clear and evolves from surface heating; storms form only if the environment allows.</div>
           </div>
@@ -295,6 +312,7 @@ export default function App() {
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 p-3" onClick={() => setAbout(false)}>
           <div className="hud max-h-[88vh] w-[560px] max-w-full overflow-y-auto p-3 leading-snug" onClick={(e) => e.stopPropagation()}>
             <div className="mb-1 flex justify-between"><b>MODEL NOTES</b><button className="hbtn" onClick={() => setAbout(false)}>×</button></div>
+            <div className="mb-1 lbl">RENDER {rtRef.current ? `${rtRef.current.engine.q.tier} · ${rtRef.current.engine.fps.toFixed(0)} fps · ${rtRef.current.engine.renderer.getPixelRatio().toFixed(2)}× · ${rtRef.current.engine.cloudScale.toFixed(2)} cloud` : gpuLabel()}</div>
             <p><b>Resolved:</b> 3-D anelastic Navier–Stokes (∇·ρ₀u=0) on a 64×64×36 MAC grid (Δx=500 m, Δz 146→689 m, 32 km periodic box, 15 km lid), momentum + θ + water vapour + 5 hydrometeor species + 2 charge species advected with a mass-weighted TVD (van Leer) flux scheme, buoyancy from virtual potential temperature and condensate loading, exact FFT/tridiagonal pressure projection (div → round-off). Cold pools, gust fronts, updraft tilt and rotation are emergent. Nothing smaller than ~1.5 km is resolved.</p>
             <p className="mt-1"><b>Parameterised:</b> Deardorff 1.5-order TKE sub-grid closure (entrainment/mixing at cloud edges); surface energy balance (SW with slope/cloud shading, LW, sensible & latent flux, soil moisture, runoff); drag by land-cover roughness; kinematic terrain lifting at the lower boundary; bulk microphysics (Kessler warm rain, Bergeron/WBF deposition, riming, graupel, melting, freezing, evaporation, sedimentation); non-inductive charging (Saunders-type sign reversal at −12 °C, lumped coefficient); effective grid-scale breakdown field = 0.45·E_k(ρ); DBM leader growth on the solved potential; large-scale forcing as weak relaxation of domain-mean wind/θ/moisture and −1.5 K/day radiative cooling.</p>
             <p className="mt-1"><b>Visual only:</b> sub-grid cloud erosion noise (advected with cloud-weighted winds), rain streaks (placed where the simulated precipitation exists), splashes/ripples, vegetation sway, thunder synthesis from channel geometry (arrival time r/c, absorption, terrain obstruction).</p>

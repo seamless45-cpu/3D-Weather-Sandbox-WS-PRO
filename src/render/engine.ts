@@ -6,12 +6,67 @@ import { computeLighting } from './skyModel';
 import { makeNoiseData } from './noise';
 import * as S from './glsl';
 
-export interface Quality { pr: number; cloudScale: number; stepScale: number; M: number; rain: number; treeGrid: number; msaa: number; }
+export type Tier = 'low' | 'mid' | 'high';
+export interface Quality {
+  tier: Tier; pr: number; cloudScale: number; stepScale: number; minCloudScale: number;
+  M: number; rain: number; treeGrid: number; msaa: number; splashes: boolean; shafts: number;
+}
+
+/** Preset for each performance tier. `low` targets entry-level mobile GPUs (Adreno 6xx, Mali-G5x). */
+export function qualityFor(tier: Tier): Quality {
+  if (tier === 'low') return { tier, pr: 0.62, cloudScale: 0.22, stepScale: 3.0, minCloudScale: 0.14, M: 256, rain: 2400, treeGrid: 22, msaa: 0, splashes: false, shafts: 12 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.32, stepScale: 1.8, minCloudScale: 0.2, M: 256, rain: 6000, treeGrid: 40, msaa: 0, splashes: true, shafts: 32 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.5, stepScale: 1.0, minCloudScale: 0.24, M: 512, rain: 12000, treeGrid: 72, msaa: 2, splashes: true, shafts: 64 };
+}
+
+/** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
+function probeRenderer(): string {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2') as WebGL2RenderingContext | null;
+    if (!gl) return '';
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = (ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : '') + ' ' + String(gl.getParameter(gl.RENDERER));
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return name;
+  } catch { return ''; }
+}
+
+/** Guess the tier from the GPU string; mobile parts are detected explicitly because core count lies. */
+export function detectGpuTier(): Tier {
+  try {
+    const name = probeRenderer();
+    if (!name.trim()) return 'low';
+    const s = name.toLowerCase();
+    const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
+    const cores = navigator.hardwareConcurrency || 4;
+    const adreno = s.match(/adreno[^0-9]*([0-9]{3})/);
+    if (adreno) return parseInt(adreno[1], 10) >= 700 ? 'mid' : 'low';   // 6xx and older: entry level
+    if (/mali-4|mali-t|mali-g[0-4]|powervr|videocore|adreno/.test(s)) return 'low';
+    if (/mali-g[5-9]|apple gpu|intel/.test(s)) return 'mid';
+    if (coarse) return 'low';        // unknown mobile GPU: assume the entry-level path
+    if (cores <= 4) return 'mid';
+    return 'high';
+  } catch { return 'mid'; }
+}
+
+/** Short human-readable GPU string for the menu, e.g. "Adreno (TM) 610". */
+export function gpuLabel(): string {
+  const n = probeRenderer();
+  return n.trim() ? n.replace(/^ANGLE \(|\)$/g, '').slice(0, 42) : 'no webgl2';
+}
+
+export function readTierPref(): Tier | null {
+  try {
+    const q = new URLSearchParams(location.search).get('perf');
+    if (q === 'low' || q === 'mid' || q === 'high') return q;
+    const v = localStorage.getItem('atmos.perf');
+    return v === 'low' || v === 'mid' || v === 'high' ? v : null;
+  } catch { return null; }
+}
+
 export function detectQuality(): Quality {
-  const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
-  const cores = navigator.hardwareConcurrency || 4;
-  if (coarse || cores <= 4) return { pr: 1, cloudScale: 0.36, stepScale: 1.4, M: 256, rain: 7000, treeGrid: 48, msaa: 0 };
-  return { pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.5, stepScale: 1.0, M: 512, rain: 12000, treeGrid: 72, msaa: 2 };
+  return qualityFor(readTierPref() || detectGpuTier());
 }
 
 export interface FlashEvent {
@@ -40,10 +95,13 @@ export class Engine {
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
   frameMs = 16; lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1;
-  flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0);
+  flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0); defs?: Record<string, number>; cssW = 1; cssH = 1;
+  adaptive = true;   // runtime degradation; disabled with ?noadapt for diagnostics
+  fps = 60;
   lightingDayness = 1; camTau = 0; rainAtCam = 0; rh = 0.5; snowLevel = 3500;
 
   constructor(canvas: HTMLCanvasElement, q: Quality, terrain: Terrain, nx: number, nzr: number) {
+    try { this.adaptive = !new URLSearchParams(location.search).has('noadapt'); } catch { /* keep default */ }
     this.q = q; this.terrain = terrain; this.nx = nx; this.nz = nzr; this.cloudScale = q.cloudScale;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', alpha: false });
     this.renderer.setPixelRatio(q.pr);
@@ -83,8 +141,10 @@ export class Engine {
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
     };
     const U = this.U;
+    // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
+    this.defs = q.tier === 'low' ? { LOWQ: 1 } : undefined;
     const mk = (vs: string, fs: string, extra: Record<string, { value: any }> = {}, opts: Partial<THREE.ShaderMaterialParameters> = {}) =>
-      new THREE.ShaderMaterial({ vertexShader: vs, fragmentShader: fs, uniforms: { ...U, ...extra }, ...opts });
+      new THREE.ShaderMaterial({ vertexShader: vs, fragmentShader: fs, uniforms: { ...U, ...extra }, ...(this.defs ? { defines: { ...this.defs } } : {}), ...opts });
 
     // ---- sky
     const sky = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mk(S.skyVert, S.skyFrag, {}, { depthTest: false, depthWrite: false }));
@@ -118,7 +178,7 @@ export class Engine {
     this.treeMesh.frustumCulled = false; this.treeMesh.renderOrder = 1; this.scene.add(this.treeMesh);
 
     // ---- precipitation shafts (one billboard per column, from the ground into the cloud base)
-    this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(16, nx >> 1)), mk(S.shaftVert, S.shaftFrag, {
+    this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(8, Math.min(q.shafts, nx >> 1))), mk(S.shaftVert, S.shaftFrag, {
       uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 },
     }, { transparent: true, depthWrite: false }));
     this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
@@ -126,16 +186,18 @@ export class Engine {
     // ---- rain + splashes
     this.rainMesh = new THREE.Mesh(this.buildParticles(q.rain), mk(S.rainVert, S.rainFrag, { uSnowLevel: { value: 3500 } }, { transparent: true, depthWrite: false }));
     this.rainMesh.frustumCulled = false; this.rainMesh.renderOrder = 3; this.scene.add(this.rainMesh);
-    this.splashMesh = new THREE.Mesh(this.buildParticles(Math.floor(q.rain * 0.42)), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    this.splashMesh = new THREE.Mesh(this.buildParticles(Math.max(1, Math.floor(q.rain * 0.42))), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    if (!q.splashes) this.splashMesh.visible = false;
     this.splashMesh.frustumCulled = false; this.splashMesh.renderOrder = 3; this.scene.add(this.splashMesh);
 
     // ---- cloud + composite passes
     this.cloudMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.cloudFrag, depthTest: false, depthWrite: false,
+      ...(this.defs ? { defines: { ...this.defs } } : {}),
       uniforms: {
         ...U, uNoise: { value: this.noiseTex }, uDepth: { value: null }, uHist: { value: null }, uInvProj: { value: new THREE.Matrix4() },
         uCamWorld: { value: new THREE.Matrix4() }, uPrevVP: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
-        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
+        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.tier === 'low' ? 26 : 96 }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
       },
     });
     const cq = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.cloudMat); cq.frustumCulled = false; this.cloudScene.add(cq);
@@ -220,6 +282,7 @@ export class Engine {
   }
 
   resize(w: number, h: number) {
+    this.cssW = w; this.cssH = h;
     this.renderer.setSize(w, h, false);
     const pr = this.renderer.getPixelRatio();
     const W = Math.max(2, Math.floor(w * pr)), H = Math.max(2, Math.floor(h * pr));
@@ -418,12 +481,16 @@ export class Engine {
 
     // ---- dynamic resolution for the cloud pass
     this.frameMs = this.frameMs * 0.95 + (performance.now() - t0 + dtReal * 0) * 0.05;
+    if (dtReal > 1e-4) this.fps += (1 / dtReal - this.fps) * Math.min(1, dtReal * 0.15);
     const frameDt = dtReal * 1000;
     if (frameDt > 26) { this.lowTimer += dtReal; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += dtReal; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     // coarsen the march before dropping the cloud buffer resolution: steps are cheaper than pixels
+    if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     if (this.lowTimer > 1.6) {
-      if (this.dynStep < 2.2) this.dynStep = Math.min(2.2, this.dynStep + 0.3);
-      else if (this.cloudScale > 0.24) { this.cloudScale = Math.max(0.24, this.cloudScale - 0.08); this.rebuildCloud(); }
+      if (this.dynStep < 2.4) this.dynStep = Math.min(2.4, this.dynStep + 0.3);
+      else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.06); this.rebuildCloud(); }
+      else if (this.renderer.getPixelRatio() > 0.4) { this.renderer.setPixelRatio(Math.max(0.4, this.renderer.getPixelRatio() - 0.12)); this.resize(this.cssW, this.cssH); }
+      else { const u = this.cloudMat.uniforms.uMaxSteps; u.value = Math.max(14, u.value - 3); }
       this.lowTimer = 0;
     }
     if (this.highTimer > 6) {
