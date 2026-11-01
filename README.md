@@ -37,6 +37,24 @@ Then pick an initial environment and press **▶ enter simulation**. The first s
 appear after ~3 simulated hours of daytime heating, so run at a time-lapse speed of ×15 or
 higher if you do not want to wait in real time.
 
+### Render quality (phones and integrated GPUs)
+
+The renderer picks a quality tier from the GPU string: `high` for desktop GPUs, `mid` for
+mid-range mobile/Apple/integrated parts, and `low` for entry-level mobile (Adreno 6xx and older,
+Mali-T/G5x and similar). The menu shows the detected GPU next to `RENDER QUALITY` and lets you
+override it with **auto / low / mid / high**; the choice is stored in `localStorage`.
+
+On the `low` tier every shader compiles a cut-down variant (`#ifdef LOWQ`): a 26-step cloud march
+with one-tap sun transmittance and one-octave detail, single-tap cloud shading on terrain, water
+and trees, no splash crowns, a quarter of the trees and particles, no MSAA and a 0.62× pixel
+ratio. Whatever the tier, the renderer also degrades at runtime — first it coarsens the cloud
+march, then the cloud buffer, then the pixel ratio, then the step budget — and recovers when
+frames are comfortable again. The `ⓘ` panel reports tier, measured fps, pixel ratio and cloud
+scale, which is the quickest way to see what the device settled on.
+
+Diagnostics: append `?perf=low|mid|high` to force a tier and `&noadapt=1` to freeze the runtime
+degradation (useful when profiling).
+
 ### "I just get a white / blank screen"
 
 The source `index.html` at the repository root **only works through Vite** — it loads
