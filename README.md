@@ -10,15 +10,15 @@ the simulation rather than from scripted animation.
 
 ## Live site
 
-GitHub Pages serves the prebuilt app (deployed from `main` by
-[`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml)):
-
 **https://seamless45-cpu.github.io/3D-Weather-Sandbox-WS-PRO/**
 
-GitHub Pages is a plain static host, so it cannot run `src/main.tsx`. The deployed site is the
-single-file build: the workflow publishes `atmos-sim-standalone.html` as `index.html`. When the
-source `index.html` is opened on any static host instead, it notices that Vite is absent and
-redirects itself to `atmos-sim-standalone.html` next to it.
+GitHub Pages is a plain static host, so it cannot run `src/main.tsx`. Pages is therefore served
+from the `docs/` folder of `main`, which contains the prebuilt single-file app
+(`docs/index.html`, produced by `npm run build:standalone`).
+
+When the *source* `index.html` is opened on any static host instead, it notices that Vite is
+absent and redirects itself to `atmos-sim-standalone.html` next to it, so a branch-root Pages
+deployment also works.
 
 ## Quick start
 
@@ -60,7 +60,7 @@ the panel polls the failed script every 3 seconds and reloads as soon as the ser
 | --- | --- |
 | `npm run dev` | Vite dev server (HMR) |
 | `npm run build` | Production build → `dist/index.html` (single self-contained file) |
-| `npm run build:standalone` | Build + copy to `atmos-sim-standalone.html` (openable from disk) |
+| `npm run build:standalone` | Build + copy to `atmos-sim-standalone.html` and `docs/index.html` |
 | `npm run preview` | Serve the production build on http://localhost:4173 |
 | `npm run typecheck` | TypeScript project check (app + scripts) |
 | `npm test` | Headless simulation smoke test (see below) |
