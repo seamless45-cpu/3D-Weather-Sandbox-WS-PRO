@@ -1,8 +1,8 @@
 /**
  * Headless smoke test for the convective atmosphere core.
  *
- * Usage: npm test -- [preset] [N] [NZ] [hours]
- *   preset : capped | fairwx | pulse | squall | super   (default: pulse)
+ * Usage: npm test -- [cape] [N] [NZ] [hours]
+ *   cape   : target surface-based CAPE in J/kg          (default: 2200)
  *   N, NZ  : horizontal / vertical grid points          (default: 64 36)
  *   hours  : simulated hours to integrate               (default: 4)
  *
@@ -12,17 +12,34 @@
  * solution blows up (non-finite kinetic energy).
  */
 import { Atmosphere } from '../src/sim/atmosphere';
-import { PRESETS, runValidation, parcelAscent } from '../src/sim/thermo';
+import { runValidation, parcelAscent } from '../src/sim/thermo';
+import { DEFAULT_PARAMS, SimParams, clampParams } from '../src/sim/params';
 import { Terrain } from '../src/sim/terrain';
 
-const [pid = 'pulse', nArg, nzArg, hoursArg] = process.argv.slice(2);
-const N = Number(nArg || 64);
-const NZ = Number(nzArg || 36);
-const hours = Number(hoursArg || 4);
-
-const preset = PRESETS.find((p) => p.id === pid);
-if (!preset) {
-  console.error(`unknown preset "${pid}" — choose from: ${PRESETS.map((p) => p.id).join(', ')}`);
+const args = process.argv.slice(2);
+const flags = new Map<string, number>();
+for (const a of args.filter((x) => x.startsWith('--'))) {
+  const [k, v] = a.slice(2).split('=');
+  flags.set(k, Number(v));
+}
+const pos = args.filter((x) => !x.startsWith('--'));
+const cape = Number(pos[0] ?? 2200);
+const N = Number(pos[1] ?? 64);
+const NZ = Number(pos[2] ?? 36);
+const hours = Number(pos[3] ?? 4);
+const params: SimParams = clampParams({
+  ...DEFAULT_PARAMS,
+  cape,
+  lakeEvap: flags.get('lake') ?? DEFAULT_PARAMS.lakeEvap,
+  landEvap: flags.get('land') ?? DEFAULT_PARAMS.landEvap,
+  dropletSpawn: flags.get('spawn') ?? DEFAULT_PARAMS.dropletSpawn,
+  freezing: flags.get('freeze') ?? DEFAULT_PARAMS.freezing,
+  evaporation: flags.get('evap') ?? DEFAULT_PARAMS.evaporation,
+  melting: flags.get('melt') ?? DEFAULT_PARAMS.melting,
+  precipTempC: flags.get('precipT') ?? DEFAULT_PARAMS.precipTempC,
+});
+if (!isFinite(cape)) {
+  console.error('cape must be a number of J/kg, e.g. `npm test -- 2500 64 36 4`');
   process.exit(2);
 }
 
@@ -35,7 +52,8 @@ const t0 = Date.now();
 const terr = new Terrain(256);
 console.log('terrain', Date.now() - t0, 'ms');
 
-const a = new Atmosphere(N, NZ, preset, terr);
+const a = new Atmosphere(N, NZ, params, terr);
+console.log('environment SBCAPE', a.env.cape.toFixed(0), 'J/kg (target', params.cape + ')');
 
 // Diagnostic sounding of the initial column.
 const T = new Float64Array(NZ);

@@ -33,7 +33,7 @@ export class Engine {
   rtScene!: THREE.WebGLRenderTarget; rtCloud: THREE.WebGLRenderTarget[] = []; cur = 0;
   cloudScene = new THREE.Scene(); compScene = new THREE.Scene(); ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   cloudMat: THREE.ShaderMaterial; compMat: THREE.ShaderMaterial;
-  terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh;
+  terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh; shaftMesh: THREE.Mesh;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
@@ -41,7 +41,7 @@ export class Engine {
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
   frameMs = 16; lowTimer = 0; highTimer = 0; cloudScale: number;
   flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0);
-  lightingDayness = 1; camTau = 0; rainAtCam = 0; rh = 0.5;
+  lightingDayness = 1; camTau = 0; rainAtCam = 0; rh = 0.5; snowLevel = 3500;
 
   constructor(canvas: HTMLCanvasElement, q: Quality, terrain: Terrain, nx: number, nzr: number) {
     this.q = q; this.terrain = terrain; this.nx = nx; this.nz = nzr; this.cloudScale = q.cloudScale;
@@ -116,6 +116,12 @@ export class Engine {
     }));
     this.treeMesh.frustumCulled = false; this.treeMesh.renderOrder = 1; this.scene.add(this.treeMesh);
 
+    // ---- precipitation shafts (one billboard per column, from the ground into the cloud base)
+    this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(16, nx >> 1)), mk(S.shaftVert, S.shaftFrag, {
+      uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 },
+    }, { transparent: true, depthWrite: false }));
+    this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
+
     // ---- rain + splashes
     this.rainMesh = new THREE.Mesh(this.buildParticles(q.rain), mk(S.rainVert, S.rainFrag, {}, { transparent: true, depthWrite: false }));
     this.rainMesh.frustumCulled = false; this.rainMesh.renderOrder = 3; this.scene.add(this.rainMesh);
@@ -138,6 +144,36 @@ export class Engine {
     });
     const cp = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.compMat); cp.frustumCulled = false; this.compScene.add(cp);
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+  }
+
+  /** Grid of cylindrical billboards, one per precipitation column, driven by the surface rain texture. */
+  private buildShafts(n: number): THREE.BufferGeometry {
+    const g = new THREE.BufferGeometry();
+    const quads = n * n;
+    const col = new Float32Array(quads * 4 * 4);
+    const corner = new Float32Array(quads * 4 * 2);
+    const pos = new Float32Array(quads * 4 * 3);
+    const idx = new Uint32Array(quads * 6);
+    const cell = DOMAIN / n;
+    let q = 0;
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const x = (i + 0.5) * cell, z = (j + 0.5) * cell;
+      const seed = ((((i * 73856093) ^ (j * 19349663)) >>> 0) % 997) / 997;
+      for (let v = 0; v < 4; v++) {
+        const vi = q * 4 + v;
+        corner[vi * 2] = v === 1 || v === 3 ? 1 : 0;
+        corner[vi * 2 + 1] = v >= 2 ? 1 : 0;
+        col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = seed; col[vi * 4 + 3] = 0;
+      }
+      idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4 + 2, q * 4 + 1, q * 4 + 3], q * 6);
+      q++;
+    }
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aCol', new THREE.BufferAttribute(col, 4));
+    g.setAttribute('aCorner', new THREE.BufferAttribute(corner, 2));
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(DOMAIN / 2, 4000, DOMAIN / 2), DOMAIN);
+    return g;
   }
 
   private buildTrees(grid: number): THREE.InstancedBufferGeometry {
@@ -210,6 +246,7 @@ export class Engine {
     this.offT = realNow;
     this.lastSimTime = s.time;
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
+    if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
     this.localWind.set(s.local.u, s.local.v);
   }
 
@@ -299,8 +336,11 @@ export class Engine {
     U.uSkyAmb.value.set(lt.skyAmb[0], lt.skyAmb[1], lt.skyAmb[2]).multiplyScalar(0.55 + 0.45 * dim);
     U.uHorizon.value.set(...lt.horizon); U.uGroundAmb.value.set(...lt.groundAmb); U.uTwilight.value = lt.twilight;
     U.uTime.value = this.time;
-    U.uVis.value = Math.max(2500, (34000 * (1 - 0.45 * this.rh)) / (1 + 0.06 * this.rainAtCam));
+    U.uVis.value = Math.max(3000, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.05 * this.rainAtCam));
     U.uCamXZ.value.set(cam.x, cam.z);
+    const sm = this.shaftMesh.material as THREE.ShaderMaterial;
+    sm.uniforms.uShaftWind.value.set(this.localWind.x, this.localWind.y);
+    sm.uniforms.uSnowLevel.value = this.snowLevel;
     this.localWind.lerp(this.tmpV.set(this.localWind.x, this.localWind.y, 0), 0);
     const tw = this.treeMesh.material as THREE.ShaderMaterial;
     const ww = Math.min(3.2, Math.hypot(this.localWind.x, this.localWind.y) * 0.3);

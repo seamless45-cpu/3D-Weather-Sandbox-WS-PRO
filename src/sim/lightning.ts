@@ -63,17 +63,18 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
   tips.push({ x, y, z, s: -1, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0 });
   const EPROP = 1.2e4, ETA = 1.5;
   let grounded = false, strikeNode = -1, strikeSign = 0, attachGen = 0;
-  const MAXSEG = 760;
+  const MAXSEG = 1200;
   let gen = 0;
-  const NC = 14;
-  for (gen = 1; gen <= 170 && nodesX.length < MAXSEG; gen++) {
+  const NC = 16;
+  for (gen = 1; gen <= 240 && nodesX.length < MAXSEG; gen++) {
     let any = false;
     const nt = tips.length;
     for (let ti = 0; ti < nt; ti++) {
       const tp = tips[ti];
       if (!tp.alive) continue;
       any = true;
-      const len = 55 + 55 * rnd();
+      // stepped leader: short steps near the tip of a fresh branch, longer as it matures
+      const len = (38 + 62 * rnd()) * (1 - Math.min(0.45, tp.order * 0.12));
       const dV = EPROP * len;
       let best = -1, tot = 0;
       const cw: number[] = [], cx: number[] = [], cy: number[] = [], cz: number[] = [], cdx: number[] = [], cdy: number[] = [], cdz: number[] = [];
@@ -96,7 +97,12 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
       for (let c = 0; c < NC; c++) { r -= cw[c]; if (r <= 0) { best = c; break; } }
       if (best < 0) best = cw.lastIndexOf(Math.max(...cw));
       const parent = tp.node;
-      tp.x = cx[best]; tp.y = cy[best]; tp.z = cz[best];
+      // tortuosity: a real channel never runs straight, so kink every step a little
+      const jit = 0.3 * len;
+      tp.x = cx[best] + (rnd() - 0.5) * jit;
+      tp.y = cy[best] + (rnd() - 0.5) * jit * 0.7;
+      tp.z = cz[best] + (rnd() - 0.5) * jit;
+      if (tp.y < 25) tp.y = 25;
       tp.dx = 0.5 * tp.dx + 0.5 * cdx[best]; tp.dy = 0.5 * tp.dy + 0.5 * cdy[best]; tp.dz = 0.5 * tp.dz + 0.5 * cdz[best];
       const nl = Math.hypot(tp.dx, tp.dy, tp.dz) || 1; tp.dx /= nl; tp.dy /= nl; tp.dz /= nl;
       nodesX.push(tp.x); nodesY.push(tp.y); nodesZ.push(tp.z); nodeGen.push(gen); nodeParent.push(parent); nodeOrder.push(tp.order);
@@ -108,10 +114,15 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
         grounded = true; strikeNode = tp.node; strikeSign = tp.s; attachGen = gen; phiCh = 0; tp.alive = false;
         continue;
       }
-      // branching
-      if (tips.length < 26 && rnd() < 0.06) {
+      // branching: main channels fork repeatedly; forks themselves fork more rarely
+      const pBranch = 0.075 * Math.pow(0.62, tp.order) * (tp.order === 0 ? 1 : 1.25);
+      if (tips.length < 52 && rnd() < pBranch) {
+        // forked leaders leave the parent at a shallow angle, in the direction of the ambient field
         const d = rdir();
-        tips.push({ x: tp.x, y: tp.y, z: tp.z, s: tp.s, dx: d[0], dy: d[1], dz: d[2], order: tp.order + 1, alive: true, node: tp.node });
+        const k = 0.35 + 0.45 * rnd();
+        let bx = tp.dx * (1 - k) + d[0] * k, by = tp.dy * (1 - k) + d[1] * k, bz = tp.dz * (1 - k) + d[2] * k;
+        const bl = Math.hypot(bx, by, bz) || 1; bx /= bl; by /= bl; bz /= bl;
+        tips.push({ x: tp.x, y: tp.y, z: tp.z, s: tp.s, dx: bx, dy: by, dz: bz, order: tp.order + 1, alive: true, node: tp.node });
       }
     }
     if (!any) break;
@@ -159,9 +170,9 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
     strike = [nodesX[strikeNode], nodesZ[strikeNode], ((nodesY[strikeNode] % L) + L) % L];
     let t = attachGen * STEP + 0.002;
     const positive = type === 'CG+';
-    const ns = positive ? (rnd() < 0.75 ? 1 : 2) : Math.min(8, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.2));
+    const ns = positive ? (rnd() < 0.75 ? 1 : 2) : Math.min(10, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.4));
     strokes.push({ t, amp: positive ? 1.35 : 1 });
-    for (let s = 1; s < ns; s++) { t += 0.035 + 0.08 * rnd(); strokes.push({ t, amp: 0.22 + 0.5 * rnd() }); }
+    for (let s = 1; s < ns; s++) { t += 0.03 + 0.075 * rnd(); strokes.push({ t, amp: (0.26 + 0.52 * rnd()) * (1 - 0.06 * s) }); }
     ccEnd = strokes[0].t + (positive ? 0.09 + 0.2 * rnd() : 0.01 + 0.04 * rnd());
     ccAmp = positive ? 0.2 : 0.12;
   } else {
