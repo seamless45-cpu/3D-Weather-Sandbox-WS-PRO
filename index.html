@@ -4,9 +4,67 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>ATMOS//SIM — Real-time 3D Convective Atmosphere</title>
+    <style>
+      /* Critical inline styles: the page must never flash a blank white screen. */
+      html, body { margin: 0; height: 100%; background: #02050a; color: #bfeeea; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+      #boot-fallback { display: none; position: fixed; inset: 0; z-index: 99; place-items: center; padding: 24px; background: #02050a; }
+      #boot-fallback > div { max-width: 470px; border: 1px solid rgba(0, 255, 225, 0.22); background: rgba(4, 14, 24, 0.72); padding: 14px; font-size: 12px; line-height: 1.55; }
+      #boot-fallback b { color: #00ffe0; }
+      #boot-fallback code { color: #ffd27a; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+
+    <!-- Shown only if the app never boots (opened from disk, served without Vite, or a runtime
+         failure), so the page can never be a blank screen with no explanation. -->
+    <div id="boot-fallback">
+      <div>
+        <div><b>ATMOS//SIM COULD NOT BOOT</b></div>
+        <div id="boot-reason" style="margin: 6px 0; color: #ffd27a"></div>
+        <div>
+          This page needs the Vite dev server:<br />
+          <code>npm install &amp;&amp; npm run dev</code> &rarr; http://localhost:5173<br /><br />
+          Or open the prebuilt single file <code>atmos-sim-standalone.html</code> in this folder
+          (no server required; regenerate with <code>npm run build:standalone</code>).<br /><br />
+          Opening this source <code>index.html</code> from disk or from a static host cannot work:
+          browsers cannot execute <code>src/main.tsx</code> without Vite.
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        var shown = false;
+        function mounted() {
+          return !!(document.querySelector('#root .hud') || document.querySelector('#root canvas'));
+        }
+        function show(reason) {
+          if (shown || mounted()) return;
+          shown = true;
+          var f = document.getElementById('boot-fallback');
+          var r = document.getElementById('boot-reason');
+          if (r && reason) r.textContent = String(reason).slice(0, 300);
+          if (f) f.style.display = 'grid';
+        }
+        // Give React a beat to mount before blaming an error for the blank page.
+        function scheduleShow(reason) {
+          setTimeout(function () { show(reason); }, 1500);
+        }
+        window.addEventListener('error', function (e) {
+          var t = e.target;
+          if (t && t !== window && (t.src || t.href)) scheduleShow('failed to load ' + (t.src || t.href));
+          else scheduleShow(e.message || 'script error');
+        }, true);
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason;
+          scheduleShow((r && r.message) || r || 'unhandled promise rejection');
+        });
+        setTimeout(function () {
+          if (!mounted()) show('the app never mounted (6 s timeout)');
+        }, 6000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

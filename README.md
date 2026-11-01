@@ -10,19 +10,40 @@ the simulation rather than from scripted animation.
 
 ## Quick start
 
+**Option A — dev server (recommended):**
+
 ```bash
 npm ci          # install dependencies
 npm run dev     # dev server on http://localhost:5173 (also bound to 0.0.0.0)
 ```
 
-Open the printed URL, pick an initial environment, and press **▶ enter simulation**.
-The first storms typically appear after ~3 simulated hours of daytime heating, so run at a
-time-lapse speed of ×15 or higher if you do not want to wait in real time.
+**Option B — zero setup:** open [`atmos-sim-standalone.html`](atmos-sim-standalone.html) in a
+modern browser. It is the whole app inlined into one file and runs straight from disk
+(`file://`) or any static host. Rebuild it with `npm run build:standalone`.
+
+Then pick an initial environment and press **▶ enter simulation**. The first storms typically
+appear after ~3 simulated hours of daytime heating, so run at a time-lapse speed of ×15 or
+higher if you do not want to wait in real time.
+
+### "I just get a white / blank screen"
+
+The source `index.html` at the repository root **only works through Vite** — it loads
+`/src/main.tsx`, which a browser cannot execute. If you open it from disk, from GitHub's file
+view, or from a plain static server, nothing can mount. Instead:
+
+* use the dev server (`npm run dev` → http://localhost:5173), or
+* open the prebuilt `atmos-sim-standalone.html`.
+
+Since the sources cannot boot that way, such a page now shows a dark "ATMOS//SIM COULD NOT
+BOOT" panel with the reason (for example `failed to load …/src/main.tsx`) instead of a blank
+white page. The same panel appears if a runtime error or worker/WebGL failure prevents the app
+from mounting.
 
 | Script | What it does |
 | --- | --- |
 | `npm run dev` | Vite dev server (HMR) |
 | `npm run build` | Production build → `dist/index.html` (single self-contained file) |
+| `npm run build:standalone` | Build + copy to `atmos-sim-standalone.html` (openable from disk) |
 | `npm run preview` | Serve the production build on http://localhost:4173 |
 | `npm run typecheck` | TypeScript project check (app + scripts) |
 | `npm test` | Headless simulation smoke test (see below) |
@@ -69,7 +90,9 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
 
 ## Notes
 
-* Requires a WebGL2-capable browser with hardware acceleration.
+* Requires a WebGL2-capable browser (software rendering such as SwiftShader also works).
+* The UI has been smoke-tested headlessly in Chromium: the dev server, the production build and
+  the standalone file all mount, initialise the worker and render the volumetric scene.
 * The terrain and solver are periodic and flat-level; nothing smaller than ~1.5 km is resolved.
 * `3d-atmospheric-weather-simulation (2).zip` is the original uploaded archive; the extracted
   sources at the repository root are the working copy.
