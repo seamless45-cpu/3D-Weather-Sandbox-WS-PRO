@@ -5,7 +5,7 @@ uniform float uTime;
 uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uSkyAmb; uniform vec3 uHorizon; uniform vec3 uGroundAmb;
 uniform float uTwilight; uniform float uDomain; uniform float uVis; uniform float uSkyScale;
 uniform sampler3D uCloud;
-uniform vec4 uFlash[6]; uniform vec3 uFlashCol;
+uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
 const vec3 BR = vec3(5.8e-6, 13.5e-6, 33.1e-6);
 const float BMIE = 21e-6;
@@ -337,40 +337,66 @@ void main(){
   ao = ao;
 }`;
 
+// ---------------------------------------------------------------------------------------------
+// Precipitation. Two layers:
+//   * particles  - individual motion-blurred streaks within ~60 m of the camera (rain or snow)
+//   * curtains   - one billboard per precipitation column, drawn as a scrolling veil that hangs
+//                  from the cloud base to the ground; this is what makes a shower read as a shaft
+// ---------------------------------------------------------------------------------------------
 export const rainVert = /* glsl */ `
 ${COMMON}
 ${TERRAIN_FN}
 attribute vec3 aSeed;
-varying float vAlpha; varying float vX; varying vec3 vCol;
+uniform float uSnowLevel;
+varying float vAlpha; varying vec2 vQ; varying vec3 vCol; varying float vDist; varying float vFlake;
 void main(){
-  vec3 size = vec3(110.0, 56.0, 110.0);
-  float vt = 6.5;
-  vec3 vel = vec3(uWind.x * 1.15, -vt, uWind.y * 1.15);
+  vec3 size = vec3(86.0, 48.0, 86.0);
   vec3 seed = aSeed * size;
+  float rnd = fract(aSeed.x * 91.7 + aSeed.y * 37.3 + aSeed.z * 13.1);
+  float rnd2 = fract(aSeed.y * 51.3 + aSeed.z * 17.9 + aSeed.x * 7.1);
+  vec3 rel0 = mod(seed - cameraPosition + size * 0.5, size) - size * 0.5;
+  // above the snow level the same particles fall slowly and drift like flakes
+  float flake = smoothstep(uSnowLevel - 250.0, uSnowLevel + 500.0, cameraPosition.y + rel0.y);
+  float fall = mix(6.2 + rnd * 3.8, 1.2 + rnd * 1.0, flake);
+  vec3 vel = vec3(uWind.x * mix(1.1, 1.6, flake), -fall, uWind.y * mix(1.1, 1.6, flake));
   vec3 rel = mod(seed + vel * uTime - cameraPosition + size * 0.5, size) - size * 0.5;
+  float dist = length(rel);
+  if (dist > 56.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }   // beyond the particle layer
   vec3 p = cameraPosition + rel;
   vec4 s = sampleCloud(p);
-  float inten = pow(s.g, 0.75);
-  float rnd = fract(aSeed.x * 91.7 + aSeed.y * 37.3 + aSeed.z * 13.1);
-  float vis = step(rnd, inten) * step(groundH(p.xz) + 0.1, p.y) * step(0.004, s.g);
+  if (s.g < 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  float inten = pow(s.g, 0.7);
+  if (mix(rnd, rnd2, flake) > inten) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  if (p.y < 1400.0 && p.y < groundH(p.xz) + 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  // streak geometry: heavy drops draw long thin streaks, flakes are short and wide
+  float len = mix(0.8 + 2.4 * rnd, 0.20 + 0.10 * rnd, flake) * (1.0 + clamp(dist * 0.03, 0.0, 2.0));
+  float wid = mix(0.005 + 0.004 * rnd, 0.018 + 0.012 * rnd, flake) + dist * 0.00055;
   vec3 dirV = normalize(vel);
-  float len = 0.75;
   vec3 center = p - dirV * len * 0.5;
   vec3 toCam = normalize(cameraPosition - center);
-  vec3 side = normalize(cross(dirV, toCam));
-  float dist = length(cameraPosition - center);
-  float w = 0.005 + dist * 0.0009;
-  vec3 wp = center + dirV * (position.y * len) + side * (position.x * w * 2.0);
-  vAlpha = vis * 0.42 * smoothstep(0.6, 3.0, dist) * (1.0 - smoothstep(35.0, 55.0, dist));
-  vX = position.x * 2.0;
-  vCol = (uSkyAmb * 0.9 + uSunCol * 0.2 + vec3(0.01)) * 1.15 + flashLight(p, vec3(0.0, 1.0, 0.0)) * 0.6;
-  gl_Position = vis > 0.5 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+  vec3 side = normalize(cross(dirV, toCam) + vec3(1e-5));
+  vec3 wp = center + dirV * (position.y * len) + side * (position.x * wid * 2.0);
+  vQ = position.xy * 2.0;
+  vDist = dist;
+  vFlake = flake;
+  // forward scattering: drops light up when the sun is behind them
+  float fwd = pow(max(dot(-toCam, uSunDir), 0.0), 8.0);
+  vec3 col = uSkyAmb * 1.15 + uSunCol * (0.12 + 0.7 * fwd) + uGroundAmb * 0.45 + vec3(0.02);
+  if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 0.0, 1.0)) * 0.9;
+  vCol = mix(col, col * vec3(1.05, 1.05, 1.1) + vec3(0.05), flake);
+  vAlpha = smoothstep(0.35, 1.5, dist) * (1.0 - smoothstep(34.0, 56.0, dist)) * mix(0.72, 0.4, flake);
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const rainFrag = /* glsl */ `
-varying float vAlpha; varying float vX; varying vec3 vCol;
+varying float vAlpha; varying vec2 vQ; varying vec3 vCol; varying float vDist; varying float vFlake;
 void main(){
-  float a = vAlpha * (1.0 - smoothstep(0.4, 1.0, abs(vX)));
+  // capsule mask: fade the streak ends, round the cross-section
+  float along = abs(vQ.y);
+  float across = abs(vQ.x);
+  float capsule = (1.0 - smoothstep(0.45, 1.0, along)) * (1.0 - smoothstep(0.15, 1.0, across));
+  float a = vAlpha * capsule;
   if (a < 0.003) discard;
+  a *= mix(1.0, 0.5, smoothstep(8.0, 55.0, vDist));   // distant drops blur into a veil
   gl_FragColor = vec4(vCol, a);
 }`;
 
@@ -378,36 +404,44 @@ export const splashVert = /* glsl */ `
 ${COMMON}
 ${TERRAIN_FN}
 attribute vec3 aSeed;
-varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol;
+varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol; varying float vDist;
 void main(){
   vec2 size = vec2(70.0);
   vec2 rel = mod(aSeed.xy * size - cameraPosition.xz + size * 0.5, size) - size * 0.5;
+  float rdist = length(rel);
+  if (rdist > 48.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 xz = cameraPosition.xz + rel;
   float gh = groundH(xz);
   vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
   float inten = pow(s.g, 0.75);
   float ph = fract(uTime * 1.9 + aSeed.z * 13.0);
   float vis = step(fract(aSeed.z * 37.7), inten * 0.9) * step(0.004, s.g) * step(0.0, gh);
-  float r = 0.03 + 0.17 * ph;
-  vec3 wp = vec3(xz.x + position.x * 2.0 * r, gh + 0.04, xz.y + position.y * 2.0 * r);
-  vPh = ph; vP = position.xy * 2.0; vVis = vis * (1.0 - smoothstep(30.0, 55.0, length(rel)));
-  vCol = (uSkyAmb * 0.9 + uSunCol * 0.2 + vec3(0.01)) * 1.4 + flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6;
+  float r = 0.04 + 0.19 * ph;
+  vec3 wp = vec3(xz.x + position.x * 2.0 * r, gh + 0.03, xz.y + position.y * 2.0 * r);
+  vPh = ph; vP = position.xy * 2.0;
+  vDist = length(rel);
+  vVis = vis * (1.0 - smoothstep(26.0, 48.0, vDist));
+  vCol = (uSkyAmb * 0.85 + uSunCol * 0.3 + vec3(0.01)) * 1.3;
+  if (uFlashOn > 0.5) vCol += flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6;
   gl_Position = vis > 0.5 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
 }`;
 export const splashFrag = /* glsl */ `
-varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol;
+varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol; varying float vDist;
 void main(){
   float rr = length(vP);
-  float ring = smoothstep(0.55, 0.8, rr) * (1.0 - smoothstep(0.8, 1.0, rr));
-  float a = ring * (1.0 - vPh) * 0.55 * vVis;
+  // expanding crown ring plus the fine mist kicked up around it
+  float ring = smoothstep(0.55, 0.78, rr) * (1.0 - smoothstep(0.78, 1.0, rr));
+  float mist = (1.0 - smoothstep(0.0, 0.95, rr)) * 0.12;
+  float a = (ring * 0.34 + mist) * (1.0 - vPh) * (1.0 - vPh) * 0.85 * vVis;
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// Rain shafts: one cylindrical billboard per precipitation column, from the ground up into the
-// cloud base, slanted by the local wind and textured with falling streaks. This is what makes the
-// precipitation read as a solid shaft instead of a sprinkle of particles.
+// Rain curtains. One cylindrical billboard per precipitation column, hanging from the cloud base
+// down to the ground, slanted by the wind shear it falls through. The veil is textured with
+// strongly anisotropic noise that scrolls downward, so it reads as falling sheets of water
+// rather than a flat grey card. Near the camera the curtains fade out (particles take over).
 // ---------------------------------------------------------------------------------------------
 export const shaftVert = /* glsl */ `
 ${COMMON}
@@ -417,51 +451,73 @@ attribute vec2 aCorner;   // 0..1 across the quad
 uniform sampler2D uSurf;  // .g = rain rate (0..1)
 uniform vec2 uShaftWind;
 uniform float uSnowLevel;
-varying float vRain; varying float vU; varying float vSeed; varying float vSnow; varying vec3 vCol; varying float vDist;
+varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
+varying vec3 vCol; varying float vDist; varying vec2 vWorld;
 void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
-  vRain = 0.0; vU = 0.0; vSeed = aCol.z; vSnow = 0.0; vCol = vec3(0.0); vDist = 0.0;
-  if (rain <= 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vRain = 0.0; vU = 0.0; vV = 0.5; vSeed = aCol.z; vSnow = 0.0; vCol = vec3(0.0); vDist = 0.0; vWorld = vec2(0.0);
+  if (rain <= 0.02) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   float seed = aCol.z;
-  float top = 4200.0;
-  // find the precipitation base by walking up the cloud texture
+  // cloud base: walk up the column until the precipitation field appears
+  float top = 3800.0;
   for (int i = 0; i < 6; i++){
-    float h = 350.0 + float(i) * 1150.0;
-    if (sampleCloud(vec3(xz.x, h, xz.y)).g > 0.02) { top = h + 1200.0; break; }
+    float h = 400.0 + float(i) * 1150.0;
+    if (sampleCloud(vec3(xz.x, h, xz.y)).g > 0.03) { top = h + 900.0; break; }
   }
   float gy = groundH(xz);
-  vec3 p = vec3(xz.x, mix(gy + 30.0, top, aCorner.y), xz.y);
+  float depth = max(top - gy, 300.0);
+  vec3 p = vec3(xz.x, mix(gy + 20.0, top, aCorner.y), xz.y);
   // slant with the wind shear of the layer it falls through
   float fall = (top - p.y) * 0.00042;
-  p.x += uShaftWind.x * fall * 1000.0 * 0.22;
-  p.z += uShaftWind.y * fall * 1000.0 * 0.22;
-  float width = mix(200.0, 620.0, aCorner.y) * (0.55 + 0.9 * fract(seed * 13.7));
+  p.x += uShaftWind.x * fall * 220.0;
+  p.z += uShaftWind.y * fall * 220.0;
+  float width = mix(150.0, 760.0, pow(aCorner.y, 1.4)) * (0.6 + 0.8 * fract(seed * 13.7)) + depth * 0.06;
   vec3 toCam = normalize(cameraPosition - p);
   vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
   p += right * (aCorner.x - 0.5) * width;
   gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
-  vRain = smoothstep(0.004, 0.55, rain);
+  vRain = smoothstep(0.02, 0.6, rain);
   vU = aCorner.y;
+  vV = aCorner.x * 2.0 - 1.0;
   vSeed = seed;
-  vSnow = smoothstep(uSnowLevel - 200.0, uSnowLevel + 600.0, p.y);
+  vWorld = vec2(p.x, p.z);
+  vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, mix(gy, top, aCorner.y));
   vDist = length(cameraPosition - p);
-  vCol = uSkyAmb * 0.85 + uSunCol * 0.28 + vec3(0.015) + flashLight(p, vec3(0.0, 1.0, 0.0)) * 0.5;
+  vCol = uSkyAmb * 0.8 + uSunCol * 0.26 + uGroundAmb * 0.35 + vec3(0.012);
 }`;
 export const shaftFrag = /* glsl */ `
 ${COMMON}
-varying float vRain; varying float vU; varying float vSeed; varying float vSnow; varying vec3 vCol; varying float vDist;
+varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
+varying vec3 vCol; varying float vDist; varying vec2 vWorld;
 void main(){
   if (vRain < 0.01) discard;
-  float wob = vnoise2(vec2(vSeed * 31.0 + vU * 2.5, vU * 9.0 - uTime * 2.4));
-  float streak = 0.45 + 0.75 * wob;
-  float topFade = 1.0 - smoothstep(0.62, 1.0, vU);
-  float botFade = smoothstep(0.0, 0.10, vU);
-  float a = vRain * streak * topFade * botFade * 0.34;
-  a *= mix(1.0, 0.75, vSnow);
-  a *= 1.0 - smoothstep(9000.0, 16000.0, vDist);
+  // soft horizontal edges: never let the card outline show
+  float edge = 1.0 - smoothstep(0.25, 1.0, abs(vV));
+  if (edge < 0.01) discard;
+  // falling sheets: two octaves of vertically stretched noise scrolling downward
+  float fall = uTime * 34.0;
+  float n1 = vnoise2(vec2(vWorld.x * 0.020 + vWorld.y * 0.011 + vSeed * 17.0, (vU * 900.0 - fall) * 0.014));
+  float n2 = vnoise2(vec2(vWorld.x * 0.055 - vWorld.y * 0.031 + vSeed * 41.0, (vU * 900.0 - fall * 1.6) * 0.035));
+  float streak = 0.22 + 1.05 * (n1 * 0.55 + n2 * 0.45);
+  // taper: wispy where it leaves the cloud, denser and wider at the ground
+  float topFade = smoothstep(1.0, 0.55, vU);
+  float botFade = smoothstep(0.0, 0.09, vU);
+  float body = pow(vU, 0.35);
+  float a = vRain * streak * edge * topFade * botFade * mix(0.52, 0.95, vU) * (0.5 + 0.5 * body);
+  // distance handling: fade in past the particle range, fade out with aerial perspective
+  a *= smoothstep(220.0, 900.0, vDist);
+  a *= 1.0 - smoothstep(9000.0, 20000.0, vDist);
   if (a < 0.004) discard;
-  vec3 col = mix(vCol * vec3(0.78, 0.83, 0.92), vCol * vec3(1.05, 1.05, 1.08), vSnow);
+  // rain reads darker than the sky it hangs in; snow reads brighter
+  // the veil is lit by the sky it sits under, not by the (often black) ground below it
+  vec3 rainCol = (uSkyAmb * 1.05 + uSunCol * 0.24 + vec3(0.01)) * vec3(0.74, 0.79, 0.9);
+  vec3 snowCol = (uSkyAmb * 1.1 + uSunCol * 0.4 + vec3(0.02)) * vec3(1.06, 1.06, 1.1);
+  vec3 col = mix(rainCol, snowCol, vSnow);
+  // backlit veil glows toward the sun, shaded veil darkens
+  float cs = dot(normalize(vec3(vWorld.x, 0.0, vWorld.y) - cameraPosition), uSunDir);
+  col *= 1.0 + 0.55 * pow(max(cs, 0.0), 4.0);
+  if (uFlashOn > 0.5) col += flashLight(vec3(vWorld.x, 300.0, vWorld.y), vec3(0.0, 1.0, 0.0)) * 0.5;
   gl_FragColor = vec4(col, a);
 }`;
 
@@ -527,7 +583,7 @@ vec2 windOffAt(float y){
   int i0 = int(floor(f)); int i1 = min(i0 + 1, 15);
   return mix(uWindOff[i0], uWindOff[i1], f - float(i0));
 }
-float hg(float c, float g){ return (1.0 - g*g) / pow(max(1.0 + g*g - 2.0*g*c, 1e-3), 1.5); }
+float hg(float c, float g){ float b = max(1.0 + g*g - 2.0*g*c, 1e-3); return (1.0 - g*g) / (b * sqrt(b)); }
 // two-lobe droplet phase function (strong forward peak + wide backscatter), tightened by k
 float phase(float c, float k){ return 0.78 * hg(c, 0.72 * k) + 0.22 * hg(c, -0.18 * k); }
 
@@ -581,34 +637,51 @@ void main(){
   float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
   float cosT = dot(rd, uSunDir);
   vec3 L = vec3(0.0); float T = 1.0; float tHit = -1.0;
-  float t = 260.0 * jitter * uStepScale;   // dither the entry point so the march does not band
-  float amb0 = 1.0;
-  for (int i = 0; i < 112; i++){
-    if (t > t1 || T < 0.02) break;
+  float t = 60.0 * jitter * uStepScale;   // dither the entry point; the history buffer averages it out
+  // ---- coarse entry search: hop over the clear air before the condensate (<=9 cheap fetches)
+  {
+    float cstep = clamp(t1 * 0.09, 260.0, 1700.0) * uStepScale;
+    for (int i = 0; i < 9; i++){
+      if (t + cstep * 1.5 >= t1) break;
+      vec3 pc = ro + rd * t;
+      if (pc.y > 15200.0) { t = t1; break; }
+      vec4 sc0 = sampleCloud(pc);
+      if (sc0.r > 0.006 || sc0.g > 0.012) break;
+      t += cstep;
+    }
+  }
+  float tauC = 0.0;
+  for (int i = 0; i < 96; i++){
+    if (t > t1 || T < 0.035) break;
     vec3 p = ro + rd * t;
     float stepLen = clamp(0.04 * t + 60.0, 60.0, 1100.0) * uStepScale;
-    stepLen *= 0.62 + 0.76 * fract(sin(dot(vec2(gl_FragCoord.x, gl_FragCoord.y + float(i) * 1.37), vec2(12.9898, 78.233))) * 43758.5453);
+    // vary the step length per pixel *and* per frame: breaks slice banding without leaving a fixed pattern
+    stepLen *= 0.93 + 0.14 * fract(sin(dot(vec2(gl_FragCoord.x + uFrame * 3.11, gl_FragCoord.y + float(i) * 1.37), vec2(12.9898, 78.233))) * 43758.5453);
     float rainD, iceF;
-    float d = cloudDensity(p, rainD, iceF, true);
+    float d = cloudDensity(p, rainD, iceF, t < 9000.0);   // fine octaves only where they are resolvable
     float rainFade = smoothstep(120.0, 700.0, t);
     float sc = d * 0.085;
     float sr = rainD * 0.0055 * rainFade * (0.55 + 0.9 * vnoise2(vec2(p.x * 0.012 + p.z * 0.007, p.y * 0.0015)));
     float sig = sc + sr;
     if (sig > 1e-5){
-      float tau = sunTau(p);
+      if (i % 3 == 0) tauC = sunTau(p);   // sun transmittance varies slowly, refresh every third step
+      float tau = tauC;
       vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0, c = 1.0;
       for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * phase(cosT, c); a *= 0.46; b *= 0.38; c *= 0.62; }
       sunL *= 0.56;   // keep the multi-octave sum energy-normalised instead of blowing out to white
       float powder = mix(1.0, 1.0 - 0.72 * exp(-d * 8.0), 0.8 * (1.0 - smoothstep(0.15, 0.85, cosT)));
-      float silver = pow(max(cosT, 0.0), 10.0) * (1.0 - smoothstep(0.05, 0.5, d));
+      float cT = max(cosT, 0.0), cT2 = cT * cT, cT4 = cT2 * cT2;
+      float silver = cT4 * cT4 * cT2 * (1.0 - smoothstep(0.05, 0.5, d));
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
-      float up1 = sampleCloud(p + vec3(0.0, 600.0, 0.0)).r;
-      float up2 = sampleCloud(p + vec3(0.0, 1900.0, 0.0)).r;
-      float up3 = sampleCloud(p + vec3(0.0, 3800.0, 0.0)).r;
-      float aoU = exp(-(up1 * 1.15 + up2 * 0.55 + up3 * 0.25));
+      float aoU = 1.0;
+      if (d > 0.025){   // skip the two extra taps inside thin wisps
+        float up1 = sampleCloud(p + vec3(0.0, 700.0, 0.0)).r;
+        float up2 = sampleCloud(p + vec3(0.0, 2600.0, 0.0)).r;
+        aoU = exp(-(up1 * 1.35 + up2 * 0.75));
+      }
       float hDark = mix(0.58, 1.0, smoothstep(0.04, 0.40, hF));   // cloud bases read darker than sunlit tops
       vec3 amb = mix(uGroundAmb * 0.55, uSkyAmb, smoothstep(0.0, 0.7, hF)) * (0.15 + 0.85 * aoU) * (0.7 + 0.5 * d) * hDark;
-      vec3 fl = flashLight(p, vec3(0.0, 1.0, 0.0));
+      vec3 fl = uFlashOn > 0.5 ? flashLight(p, vec3(0.0, 1.0, 0.0)) : vec3(0.0);
       vec3 iceTint = mix(vec3(1.0), vec3(0.95, 0.97, 1.06), iceF);
       vec3 Sc = (uSunCol * sunL * (0.6 + 0.6 * silver) * powder + amb + fl * 0.14) * iceTint;
       vec3 Sr = (uSunCol * 0.09 * sunL + amb * 0.8 + fl * 0.1) * vec3(0.78, 0.84, 0.94);
@@ -617,9 +690,9 @@ void main(){
       L += T * (1.0 - Ts) * S;
       T *= Ts;
       if (tHit < 0.0 && T < 0.97) tHit = t;
-      t += stepLen * 0.65;
+      t += stepLen * (0.68 + 0.32 * clamp(sig * stepLen, 0.0, 1.0));
     } else {
-      t += stepLen;
+      t += stepLen * 1.25;   // clear air: stride out
     }
   }
   float dist = tHit > 0.0 ? tHit : min(t1, 45000.0);

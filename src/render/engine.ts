@@ -10,8 +10,8 @@ export interface Quality { pr: number; cloudScale: number; stepScale: number; M:
 export function detectQuality(): Quality {
   const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
   const cores = navigator.hardwareConcurrency || 4;
-  if (coarse || cores <= 4) return { pr: 1, cloudScale: 0.36, stepScale: 1.4, M: 256, rain: 6000, treeGrid: 48, msaa: 0 };
-  return { pr: Math.min(window.devicePixelRatio || 1, 1.5), cloudScale: 0.5, stepScale: 1.0, M: 512, rain: 14000, treeGrid: 72, msaa: 4 };
+  if (coarse || cores <= 4) return { pr: 1, cloudScale: 0.36, stepScale: 1.4, M: 256, rain: 7000, treeGrid: 48, msaa: 0 };
+  return { pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.5, stepScale: 1.0, M: 512, rain: 12000, treeGrid: 72, msaa: 2 };
 }
 
 export interface FlashEvent {
@@ -39,7 +39,7 @@ export class Engine {
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
-  frameMs = 16; lowTimer = 0; highTimer = 0; cloudScale: number;
+  frameMs = 16; lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1;
   flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0);
   lightingDayness = 1; camTau = 0; rainAtCam = 0; rh = 0.5; snowLevel = 3500;
 
@@ -77,6 +77,7 @@ export class Engine {
       uHorizon: { value: new V3(0.5, 0.6, 0.8) }, uGroundAmb: { value: new V3(0.2, 0.2, 0.2) }, uTwilight: { value: 0 },
       uDomain: { value: DOMAIN }, uVis: { value: 30000 }, uSkyScale: { value: 14 }, uCloud: { value: this.cloudTex },
       uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.75, 0.85, 1.0) },
+      uFlashOn: { value: 0 },
       uWind: { value: this.localWind },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
@@ -123,9 +124,9 @@ export class Engine {
     this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
 
     // ---- rain + splashes
-    this.rainMesh = new THREE.Mesh(this.buildParticles(q.rain), mk(S.rainVert, S.rainFrag, {}, { transparent: true, depthWrite: false }));
+    this.rainMesh = new THREE.Mesh(this.buildParticles(q.rain), mk(S.rainVert, S.rainFrag, { uSnowLevel: { value: 3500 } }, { transparent: true, depthWrite: false }));
     this.rainMesh.frustumCulled = false; this.rainMesh.renderOrder = 3; this.scene.add(this.rainMesh);
-    this.splashMesh = new THREE.Mesh(this.buildParticles(Math.floor(q.rain * 0.4)), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    this.splashMesh = new THREE.Mesh(this.buildParticles(Math.floor(q.rain * 0.42)), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
     this.splashMesh.frustumCulled = false; this.splashMesh.renderOrder = 3; this.scene.add(this.splashMesh);
 
     // ---- cloud + composite passes
@@ -341,6 +342,7 @@ export class Engine {
     const sm = this.shaftMesh.material as THREE.ShaderMaterial;
     sm.uniforms.uShaftWind.value.set(this.localWind.x, this.localWind.y);
     sm.uniforms.uSnowLevel.value = this.snowLevel;
+    (this.rainMesh.material as THREE.ShaderMaterial).uniforms.uSnowLevel.value = this.snowLevel;
     this.localWind.lerp(this.tmpV.set(this.localWind.x, this.localWind.y, 0), 0);
     const tw = this.treeMesh.material as THREE.ShaderMaterial;
     const ww = Math.min(3.2, Math.hypot(this.localWind.x, this.localWind.y) * 0.3);
@@ -366,6 +368,7 @@ export class Engine {
       if (t > f.end) this.removeFlash(f);
     });
     this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dtReal / 0.15));
+    U.uFlashOn.value = act.length > 0 ? 1 : 0;
 
     // ---- exposure: physically-motivated from sun elevation and overhead cloud optical depth, with flash compression
     const bright = lt.dayness * (0.3 + 0.7 * tc);
@@ -417,8 +420,18 @@ export class Engine {
     this.frameMs = this.frameMs * 0.95 + (performance.now() - t0 + dtReal * 0) * 0.05;
     const frameDt = dtReal * 1000;
     if (frameDt > 26) { this.lowTimer += dtReal; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += dtReal; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
-    if (this.lowTimer > 2.5 && this.cloudScale > 0.26) { this.cloudScale = Math.max(0.26, this.cloudScale - 0.08); this.lowTimer = 0; this.rebuildCloud(); }
-    if (this.highTimer > 8 && this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.highTimer = 0; this.rebuildCloud(); }
+    // coarsen the march before dropping the cloud buffer resolution: steps are cheaper than pixels
+    if (this.lowTimer > 1.6) {
+      if (this.dynStep < 2.2) this.dynStep = Math.min(2.2, this.dynStep + 0.3);
+      else if (this.cloudScale > 0.24) { this.cloudScale = Math.max(0.24, this.cloudScale - 0.08); this.rebuildCloud(); }
+      this.lowTimer = 0;
+    }
+    if (this.highTimer > 6) {
+      if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
+      else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.2);
+      this.highTimer = 0;
+    }
+    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * this.dynStep;
   }
   private rebuildCloud() {
     const pr = this.renderer.getPixelRatio();
