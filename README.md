@@ -34,10 +34,15 @@ view, or from a plain static server, nothing can mount. Instead:
 * use the dev server (`npm run dev` → http://localhost:5173), or
 * open the prebuilt `atmos-sim-standalone.html`.
 
-Since the sources cannot boot that way, such a page now shows a dark "ATMOS//SIM COULD NOT
-BOOT" panel with the reason (for example `failed to load …/src/main.tsx`) instead of a blank
-white page. The same panel appears if a runtime error or worker/WebGL failure prevents the app
-from mounting.
+Since the sources cannot boot that way, such a page shows a dark **"ATMOS//SIM COULD NOT
+BOOT"** panel with the exact reason (for example `failed to load …/src/main.tsx`) instead of a
+blank white page. The same panel appears if a runtime error or worker/WebGL failure prevents
+the app from mounting.
+
+If that panel appears on the live preview, the dev server is simply not running — it stops
+whenever the sandbox restarts. Start it again (`npm run dev`) and the open page reloads itself:
+the panel polls the failed script every 3 seconds and reloads as soon as the server answers
+(there is also a **↻ retry** button).
 
 | Script | What it does |
 | --- | --- |
