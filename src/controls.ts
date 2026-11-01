@@ -72,7 +72,8 @@ export class Player {
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) s += 1;
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) s -= 1;
     const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
-    const sp = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 5.5 : 2.0;
+    // 5x the original walking pace (running still ~2.75x faster than walking)
+    const sp = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 27.5 : 10.0;
     const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw), rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
     const tvx = (fx * f + rx * s) * sp, tvz = (fz * f + rz * s) * sp;
     const k = 1 - Math.exp(-dt * 7);
@@ -88,9 +89,9 @@ export class Player {
     else if (ok(this.x, nz)) { this.z = wrap(nz); this.vx *= 0.3; }
     else { this.vx = 0; this.vz = 0; }
     const speed = Math.hypot(this.vx, this.vz);
-    this.walking += speed * dt * 2.2;
+    this.walking += speed * dt * 0.55;
     const gh = Math.max(0, this.terrain.groundHeight(this.x, this.z));
-    const target = gh + EYE + Math.sin(this.walking) * 0.025 * Math.min(1, speed / 2);
+    const target = gh + EYE + Math.sin(this.walking) * 0.035 * Math.min(1, speed / 9);
     this.eyeY += (target - this.eyeY) * (1 - Math.exp(-dt * 14));
     this.y = Math.max(this.eyeY, gh + 1.2);
   }

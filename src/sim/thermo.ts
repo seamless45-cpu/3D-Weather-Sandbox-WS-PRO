@@ -12,24 +12,58 @@ export function dewpoint(q: number, p: number) {
   return (29.65 * a - 17.67 * 273.15) / (a - 17.67);
 }
 
-// ---------- environment presets (initial sounding + wind profile; NOT weather: no clouds/storms are placed) ----------
-export interface Preset {
-  id: string; name: string; blurb: string;
+// ---------- environment sounding ----------
+// There is no preset list any more: the initial sounding is generated from the CAPE control so a
+// requested instability is actually reproduced by the profile the model relaxes toward.
+export interface Environment {
+  cape: number; // SBCAPE realised by this sounding [J/kg]
   thSfc: number; thTr: number; qvMax: number; capD: number; capZ: number; midDry: number;
   shearType: 'uni' | 'curved'; shear: number; shearZ: number; u0: number; v0: number; nocturnal: number;
 }
-export const PRESETS: Preset[] = [
-  { id: 'capped', name: 'Capped / stable', blurb: 'Strong inversion, modest moisture: convection stays suppressed',
-    thSfc: 299, thTr: 346, qvMax: 0.0105, capD: 7, capZ: 1300, midDry: 0.2, shearType: 'uni', shear: 8, shearZ: 4000, u0: 1, v0: 2, nocturnal: 3.5 },
-  { id: 'fairwx', name: 'Fair-weather Cu', blurb: 'Weak instability, light shear: shallow cumulus at most',
-    thSfc: 297, thTr: 344, qvMax: 0.0095, capD: 2.0, capZ: 1700, midDry: 0.55, shearType: 'uni', shear: 6, shearZ: 4000, u0: 1.5, v0: 1.5, nocturnal: 3.5 },
-  { id: 'pulse', name: 'Airmass / pulse', blurb: 'Moist, weakly sheared: short-lived pulse storms & outflow-driven multicells',
-    thSfc: 300, thTr: 343, qvMax: 0.0135, capD: 1.5, capZ: 1800, midDry: 0.15, shearType: 'uni', shear: 6, shearZ: 4000, u0: 1, v0: 1, nocturnal: 3.5 },
-  { id: 'squall', name: 'Multicell / squall', blurb: 'Moist, strong unidirectional low-level shear: cold-pool-regenerated lines',
-    thSfc: 300, thTr: 343, qvMax: 0.0145, capD: 1.8, capZ: 1700, midDry: 0.3, shearType: 'uni', shear: 22, shearZ: 4500, u0: 1, v0: 0.5, nocturnal: 3.5 },
-  { id: 'super', name: 'Supercell env.', blurb: 'High CAPE with a strongly veering quarter-circle hodograph',
-    thSfc: 300.5, thTr: 343, qvMax: 0.0155, capD: 2.2, capZ: 1700, midDry: 0.3, shearType: 'curved', shear: 30, shearZ: 6000, u0: 0, v0: 0, nocturnal: 3.5 },
-];
+
+const BASE_ENV: Omit<Environment, 'cape'> = {
+  thSfc: 299.0, thTr: 344, qvMax: 0.0145, capD: 0.6, capZ: 1750, midDry: 0.15,
+  shearType: 'uni', shear: 12, shearZ: 4500, u0: 1, v0: 1, nocturnal: 3.5,
+};
+
+/** SBCAPE of a sounding on this grid. */
+export function soundingCape(g: Grid, env: Environment): number {
+  const p = buildProfile(g, env);
+  return parcelAscent(p.z, p.p, p.T, p.qv, 'SB').cape;
+}
+
+/**
+ * Build the environment that realises `capeTarget` J/kg of surface-based CAPE.
+ * A cap is added when little instability is asked for (so low values really stay suppressed) and
+ * the boundary layer is warmed/moistened when more is asked for; a short bisection nails the target.
+ */
+export function envForCape(g: Grid, capeTarget: number): Environment {
+  const t = Math.max(0, Math.min(4000, isFinite(capeTarget) ? capeTarget : 2000));
+  // a cap keeps low instability settings genuinely suppressed
+  const capD = 0.6 + Math.max(0, (700 - t) / 110);
+  // one knob scales a physically sane boundary layer: 296..305.6 K, 10..21.7 g/kg
+  const make = (m: number): Environment => ({
+    ...BASE_ENV,
+    cape: t,
+    capD,
+    thSfc: 296 + m * 6,
+    qvMax: 0.010 + m * 0.0072,
+  });
+  let lo = 0, hi = 1.6;
+  let best = make(0.8), bestErr = Infinity, bestCape = 0;
+  const cLo = soundingCape(g, make(lo)), cHi = soundingCape(g, make(hi));
+  if (cHi < t) lo = hi;            // even the most unstable profile is not enough
+  else if (cLo > t) hi = lo;       // already unstable enough at the driest/coolest setting
+  for (let i = 0; i < 16; i++) {
+    const m = 0.5 * (lo + hi);
+    const env = make(m);
+    const cape = soundingCape(g, env);
+    const err = Math.abs(cape - t);
+    if (err < bestErr) { bestErr = err; best = env; bestCape = cape; }
+    if (cape < t) lo = m; else hi = m;
+  }
+  return { ...best, cape: bestCape };
+}
 
 export interface Profile {
   n: number; z: Float64Array; th: Float64Array; qv: Float64Array; u: Float64Array; v: Float64Array;
@@ -37,7 +71,7 @@ export interface Profile {
   rhoF: Float64Array; pSfc: number;
 }
 
-function windAt(z: number, pr: Preset): [number, number] {
+function windAt(z: number, pr: Environment): [number, number] {
   const f = Math.min(1, z / pr.shearZ);
   const after = Math.max(0, z - pr.shearZ) / 9000;
   if (pr.shearType === 'uni') {
@@ -49,7 +83,7 @@ function windAt(z: number, pr: Preset): [number, number] {
   return [pr.u0 + U * (1 - Math.cos(a)) + 0.3 * U * after, pr.v0 + U * Math.sin(a) + 0.15 * U * after];
 }
 
-export function thetaProfile(z: number, pr: Preset, ztr = 12000, Ttr = 213): number {
+export function thetaProfile(z: number, pr: Environment, ztr = 12000, Ttr = 213): number {
   let th: number;
   if (z <= ztr) th = pr.thSfc + (pr.thTr - pr.thSfc) * Math.pow(z / ztr, 1.25);
   else th = pr.thTr * Math.exp((G / (CP * Ttr)) * (z - ztr));
@@ -58,7 +92,7 @@ export function thetaProfile(z: number, pr: Preset, ztr = 12000, Ttr = 213): num
   return th;
 }
 
-export function buildProfile(g: Grid, pr: Preset): Profile {
+export function buildProfile(g: Grid, pr: Environment): Profile {
   const n = g.nz, zc = g.zc;
   const th = new Float64Array(n), qv = new Float64Array(n), u = new Float64Array(n), v = new Float64Array(n);
   const p = new Float64Array(n), rho = new Float64Array(n), pi = new Float64Array(n), T = new Float64Array(n), thv = new Float64Array(n);
@@ -179,7 +213,7 @@ export function runValidation(): Check[] {
   const zl = ((303.15 - Tl) / 9.76) * 1000;
   out.push({ name: 'LCL T=30,Td=20', value: res.lcl.toFixed(0) + ' m', expect: `~${zl.toFixed(0)} (Bolton)`, ok: rel(res.lcl, zl) < 0.1 });
   // Weisman-Klemp (1982) analytic sounding
-  const wk: Preset = { id: 'wk', name: '', blurb: '', thSfc: 300, thTr: 343, qvMax: 0.014, capD: 0, capZ: 1e5, midDry: 0, shearType: 'uni', shear: 0, shearZ: 1000, u0: 0, v0: 0, nocturnal: 0 };
+  const wk: Environment = { cape: 2200, thSfc: 300, thTr: 343, qvMax: 0.014, capD: 0, capZ: 1e5, midDry: 0, shearType: 'uni', shear: 0, shearZ: 1000, u0: 0, v0: 0, nocturnal: 0 };
   const zz = new Float64Array(120), pp = new Float64Array(120), TT = new Float64Array(120), qq = new Float64Array(120);
   const th = new Float64Array(120), thv = new Float64Array(120);
   for (let k = 0; k < 120; k++) { zz[k] = 50 + k * 125; pp[k] = 98000 * Math.exp(-zz[k] / 8000); }

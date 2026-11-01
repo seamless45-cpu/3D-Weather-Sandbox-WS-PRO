@@ -1,8 +1,9 @@
 /// <reference lib="webworker" />
 import { Atmosphere } from './atmosphere';
-import { PRESETS, runValidation } from './thermo';
+import { runValidation } from './thermo';
+import { DEFAULT_PARAMS, SimParams, clampParams } from './params';
 import { Terrain } from './terrain';
-import { DOMAIN, ZTOP } from './consts';
+import { DOMAIN, ZTOP, T0 } from './consts';
 import { localSounding, capeMap, stormMode, diagSlice, DiagField } from './diagnostics';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -19,6 +20,20 @@ let windOff = new Float32Array(32);
 let lastSnapSimTime = 0;
 let emptyTex = false;
 let layerK0 = new Int32Array(NZR), layerW = new Float32Array(NZR);
+
+/** Height of the user's precipitation-type threshold (below it, precipitation falls frozen). */
+function precipTypeHeight(a: Atmosphere): number {
+  const thresh = T0 + a.params.precipTempC;
+  const T = a.prof.T, z = a.prof.z;
+  for (let k = 1; k < a.nz; k++) {
+    if (T[k] < thresh) {
+      if (T[k - 1] === T[k]) return z[k];
+      const f = (T[k - 1] - thresh) / (T[k - 1] - T[k]);
+      return z[k - 1] + f * (z[k] - z[k - 1]);
+    }
+  }
+  return ZTOP;
+}
 
 function setupLayers(a: Atmosphere) {
   for (let m = 0; m < NZR; m++) {
@@ -113,7 +128,7 @@ function snapshot(forceDiag = false) {
     type: 'snap', time: a.time, speed: actualSpeed, stepMs, dt: a.dt, paused,
     cloud, surf, windOff: windOff.slice(), stats: { ...a.stats }, sounding: snd, mode, capeMean: capeM.mean, capeMax: capeM.max,
     diag: d, local: { u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn, wetness: a.soilM[ij], surfW: a.surfW[ij] },
-    sunSin: a.sunSin, empty: emptyTex,
+    sunSin: a.sunSin, empty: emptyTex, snowLevel: precipTypeHeight(a), params: a.params, envCape: a.env.cape,
   };
   ctx.postMessage(msg, [cloud.buffer, surf.buffer, d.data.buffer, d.ua.buffer, d.va.buffer]);
 }
@@ -152,14 +167,25 @@ ctx.onmessage = (ev: MessageEvent) => {
   switch (m.type) {
     case 'init': {
       const terr = new Terrain(256);
-      const preset = PRESETS.find((p) => p.id === m.preset) || PRESETS[2];
-      atm = new Atmosphere(m.n, m.nz, preset, terr, m.seed || 7);
+      const params: SimParams = clampParams(m.params || DEFAULT_PARAMS);
+      atm = new Atmosphere(m.n, m.nz, params, terr, m.seed || 7);
       setupLayers(atm);
       windOff = new Float32Array(32);
       lastSnapSimTime = atm.time; capeM = null;
-      ctx.postMessage({ type: 'ready', info: { n: atm.nx, nz: atm.nz, zf: Array.from(atm.g.zf), zc: Array.from(atm.g.zc), NZR, domain: DOMAIN, ztop: ZTOP, preset: preset.id }, checks: runValidation() });
+      ctx.postMessage({
+        type: 'ready',
+        info: { n: atm.nx, nz: atm.nz, zf: Array.from(atm.g.zf), zc: Array.from(atm.g.zc), NZR, domain: DOMAIN, ztop: ZTOP, params: atm.params, envCape: atm.env.cape },
+        checks: runValidation(),
+      });
       lastT = performance.now();
       loop();
+      break;
+    }
+    case 'params': {
+      if (!atm) break;
+      const p = atm.setParams(m.params || {});
+      capeM = null;
+      ctx.postMessage({ type: 'params', params: p, envCape: atm.env.cape });
       break;
     }
     case 'cfg': if (m.paused !== undefined) paused = m.paused; if (m.speed !== undefined) speed = m.speed; break;
@@ -167,9 +193,9 @@ ctx.onmessage = (ev: MessageEvent) => {
     case 'diag': diag = { field: m.field, mode: m.mode, level: m.level }; break;
     case 'reset': {
       if (!atm) break;
-      const preset = PRESETS.find((p) => p.id === m.preset) || atm.preset;
-      atm.reset(preset); windOff = new Float32Array(32); lastSnapSimTime = atm.time; capeM = null; budget = 0;
-      ctx.postMessage({ type: 'reset', preset: preset.id });
+      atm.reset(m.params ? clampParams(m.params) : atm.params);
+      windOff = new Float32Array(32); lastSnapSimTime = atm.time; capeM = null; budget = 0;
+      ctx.postMessage({ type: 'reset', params: atm.params, envCape: atm.env.cape });
       break;
     }
   }

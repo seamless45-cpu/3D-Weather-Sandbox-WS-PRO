@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import SimWorker from './sim/worker?worker&inline';
 import { Terrain } from './sim/terrain';
-import { PRESETS } from './sim/thermo';
+import { DEFAULT_PARAMS, PARAM_SPECS, SimParams } from './sim/params';
 import { clockString } from './sim/sun';
 import { Engine, detectQuality } from './render/engine';
 import { Player } from './controls';
@@ -25,7 +25,10 @@ export default function App() {
   const skewRef = useRef<HTMLCanvasElement>(null);
   const [phase, setPhase] = useState<'menu' | 'loading' | 'run' | 'error'>('menu');
   const [error, setError] = useState<string | null>(null);
-  const [preset, setPreset] = useState('pulse');
+  const [params, setParams] = useState<SimParams>(DEFAULT_PARAMS);
+  const [envOpen, setEnvOpen] = useState(false);
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
   const [paused, setPaused] = useState(false);
   const [speed, setSpeed] = useState(30);
   const [diagOn, setDiagOn] = useState(false);
@@ -77,7 +80,7 @@ export default function App() {
           setError(ev.message || 'simulation worker failed');
           setPhase('error');
         };
-        worker.postMessage({ type: 'init', n, nz, preset, seed: 11 });
+        worker.postMessage({ type: 'init', n, nz, params: paramsRef.current, seed: 11 });
         let last = performance.now(), camT = 0, audT = 0;
         const loop = () => {
           const now = performance.now();
@@ -102,7 +105,7 @@ export default function App() {
         setPhase('error');
       }
     }, 60);
-  }, [preset]);
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => setTick((t) => (t + 1) % 1e6), 250);
@@ -110,6 +113,11 @@ export default function App() {
   }, []);
   useEffect(() => () => { const r = rtRef.current; if (r) { cancelAnimationFrame(r.raf); r.worker.terminate(); r.player.dispose(); r.engine.dispose(); } }, []);
   useEffect(() => { send({ type: 'cfg', paused, speed }); }, [paused, speed, send, phase]);
+  // live parameter changes (debounced so dragging a slider does not rebuild the sounding every frame)
+  useEffect(() => {
+    const id = setTimeout(() => send({ type: 'params', params }), 140);
+    return () => clearTimeout(id);
+  }, [params, send]);
   useEffect(() => { send({ type: 'diag', field, mode, level }); }, [field, mode, level, send, phase]);
   useEffect(() => { rtRef.current?.audio.setEnabled(sound); }, [sound]);
 
@@ -125,7 +133,7 @@ export default function App() {
     if (skewRef.current && s.sounding) drawSkewT(skewRef.current, s.sounding);
   });
 
-  const reset = () => { send({ type: 'reset', preset }); rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f)); setLastFlash(null); };
+  const reset = () => { send({ type: 'reset', params }); rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f)); setLastFlash(null); };
 
   const player = rtRef.current?.player;
   const sd = s?.sounding;
@@ -141,6 +149,28 @@ export default function App() {
     onTouchCancel: () => { if (player) { player.vf = 0; player.vs = 0; } },
   });
 
+  const paramSliders = (
+    <div className="flex flex-col gap-1.5">
+      {PARAM_SPECS.map((sp) => (
+        <label key={sp.key} className="block" title={sp.hint}>
+          <div className="flex items-baseline justify-between">
+            <span className="lbl">{sp.label}</span>
+            <b>{params[sp.key].toFixed(sp.decimals)} <span className="lbl">{sp.unit}</span></b>
+          </div>
+          <input
+            className="hr"
+            type="range"
+            min={sp.min}
+            max={sp.max}
+            step={sp.step}
+            value={params[sp.key]}
+            onChange={(e) => setParams((p) => ({ ...p, [sp.key]: Number(e.target.value) }))}
+          />
+        </label>
+      ))}
+    </div>
+  );
+
   return (
     <div className="fixed inset-0 select-none bg-black" style={{ touchAction: 'none' }}>
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ touchAction: 'none' }} />
@@ -150,14 +180,11 @@ export default function App() {
           <div className="hud scan relative w-[340px] max-w-full p-3">
             <div className="mb-1 text-[13px] tracking-[0.3em]"><b>ATMOS//SIM</b></div>
             <div className="mb-2 lbl">3-D anelastic convective atmosphere · ray-marched volumetric clouds · bulk microphysics · electrification</div>
-            <div className="mb-1 lbl">INITIAL ENVIRONMENT (clear sky start, sounding only)</div>
-            <div className="mb-2 flex flex-col gap-1">
-              {PRESETS.map((p) => (
-                <button key={p.id} onClick={() => setPreset(p.id)} className={`hbtn text-left ${preset === p.id ? 'on' : ''}`}>
-                  {p.name}<span className="lbl ml-1 normal-case tracking-normal">— {p.blurb}</span>
-                </button>
-              ))}
+            <div className="mb-1 flex items-baseline justify-between">
+              <span className="lbl">ENVIRONMENT · MICROPHYSICS</span>
+              <button className="hbtn !px-1" onClick={() => setParams(DEFAULT_PARAMS)}>defaults</button>
             </div>
+            <div className="mb-2 max-h-[44vh] overflow-y-auto pr-1">{paramSliders}</div>
             <button className="hbtn w-full !py-1 !text-[11px]" onClick={start}>▶ enter simulation</button>
             <div className="mt-2 lbl leading-snug">{touch ? 'Drag: look · Pinch: zoom · Hold ▲▼ to walk' : 'Click view: mouse-look · WASD / arrows: walk · Shift: run · wheel: zoom · Esc: release cursor'}<br />Weather starts clear and evolves from surface heating; storms form only if the environment allows.</div>
           </div>
@@ -190,8 +217,8 @@ export default function App() {
           <div className="hud absolute right-1.5 top-1.5 z-10 flex max-w-[60vw] flex-wrap items-center justify-end gap-1 px-1.5 py-1">
             <button className={`hbtn ${paused ? 'on' : ''}`} onClick={() => setPaused((p) => !p)}>{paused ? '▶' : '‖'}</button>
             {SPEEDS.map((v) => <button key={v} className={`hbtn ${speed === v ? 'on' : ''}`} onClick={() => setSpeed(v)}>{v}×</button>)}
-            <select className="hsel" value={preset} onChange={(e) => setPreset(e.target.value)}>{PRESETS.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select>
-            <button className="hbtn" onClick={reset} title="Reset to clear sky with the selected environment">⟲ clear</button>
+            <button className={`hbtn ${envOpen ? 'on' : ''}`} onClick={() => setEnvOpen((o) => !o)} title="Environment and microphysics controls">⚙ env</button>
+            <button className="hbtn" onClick={reset} title="Reset to clear sky with the current parameters">⟲ clear</button>
             <button className={`hbtn ${diagOn ? 'on' : ''}`} onClick={() => setDiagOn((d) => !d)}>diag</button>
             <button className={`hbtn ${sound ? 'on' : ''}`} onClick={() => setSound((d) => !d)}>♪</button>
             <button className="hbtn" onClick={() => setAbout(true)}>i</button>
@@ -233,6 +260,23 @@ export default function App() {
                   {checksRef.current.map((c) => <div key={c.name} className={c.ok ? '' : 'text-red-400'}>{c.ok ? '✓' : '✗'} {c.name}: {c.value} <span className="lbl">({c.expect})</span></div>)}
                 </div>
               )}
+            </div>
+          )}
+
+          {envOpen && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/45 p-3" onClick={() => setEnvOpen(false)}>
+              <div className="hud max-h-[86vh] w-[340px] max-w-full overflow-y-auto p-2.5" onClick={(e) => e.stopPropagation()}>
+                <div className="mb-1 flex items-center justify-between">
+                  <b>ENVIRONMENT · MICROPHYSICS</b>
+                  <button className="hbtn" onClick={() => setEnvOpen(false)}>×</button>
+                </div>
+                <div className="mb-1 lbl">sounding CAPE {f0(s?.envCape)} J/kg · applies live</div>
+                {paramSliders}
+                <div className="mt-1.5 flex items-center justify-between">
+                  <button className="hbtn" onClick={() => setParams(DEFAULT_PARAMS)}>defaults</button>
+                  <span className="lbl">CAPE re-targets the sounding</span>
+                </div>
+              </div>
             </div>
           )}
 

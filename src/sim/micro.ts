@@ -17,6 +17,7 @@ export const K_NI = 4e-4; // effective non-inductive charging coefficient [C m^3
 export function microphysics(a: Atmosphere, dt: number) {
   const { nz, nxy } = a;
   const th = a.th, qv = a.qv, qc = a.qc, qi = a.qi, qr = a.qr, qs = a.qs, qg = a.qg, qh = a.qh, ql = a.ql;
+  const P = a.params;
   a.colHydro.fill(0);
   a.tauCol.fill(0);
   let anyH = false;
@@ -36,7 +37,7 @@ export function microphysics(a: Atmosphere, dt: number) {
       // 1. melting
       if (T > T0) {
         if (tqi > 0) { tqc += tqi; T -= LFc * tqi; tqi = 0; }
-        const f = Math.min(1, ((T - T0) * dt) / 90);
+        const f = Math.min(1, ((T - T0) * dt * P.melting) / 90);
         let ms = tqs * f, mg = tqg * f;
         const lim = (0.9 * (T - T0)) / LFc;
         if (ms + mg > lim) { const s = lim / (ms + mg); ms *= s; mg *= s; }
@@ -46,12 +47,12 @@ export function microphysics(a: Atmosphere, dt: number) {
         if (tqc > 0 && T < 233.15) { tqi += tqc; T += LFc * tqc; tqc = 0; }
         if (tqc > 1e-8 && T < T0 - 4) {
           const x = (T0 - T - 4) / 10;
-          const fr = tqc * (1 - Math.exp(-dt * 4e-4 * x * x));
+          const fr = tqc * (1 - Math.exp(-dt * 4e-4 * P.freezing * x * x));
           tqc -= fr; tqi += fr; T += LFc * fr;
         }
         if (tqr > 1e-9 && T < T0 - 2) {
           const x = (T0 - T) / 10;
-          const fr = T < 243.15 ? tqr : tqr * (1 - Math.exp(-dt * 1e-3 * x * x));
+          const fr = T < 243.15 ? tqr : tqr * (1 - Math.exp(-dt * 1e-3 * P.freezing * x * x));
           tqr -= fr; tqg += fr; T += LFc * fr;
         }
         // 3. ice nucleation (needs supercooled liquid / ice supersaturation) then deposition growth (WBF) / sublimation
@@ -93,7 +94,8 @@ export function microphysics(a: Atmosphere, dt: number) {
       }
       // 6. collision-coalescence (autoconversion + accretion)
       if (tqc > 1e-9) {
-        const auto = tqc > 5e-4 ? 1.2e-3 * (tqc - 5e-4) : 0;
+        const autoThr = 5e-4 * P.dropletSpawn;                       // more droplets -> higher threshold
+        const auto = tqc > autoThr ? (1.2e-3 * (tqc - autoThr)) / P.dropletSpawn : 0;
         const accr = tqr > 1e-9 ? 2.2 * tqc * Math.pow(tqr, 0.875) : 0;
         const conv = Math.min(tqc, dt * (auto + accr));
         tqc -= conv; tqr += conv;
@@ -117,7 +119,7 @@ export function microphysics(a: Atmosphere, dt: number) {
         if (tqv < q) {
           const rr = rho * tqr;
           let ev = (((1.6 + 124.9 * Math.pow(rr, 0.2046)) * Math.pow(rr, 0.525)) / (2.55e8 / (p * q) + 5.4e5)) * ((q - tqv) / (rho * q));
-          ev *= 3;
+          ev *= 3 * P.evaporation;
           const lim = (q - tqv) / (1 + (LV * LV * q) / (CP * RV * T * T));
           const e = Math.min(ev * dt, tqr, lim);
           tqr -= e; tqv += e; T -= (LV / CP) * e;
@@ -155,10 +157,13 @@ export function sedimentation(a: Atmosphere, dt: number) {
   for (let ij = 0; ij < nxy; ij++) {
     if (!a.colHydro[ij]) { a.surfPrec[ij] = 0; continue; }
     let any = 0;
+    const thresh = T0 + a.params.precipTempC;
+    const Pi = a.prof.pi;
     for (let k = 0; k < nz; k++) {
       const idx = k * nxy + ij, rho = rhoC[k], rf = rhoFac(rho);
       const qr = a.qr[idx], qs = a.qs[idx], qg = a.qg[idx];
-      vtr[k] = qr > 1e-9 ? vtRain(rho * qr, rf) : 0;
+      const frozen = a.th[idx] * Pi[k] < thresh;                   // below the threshold: falls as snow
+      vtr[k] = qr > 1e-9 ? (frozen ? vtSnow(rf) : vtRain(rho * qr, rf)) : 0;
       vts[k] = qs > 1e-9 ? vtSnow(rf) : 0;
       vtg[k] = qg > 1e-9 ? vtGraupel(rho * qg, rf) : 0;
       vti[k] = a.qi[idx] > 1e-9 ? vtIce(rf) : 0;

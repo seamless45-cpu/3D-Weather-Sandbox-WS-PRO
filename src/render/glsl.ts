@@ -80,7 +80,7 @@ vec3 applyFog(vec3 col, vec3 wpos){
   float dist = length(d);
   vec3 dn = d / max(dist, 1e-3);
   float f = 1.0 - exp(-dist / uVis);
-  f = max(f, smoothstep(10000.0, 15500.0, dist));
+  f = max(f, smoothstep(13500.0, 21500.0, dist));
   vec3 fogc = skyRad(normalize(vec3(dn.x, max(dn.y, 0.0) + 0.015, dn.z)));
   return mix(col, fogc, f);
 }
@@ -404,42 +404,110 @@ void main(){
   gl_FragColor = vec4(vCol, a);
 }`;
 
+// ---------------------------------------------------------------------------------------------
+// Rain shafts: one cylindrical billboard per precipitation column, from the ground up into the
+// cloud base, slanted by the local wind and textured with falling streaks. This is what makes the
+// precipitation read as a solid shaft instead of a sprinkle of particles.
+// ---------------------------------------------------------------------------------------------
+export const shaftVert = /* glsl */ `
+${COMMON}
+${TERRAIN_FN}
+attribute vec4 aCol;      // x, z, seed, unused
+attribute vec2 aCorner;   // 0..1 across the quad
+uniform sampler2D uSurf;  // .g = rain rate (0..1)
+uniform vec2 uShaftWind;
+uniform float uSnowLevel;
+varying float vRain; varying float vU; varying float vSeed; varying float vSnow; varying vec3 vCol; varying float vDist;
+void main(){
+  vec2 xz = aCol.xy;
+  float rain = texture(uSurf, xz / uDomain).g;
+  vRain = 0.0; vU = 0.0; vSeed = aCol.z; vSnow = 0.0; vCol = vec3(0.0); vDist = 0.0;
+  if (rain <= 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  float seed = aCol.z;
+  float top = 4200.0;
+  // find the precipitation base by walking up the cloud texture
+  for (int i = 0; i < 6; i++){
+    float h = 350.0 + float(i) * 1150.0;
+    if (sampleCloud(vec3(xz.x, h, xz.y)).g > 0.02) { top = h + 1200.0; break; }
+  }
+  float gy = groundH(xz);
+  vec3 p = vec3(xz.x, mix(gy + 30.0, top, aCorner.y), xz.y);
+  // slant with the wind shear of the layer it falls through
+  float fall = (top - p.y) * 0.00042;
+  p.x += uShaftWind.x * fall * 1000.0 * 0.22;
+  p.z += uShaftWind.y * fall * 1000.0 * 0.22;
+  float width = mix(200.0, 620.0, aCorner.y) * (0.55 + 0.9 * fract(seed * 13.7));
+  vec3 toCam = normalize(cameraPosition - p);
+  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
+  p += right * (aCorner.x - 0.5) * width;
+  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+  vRain = smoothstep(0.004, 0.55, rain);
+  vU = aCorner.y;
+  vSeed = seed;
+  vSnow = smoothstep(uSnowLevel - 200.0, uSnowLevel + 600.0, p.y);
+  vDist = length(cameraPosition - p);
+  vCol = uSkyAmb * 0.85 + uSunCol * 0.28 + vec3(0.015) + flashLight(p, vec3(0.0, 1.0, 0.0)) * 0.5;
+}`;
+export const shaftFrag = /* glsl */ `
+${COMMON}
+varying float vRain; varying float vU; varying float vSeed; varying float vSnow; varying vec3 vCol; varying float vDist;
+void main(){
+  if (vRain < 0.01) discard;
+  float wob = vnoise2(vec2(vSeed * 31.0 + vU * 2.5, vU * 9.0 - uTime * 2.4));
+  float streak = 0.45 + 0.75 * wob;
+  float topFade = 1.0 - smoothstep(0.62, 1.0, vU);
+  float botFade = smoothstep(0.0, 0.10, vU);
+  float a = vRain * streak * topFade * botFade * 0.34;
+  a *= mix(1.0, 0.75, vSnow);
+  a *= 1.0 - smoothstep(9000.0, 16000.0, vDist);
+  if (a < 0.004) discard;
+  vec3 col = mix(vCol * vec3(0.78, 0.83, 0.92), vCol * vec3(1.05, 1.05, 1.08), vSnow);
+  gl_FragColor = vec4(col, a);
+}`;
+
 export const boltVert = /* glsl */ `
 attribute vec3 aA; attribute vec3 aB; attribute vec4 aS; attribute vec2 aCorner;
 uniform float uT; uniform float uStep; uniform float uRS; uniform float uN;
 uniform float uStrokeT[8]; uniform float uStrokeA[8];
 uniform float uCCEnd; uniform float uCCAmp; uniform float uLeaderEnd;
-varying float vLum; varying float vSide;
+varying float vLum; varying float vSide; varying float vOrder;
 void main(){
   vec3 p = mix(aA, aB, aCorner.x);
   vec3 dir = normalize(aB - aA + vec3(1e-4));
   vec3 toCam = normalize(cameraPosition - p);
   vec3 side = normalize(cross(dir, toCam) + vec3(1e-5));
   float dist = length(cameraPosition - p);
-  float tGen = aS.x * uStep;
-  float ord = pow(0.62, aS.z);
+  float tGen = aS.x * uStep;                 // this segment appears when the leader reaches it
+  float ord = pow(0.66, aS.z);
   float lum = 0.0;
-  if (uT > tGen){ float age = uT - tGen; lum += 0.5 * exp(-age / 0.0035) + 0.05 * exp(-age / 0.08); }
+  // stepped-leader glow while the channel grows
+  if (uT > tGen){ float age = uT - tGen; lum += 0.55 * exp(-age / 0.004) + 0.045 * exp(-age / 0.09); }
+  // return strokes / K-changes travelling up the channel
   for (int i = 0; i < 8; i++){
     if (float(i) >= uN) break;
     float tr = uStrokeT[i] + aS.y * uRS;
-    if (uT > tr){ float age = uT - tr; lum += uStrokeA[i] * ord * (exp(-age / 0.012) + 0.25 * exp(-age / 0.07)); }
+    if (uT > tr){ float age = uT - tr; lum += uStrokeA[i] * ord * (exp(-age / 0.010) + 0.3 * exp(-age / 0.075)); }
   }
-  if (uT > uStrokeT[0] && uT < uCCEnd) lum += uCCAmp * ord;
-  if (uT > uLeaderEnd) lum += 0.03 * ord * exp(-(uT - uLeaderEnd) / 0.35);
+  if (uT > uStrokeT[0] && uT < uCCEnd) lum += uCCAmp * ord;   // continuing current
+  if (uT > uLeaderEnd) lum += 0.035 * ord * exp(-(uT - uLeaderEnd) / 0.4);
   vLum = lum;
-  float w = (0.7 + 1.3 * sqrt(lum)) * aS.w * 0.9 + dist * 0.0013;
+  vOrder = aS.z;
+  float w = (0.55 + 1.7 * sqrt(lum)) * aS.w * 1.15 + dist * 0.0011;
   vSide = aCorner.y;
   vec3 wp = p + side * aCorner.y * w * 3.0;
   gl_Position = (lum < 0.003) ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const boltFrag = /* glsl */ `
-varying float vLum; varying float vSide;
+varying float vLum; varying float vSide; varying float vOrder;
 void main(){
   float s = abs(vSide);
-  float core = exp(-s * s * 10.0);
-  float halo = exp(-s * s * 2.4) * 0.16;
-  vec3 c = vec3(0.82, 0.88, 1.0) * (core * 16.0 + halo * 7.0) * vLum;
+  float core = exp(-s * s * 15.0);
+  float glow = exp(-s * s * 2.0);
+  float outer = exp(-s * s * 0.7);
+  vec3 hot = vec3(0.92, 0.95, 1.0);
+  vec3 cold = vec3(0.45, 0.62, 1.0);
+  vec3 c = (hot * core * 24.0 + mix(cold, hot, core) * glow * 5.5 + cold * outer * 1.1) * vLum;
+  c *= mix(1.0, 0.75, clamp(vOrder / 3.0, 0.0, 1.0));   // thin branches are dimmer
   gl_FragColor = vec4(c, 1.0);
 }`;
 
@@ -460,7 +528,8 @@ vec2 windOffAt(float y){
   return mix(uWindOff[i0], uWindOff[i1], f - float(i0));
 }
 float hg(float c, float g){ return (1.0 - g*g) / pow(max(1.0 + g*g - 2.0*g*c, 1e-3), 1.5); }
-float phase(float c, float k){ return 0.7 * hg(c, 0.62 * k) + 0.3 * hg(c, -0.25 * k); }
+// two-lobe droplet phase function (strong forward peak + wide backscatter), tightened by k
+float phase(float c, float k){ return 0.78 * hg(c, 0.72 * k) + 0.22 * hg(c, -0.18 * k); }
 
 float cloudDensity(vec3 p, out float rainD, out float iceF, bool detail){
   vec4 s = sampleCloud(p);
@@ -469,23 +538,29 @@ float cloudDensity(vec3 p, out float rainD, out float iceF, bool detail){
   if (base < 0.004) return 0.0;
   vec2 wo = windOffAt(p.y);
   vec3 np = p + vec3(wo.x, uTime * 1.2, wo.y);
-  float low = texture(uNoise, np / 4200.0).r;
-  float shape = base * (0.5 + 0.95 * low);
+  // billows: two-scale low frequency shape modulation with a slow domain warp
+  float low = texture(uNoise, np / 5200.0).r;
+  float warp = texture(uNoise, np * 0.00011 + vec3(0.37, 0.11, 0.73)).g;
+  float shape = base * (0.42 + 0.86 * low + 0.24 * warp);
   if (!detail) return clamp(shape, 0.0, 1.0);
-  float f1 = texture(uNoise, np / 1700.0).g, f2 = texture(uNoise, np / 700.0).b, f3 = texture(uNoise, np / 260.0).a;
-  float fine = f1 * 0.5 + f2 * 0.32 + f3 * 0.18;
-  float erode = (1.0 - fine) * 0.55 * (1.0 - 0.65 * smoothstep(0.35, 1.0, base));
+  // erode the edges: detail noise gets stronger where the field is weak (fractal edges, wispy bases)
+  float f1 = texture(uNoise, np / 1550.0).g;
+  float f2 = texture(uNoise, np / 640.0).b;
+  float f3 = texture(uNoise, np / 250.0).a;
+  float fine = f1 * 0.52 + f2 * 0.31 + f3 * 0.17;
+  float edge = 1.0 - smoothstep(0.25, 0.95, base);
+  float erode = (1.0 - fine) * (0.34 + 0.42 * edge);
   return clamp((shape - erode) / (1.0 - erode + 1e-3), 0.0, 1.0);
 }
 
 float sunTau(vec3 p){
-  float tau = 0.0; float st = 90.0; vec3 q = p;
-  for (int j = 0; j < 5; j++){
+  float tau = 0.0; float st = 70.0; vec3 q = p;
+  for (int j = 0; j < 6; j++){
     q += uSunDir * st;
     if (q.y > 15000.0) break;
     vec4 s = sampleCloud(q);
-    tau += (s.r * 0.9 + s.g * 0.25) * 0.042 * st;
-    st *= 2.1;
+    tau += (s.r * 1.05 + s.g * 0.28) * 0.058 * st;
+    st *= 1.95;
   }
   return tau;
 }
@@ -506,31 +581,37 @@ void main(){
   float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
   float cosT = dot(rd, uSunDir);
   vec3 L = vec3(0.0); float T = 1.0; float tHit = -1.0;
-  float t = 20.0 * jitter;
+  float t = 260.0 * jitter * uStepScale;   // dither the entry point so the march does not band
   float amb0 = 1.0;
   for (int i = 0; i < 112; i++){
     if (t > t1 || T < 0.02) break;
     vec3 p = ro + rd * t;
     float stepLen = clamp(0.04 * t + 60.0, 60.0, 1100.0) * uStepScale;
+    stepLen *= 0.62 + 0.76 * fract(sin(dot(vec2(gl_FragCoord.x, gl_FragCoord.y + float(i) * 1.37), vec2(12.9898, 78.233))) * 43758.5453);
     float rainD, iceF;
     float d = cloudDensity(p, rainD, iceF, true);
     float rainFade = smoothstep(120.0, 700.0, t);
-    float sc = d * 0.045;
+    float sc = d * 0.085;
     float sr = rainD * 0.0055 * rainFade * (0.55 + 0.9 * vnoise2(vec2(p.x * 0.012 + p.z * 0.007, p.y * 0.0015)));
     float sig = sc + sr;
     if (sig > 1e-5){
       float tau = sunTau(p);
       vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0, c = 1.0;
-      for (int o = 0; o < 3; o++){ sunL += a * exp(-tau * b) * phase(cosT, c); a *= 0.5; b *= 0.42; c *= 0.6; }
-      float powder = mix(1.0, 1.0 - 0.6 * exp(-d * 7.0), 0.7 * (1.0 - smoothstep(0.2, 0.9, cosT)));
+      for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * phase(cosT, c); a *= 0.46; b *= 0.38; c *= 0.62; }
+      sunL *= 0.56;   // keep the multi-octave sum energy-normalised instead of blowing out to white
+      float powder = mix(1.0, 1.0 - 0.72 * exp(-d * 8.0), 0.8 * (1.0 - smoothstep(0.15, 0.85, cosT)));
+      float silver = pow(max(cosT, 0.0), 10.0) * (1.0 - smoothstep(0.05, 0.5, d));
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
-      float up1 = sampleCloud(p + vec3(0.0, 700.0, 0.0)).r + sampleCloud(p + vec3(0.0, 2200.0, 0.0)).r;
-      float aoU = exp(-up1 * 1.3);
-      vec3 amb = mix(uGroundAmb * 0.7, uSkyAmb, hF) * (0.35 + 0.65 * aoU) * (0.8 + 0.4 * d);
+      float up1 = sampleCloud(p + vec3(0.0, 600.0, 0.0)).r;
+      float up2 = sampleCloud(p + vec3(0.0, 1900.0, 0.0)).r;
+      float up3 = sampleCloud(p + vec3(0.0, 3800.0, 0.0)).r;
+      float aoU = exp(-(up1 * 1.15 + up2 * 0.55 + up3 * 0.25));
+      float hDark = mix(0.58, 1.0, smoothstep(0.04, 0.40, hF));   // cloud bases read darker than sunlit tops
+      vec3 amb = mix(uGroundAmb * 0.55, uSkyAmb, smoothstep(0.0, 0.7, hF)) * (0.15 + 0.85 * aoU) * (0.7 + 0.5 * d) * hDark;
       vec3 fl = flashLight(p, vec3(0.0, 1.0, 0.0));
-      vec3 iceTint = mix(vec3(1.0), vec3(0.96, 0.98, 1.04), iceF);
-      vec3 Sc = (uSunCol * sunL * 0.5 * powder + amb + fl * 0.12) * iceTint;
-      vec3 Sr = (uSunCol * 0.1 * sunL + amb * 0.85 + fl * 0.1) * vec3(0.8, 0.86, 0.95);
+      vec3 iceTint = mix(vec3(1.0), vec3(0.95, 0.97, 1.06), iceF);
+      vec3 Sc = (uSunCol * sunL * (0.6 + 0.6 * silver) * powder + amb + fl * 0.14) * iceTint;
+      vec3 Sr = (uSunCol * 0.09 * sunL + amb * 0.8 + fl * 0.1) * vec3(0.78, 0.84, 0.94);
       vec3 S = (sc * Sc + sr * Sr) / sig;
       float Ts = exp(-sig * stepLen);
       L += T * (1.0 - Ts) * S;
@@ -542,8 +623,9 @@ void main(){
     }
   }
   float dist = tHit > 0.0 ? tHit : min(t1, 45000.0);
-  float fogF = 1.0 - exp(-dist / (uVis * 1.1));
-  L = L * (1.0 - fogF) + uHorizon * fogF * (1.0 - T);
+  float fogF = 1.0 - exp(-dist / (uVis * 2.2));   // storms stay readable from many km away
+  vec3 haze = mix(uHorizon, uSkyAmb, 0.55) * 0.85;   // air, not white fog
+  L = L * (1.0 - fogF) + haze * fogF * (1.0 - T);
   vec4 cur = vec4(L, T);
   vec3 P = uCamPos + rd * 9000.0;
   vec4 pc = uPrevVP * vec4(P, 1.0);

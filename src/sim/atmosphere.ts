@@ -6,7 +6,8 @@
  * Buoyancy uses virtual potential temperature and condensate loading; latent heating is applied in microphysics.
  */
 import { Grid, makeGrid, G, CP, LV, LF, SIGMA, EPS0, DOMAIN, mulberry32 } from './consts';
-import { Profile, buildProfile, Preset, qsl } from './thermo';
+import { Profile, buildProfile, Environment, envForCape, qsl } from './thermo';
+import { SimParams, clampParams } from './params';
 import { Poisson } from './fft';
 import { Terrain, columnProps, ColumnProps } from './terrain';
 import { sunState } from './sun';
@@ -22,7 +23,7 @@ export interface Stats {
 
 export class Atmosphere {
   g: Grid; nx: number; ny: number; nz: number; nxy: number; n3: number;
-  prof!: Profile; preset: Preset; terrain: Terrain; cols: ColumnProps;
+  prof!: Profile; env: Environment; params: SimParams; terrain: Terrain; cols: ColumnProps;
   u!: Float32Array; v!: Float32Array; w!: Float32Array;
   th!: Float32Array; qv!: Float32Array; qc!: Float32Array; qi!: Float32Array; qr!: Float32Array; qs!: Float32Array; qg!: Float32Array;
   qh!: Float32Array; ql!: Float32Array; tke!: Float32Array; pi!: Float32Array;
@@ -37,13 +38,13 @@ export class Atmosphere {
   rhoC!: Float64Array; rhoF!: Float64Array;
   poisP!: Poisson; poisE!: Poisson;
   bufX: Float32Array; fluxX: Float32Array; fluxPlane: Float32Array;
-  time = 9 * 3600; dt = 4; step_n = 0; rng: () => number;
+  time = 11 * 3600; dt = 4; step_n = 0; rng: () => number;
   anyHydro = false; chargeMax = 0; flashEvents: any[] = [];
   precipCum = 0; iceGroundCum = 0; evapCum = 0; nudgeWater = 0; w0Total = 0; mse0 = 0; srcEnergy = 0; flashCount = 0;
   stats: Stats; sunSin = 0; sunDirV: [number, number, number] = [0, 1, 0]; cflRate = 0;
   lastLightningT = -1e9;
 
-  constructor(n: number, nz: number, preset: Preset, terrain: Terrain, seed = 7) {
+  constructor(n: number, nz: number, params: SimParams, terrain: Terrain, seed = 7) {
     // The horizontal pressure solver is a radix-2 FFT: the (square) horizontal
     // grid must be a power of two. Fail loudly instead of producing NaNs.
     if (!Number.isInteger(n) || n < 8 || (n & (n - 1)) !== 0) {
@@ -54,10 +55,12 @@ export class Atmosphere {
     }
     this.g = makeGrid(n, nz);
     this.nx = n; this.ny = n; this.nz = nz; this.nxy = n * n; this.n3 = n * n * nz;
-    this.preset = preset; this.terrain = terrain; this.cols = columnProps(terrain, n);
+    this.params = clampParams(params);
+    this.terrain = terrain; this.cols = columnProps(terrain, n);
     this.rng = mulberry32(seed);
     const g = this.g;
-    this.prof = buildProfile(g, preset);
+    this.env = envForCape(g, this.params.cape);
+    this.prof = buildProfile(g, this.env);
     this.poisP = null as any; this.poisE = null as any;
     this.buildSolvers();
     const F = (m: number) => new Float32Array(m);
@@ -126,7 +129,7 @@ export class Atmosphere {
       this.soilM[ij] = water ? 1 : Math.max(0.1, Math.min(0.9, 0.55 - h / 700 + (r() - 0.5) * 0.3));
       this.surfW[ij] = 0;
     }
-    this.time = 9 * 3600; this.step_n = 0; this.dt = 4;
+    this.time = 11 * 3600; this.step_n = 0; this.dt = 4;
     this.precipCum = 0; this.iceGroundCum = 0; this.evapCum = 0; this.nudgeWater = 0; this.srcEnergy = 0; this.flashCount = 0;
     this.anyHydro = false; this.chargeMax = 0; this.lastLightningT = -1e9;
     this.terrainBC();
@@ -407,7 +410,8 @@ export class Atmosphere {
       const wet = fW > 0.5 ? 1 : this.surfW[ij] > 0.2 ? 1 : Math.min(1, Math.max(fF > 0.5 ? 0.35 : 0.05, soil / 0.5));
       const H = rho * CP * Ch * V * fs * dT;
       const qss = qsl(Ts, p0);
-      let LE = rho * LV * Ch * V * fs * wet * (qss - qa);
+      const evapMul = fW > 0.5 ? this.params.lakeEvap : this.params.landEvap;
+      let LE = rho * LV * Ch * V * fs * wet * (qss - qa) * evapMul;
       if (LE < 0) LE *= 0.3;
       const LWdown = 5.67e-8 * Ta * Ta * Ta * Ta * (0.7 + 0.27 * (1 - tc));
       const LWnet = 0.97 * SIGMA * Ts * Ts * Ts * Ts - 0.97 * LWdown;
@@ -762,14 +766,47 @@ export class Atmosphere {
     return removed;
   }
 
-  reset(preset: Preset) {
-    this.preset = preset;
-    this.prof = buildProfile(this.g, preset);
+  /** Rebuild the clear-sky state from scratch (optionally with a new parameter set). */
+  reset(params: SimParams = this.params) {
+    this.params = clampParams(params);
+    this.env = envForCape(this.g, this.params.cape);
+    this.prof = buildProfile(this.g, this.env);
     this.rhoC = this.prof.rho; this.rhoF = this.prof.rhoF;
     this.rng = mulberry32((Math.random() * 1e9) | 0);
     this.buildSolvers();
     for (let k = 0; k < this.nz; k++) for (let ij = 0; ij < this.nxy; ij++) this.M0[k * this.nxy + ij] = this.rhoC[k];
     this.init();
+  }
+
+  /**
+   * Live parameter update. Microphysics/surface parameters take effect on the next step; changing the
+   * CAPE target rebuilds the environmental sounding (which the model relaxes toward, so the change
+   * spreads through the column over the next few simulated hours).
+   */
+  setParams(next: Partial<SimParams>): SimParams {
+    const merged = clampParams({ ...this.params, ...next });
+    const capeChanged = Math.abs(merged.cape - this.params.cape) > 1;
+    this.params = merged;
+    if (capeChanged) {
+      this.env = envForCape(this.g, merged.cape);
+      this.prof = buildProfile(this.g, this.env);
+      this.rhoC = this.prof.rho; this.rhoF = this.prof.rhoF;
+      this.buildSolvers();
+      for (let k = 0; k < this.nz; k++) for (let ij = 0; ij < this.nxy; ij++) this.M0[k * this.nxy + ij] = this.rhoC[k];
+      // Move the existing state most of the way to the new environment so the change is felt in
+      // seconds rather than waiting for the multi-hour relaxation. Clouds are left untouched.
+      const wgt = 0.65;
+      for (let k = 0; k < this.nz; k++) {
+        const dth = this.prof.th[k], dqv = this.prof.qv[k];
+        for (let ij = 0; ij < this.nxy; ij++) {
+          const c = k * this.nxy + ij;
+          if (this.qc[c] + this.qi[c] + this.qr[c] + this.qs[c] + this.qg[c] > 1e-6) continue;
+          this.th[c] += (dth - this.th[c]) * wgt;
+          this.qv[c] += (dqv - this.qv[c]) * wgt;
+        }
+      }
+    }
+    return this.params;
   }
 }
 export { DOMAIN };
