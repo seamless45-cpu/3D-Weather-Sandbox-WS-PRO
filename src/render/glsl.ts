@@ -16,7 +16,12 @@ float vnoise2(vec2 p){
   vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);
   return mix(mix(hash12(i), hash12(i+vec2(1.0,0.0)), f.x), mix(hash12(i+vec2(0.0,1.0)), hash12(i+vec2(1.0,1.0)), f.x), f.y);
 }
-float airMass(float cy){ cy = max(cy, 0.0); float zen = degrees(acos(min(cy, 1.0))); return 1.0 / (cy + 0.15 * pow(max(93.885 - zen, 1.0), -1.253)); }
+float airMass(float cy){
+  cy = max(cy, 0.0);
+  // Rational fit of Kasten-Young. This runs per pixel inside applyFog, so the acos/pow
+  // version was a significant constant cost on integrated GPUs.
+  return (1.0 - 0.06 * (1.0 - cy)) / (cy + 0.035);
+}
 
 vec3 skyRad(vec3 dir){
   float cy = max(dir.y, 0.0);
@@ -24,17 +29,19 @@ vec3 skyRad(vec3 dir){
   float cs = dot(dir, uSunDir);
   float phR = 3.0 / (16.0 * PI) * (1.0 + cs*cs);
   float g = 0.76;
-  float phM = (1.0 - g*g) / (4.0 * PI * pow(max(1.0 + g*g - 2.0*g*cs, 1e-3), 1.5));
+  float b = max(1.0 + g*g - 2.0*g*cs, 1e-3);
+  float phM = (1.0 - g*g) / (4.0 * PI * b * sqrt(b));
   float sam = uSunDir.y > 0.0 ? airMass(uSunDir.y) : 40.0 + (-uSunDir.y) * 400.0;
   vec3 sT = exp(-(BR * 8000.0 + vec3(BMIE * 1320.0)) * sam);
   vec3 tau = (BR * 8000.0 + vec3(BMIE * 1320.0 * 1.1)) * am;
   vec3 fex = exp(-tau);
   vec3 bt = BR + vec3(BMIE * 1.1);
   vec3 insc = (BR * phR + vec3(BMIE * 1.1 * phM)) / bt * (1.0 - fex);
-  vec3 st = pow(sT, vec3(1.0 - 0.5 * min(1.0, cy * 2.0)));
+  vec3 st = mix(sT, sqrt(sT), min(1.0, cy * 2.0));
   vec3 L = uSkyScale * insc * st;
   L += vec3(0.0025, 0.0045, 0.012);
-  L += uTwilight * vec3(0.55, 0.28, 0.2) * 0.35 * exp(-cy * 5.0) * (0.25 + 0.75 * pow(max(cs, 0.0), 2.0));
+  float csp = max(cs, 0.0);
+  L += uTwilight * vec3(0.55, 0.28, 0.2) * 0.35 * exp(-cy * 5.0) * (0.25 + 0.75 * csp * csp);
   return L;
 }
 
@@ -271,7 +278,7 @@ varying vec3 vWorld;
 vec2 waveGrad(vec2 p, vec2 wd, float t){
   vec2 g = vec2(0.0);
   float a = 1.0; float f = 0.35; float sp = 0.7;
-  for (int i = 0; i < 3; i++){
+  for (int i = 0; i < 2; i++){
     vec2 q = p * f + wd * t * sp;
     float e = 0.05;
     g += a * vec2(vnoise2(q + vec2(e, 0.0)) - vnoise2(q - vec2(e, 0.0)), vnoise2(q + vec2(0.0, e)) - vnoise2(q - vec2(0.0, e))) / (2.0 * e) * f;
@@ -677,25 +684,29 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, bool detail
   vec2 wo = windOffAt(p.y);
   vec3 np = p + vec3(wo.x, uTime * 1.2, wo.y);
   vec4 nA = texture(uNoise, np / 5200.0);
+  // domain warp from the worley channels: stops the 500 m solver cells reading as a grid
+  vec2 warp = (nA.gb - 0.5) * 1300.0;
+  vec3 np2 = np + vec3(warp.x, 0.0, warp.y);
   float shape = base * (0.40 + 0.92 * nA.r + 0.26 * nA.g);
   if (!detail) return clamp(shape, 0.0, 1.0);
-  vec4 nB = texture(uNoise, np / 700.0);
+  vec4 nB = texture(uNoise, np2 / 700.0);
+  shape *= 0.80 + 0.40 * nB.r;   // mid-scale billows break up the base cells
   float fine = nB.b;
   // the finest octave only pays for itself close to the camera, where it is visible
-  if (t < 3400.0) fine = fine * 0.70 + texture(uNoise, np / 240.0).a * 0.30;
+  if (t < 3400.0) fine = fine * 0.70 + texture(uNoise, np2 / 240.0).a * 0.30;
   float edge = 1.0 - smoothstep(0.22, 0.95, base);
   float erode = (1.0 - fine) * (0.30 + 0.44 * edge);
   return clamp((shape - erode) / (1.0 - erode + 1e-3), 0.0, 1.0);
 }
 
 float sunTau(vec3 p){
-  float tau = 0.0; float st = 120.0; vec3 q = p;
-  for (int j = 0; j < 5; j++){
+  float tau = 0.0; float st = 150.0; vec3 q = p;
+  for (int j = 0; j < 4; j++){
     q += uSunDir * st;
     if (q.y > 15000.0) break;
     vec4 s = sampleCloud(q);
     tau += (s.r * 1.05 + s.g * 0.28) * 0.058 * st;
-    st *= 2.2;
+    st *= 2.5;
   }
   return tau;
 }
@@ -739,7 +750,7 @@ void main(){
     vec3 p = ro + rd * t;
     float stepLen = clamp(0.045 * t + 55.0, 55.0, 1200.0) * uStepScale;
     // vary the step length per pixel *and* per frame: breaks slice banding without a fixed pattern
-    stepLen *= 0.92 + 0.16 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, uFrame * 3.11));
+    stepLen *= 0.96 + 0.08 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, uFrame * 3.11));
     // optically thick cloud does not need fine steps: grow them as the beam is extinguished
     stepLen *= mix(1.0, 2.6, 1.0 - T);
     float rainD, iceF;
@@ -768,7 +779,7 @@ void main(){
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
       // one-tap vertical occlusion: how much cloud sits above this sample
       float aoU = 1.0;
-      if (d > 0.03) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
+      if (d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
       float hDark = mix(0.52, 1.0, smoothstep(0.03, 0.38, hF));
       vec3 amb = mix(uGroundAmb * 0.6, uSkyAmb, smoothstep(0.0, 0.75, hF));
       amb *= (0.16 + 0.84 * aoU) * (0.72 + 0.48 * d) * hDark;
@@ -821,18 +832,23 @@ vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59)
 // Edge-aware upsample of the reduced-resolution cloud buffer. A plain bilinear fetch
 // smears cloud edges into blocky steps; weighting the 4 neighbours by scattering-depth
 // similarity keeps the silhouette crisp without ringing.
+const vec2 CLOUD_OFF[8] = vec2[8](
+  vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+  vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0)
+);
+const float CLOUD_W[8] = float[8](1.0, 1.0, 1.0, 1.0, 0.55, 0.55, 0.55, 0.55);
 vec4 cloudSample(vec2 uv){
   vec2 tx = 1.0 / uCloudRes;
   vec4 c0 = texture(uCloudRT, uv);
   float d0 = texture(uCloudAux, uv).r;
   vec4 acc = c0 * 2.0;
   float wsum = 2.0;
-  for (int i = 0; i < 4; i++){
-    vec2 o = vec2(float(i == 0) - float(i == 1), float(i == 2) - float(i == 3)) * tx;
-    vec4 c = texture(uCloudRT, uv + o);
-    float d = texture(uCloudAux, uv + o).r;
-    float w = 1.0 / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
-    w *= 1.0 - 0.7 * smoothstep(0.15, 0.55, abs(c.a - c0.a));
+  for (int i = 0; i < 8; i++){
+    vec4 c = texture(uCloudRT, uv + CLOUD_OFF[i] * tx);
+    float d = texture(uCloudAux, uv + CLOUD_OFF[i] * tx).r;
+    // depth similarity keeps the silhouette crisp; transmittance jump rejects cloud/sky bleed
+    float w = CLOUD_W[i] / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
+    w *= 1.0 - 0.75 * smoothstep(0.12, 0.5, abs(c.a - c0.a));
     acc += c * w; wsum += w;
   }
   return acc / wsum;

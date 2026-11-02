@@ -142,7 +142,7 @@ function loop() {
       budget += realDt * speed;
       const t0 = performance.now();
       let n = 0;
-      while (budget >= atm.dt && performance.now() - t0 < 45) {
+      while (budget >= atm.dt && performance.now() - t0 < 25) {
         const s0 = performance.now();
         atm.step();
         stepMs = 0.9 * stepMs + 0.1 * (performance.now() - s0);
@@ -157,9 +157,9 @@ function loop() {
       realAcc += realDt;
       if (realAcc > 1) { actualSpeed = simAdv / realAcc; simAdv = 0; realAcc = 0; }
     }
-    if (now - lastSnap > 110) { lastSnap = now; snapshot(); }
+    if (now - lastSnap > 150) { lastSnap = now; snapshot(); }
   }
-  setTimeout(loop, 3);
+  setTimeout(loop, 8);
 }
 
 ctx.onmessage = (ev: MessageEvent) => {

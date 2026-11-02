@@ -58,7 +58,9 @@ export default function App() {
         const q = detectQuality();
         const terrain = new Terrain(q.M);
         const spawn = terrain.findSpawn();
-        const n = q.M >= 512 ? 64 : 32, nz = q.M >= 512 ? 36 : 28, NZR = 48;
+        // The cloud texture is only as sharp as the solver grid. mid/high use 64x64 (500 m cells);
+        // the old 32x32 fallback put 1 km cells into the texture, which no render setting can hide.
+        const n = q.tier === 'low' ? 32 : 64, nz = q.tier === 'low' ? 28 : 48, NZR = 48;
         const canvas = canvasRef.current!;
         const engine = new Engine(canvas, q, terrain, n, NZR);
         const player = new Player(canvas, terrain, spawn);
@@ -90,9 +92,10 @@ export default function App() {
         let last = performance.now(), camT = 0, audT = 0;
         const loop = () => {
           const now = performance.now();
-          const dt = Math.min(0.1, (now - last) / 1000); last = now;
+          const rawDt = Math.max(1e-3, (now - last) / 1000);
+          const dt = Math.min(0.1, rawDt); last = now;
           player.update(dt);
-          engine.render(dt, { x: player.x, y: player.y, z: player.z, yaw: player.yaw, pitch: player.pitch, fov: player.fov });
+          engine.render(rawDt, { x: player.x, y: player.y, z: player.z, yaw: player.yaw, pitch: player.pitch, fov: player.fov });
           camT += dt; audT += dt;
           if (camT > 0.2) { camT = 0; worker.postMessage({ type: 'cam', x: player.x, z: player.z }); }
           if (audT > 0.1) {
@@ -120,7 +123,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => (t + 1) % 1e6), 250);
+    const id = setInterval(() => setTick((t) => (t + 1) % 1e6), 500);
     return () => clearInterval(id);
   }, []);
   useEffect(() => () => { const r = rtRef.current; if (r) { cancelAnimationFrame(r.raf); r.worker.terminate(); r.player.dispose(); r.engine.dispose(); } }, []);
@@ -231,8 +234,9 @@ export default function App() {
         <>
           {/* top-left status */}
           <div className="hud absolute left-1.5 top-1.5 z-10 px-1.5 py-1">
-            <div><b>ATMOS//SIM</b> <span className="lbl">LT</span> <b>{s ? clockString(s.time) : '--:--'}</b> <span className="lbl">×</span>{s ? f0(s.speed, 0) : '—'}{s?.paused ? <span className="text-amber-300"> ‖PAUSED</span> : ''}</div>
+            <div><b>ATMOS//SIM</b> <span className="lbl">LT</span> <b>{s ? clockString(s.time) : '--:--'}</b> <span className="lbl">×</span>{s ? f0(s.speed, 0) : '—'}{s?.paused ? <span className="text-amber-300"> ‖PAUSED</span> : ''} <span className={rtRef.current && rtRef.current.engine.fps < 30 ? 'text-amber-300' : 'lbl'}>{rtRef.current ? rtRef.current.engine.fps.toFixed(0) : '—'} fps</span></div>
             <div className="lbl">{s ? `${f0(wind, 1)}m/s ${f0(s.local.T, 1)}°C RH${f0(s.local.rh)}% ${s.local.rain > 0.1 ? `RAIN ${f0(s.local.rain, 1)}mm/h` : ''}` : 'sync…'}</div>
+            {rtRef.current?.engine.timerExt && <div className="lbl">GPU scene {rtRef.current.engine.profile.scene.toFixed(1)} · cloud {rtRef.current.engine.profile.cloud.toFixed(1)} · comp {rtRef.current.engine.profile.comp.toFixed(1)} ms</div>}
           </div>
           {/* heading */}
           <div className="hud absolute left-1.5 top-[46px] z-10 px-1.5 py-0.5"><b>{card}</b> {f0(heading)}° <span className="lbl">FOV</span> {f0(player?.fov || 72)}</div>
@@ -318,7 +322,10 @@ export default function App() {
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 p-3" onClick={() => setAbout(false)}>
           <div className="hud max-h-[88vh] w-[560px] max-w-full overflow-y-auto p-3 leading-snug" onClick={(e) => e.stopPropagation()}>
             <div className="mb-1 flex justify-between"><b>MODEL NOTES</b><button className="hbtn" onClick={() => setAbout(false)}>×</button></div>
-            <div className="mb-1 lbl">RENDER {rtRef.current ? `${rtRef.current.engine.q.tier} · ${rtRef.current.engine.fps.toFixed(0)} fps · ${rtRef.current.engine.renderer.getPixelRatio().toFixed(2)}× · ${rtRef.current.engine.cloudScale.toFixed(2)} cloud` : gpuLabel()}</div>
+            <div className="mb-1 lbl">RENDER {rtRef.current ? `${rtRef.current.engine.q.tier} · ${rtRef.current.engine.fps.toFixed(0)} fps · scene ${rtRef.current.engine.renderer.domElement.width}×${rtRef.current.engine.renderer.domElement.height} · cloud ${rtRef.current.engine.cloudW}×${rtRef.current.engine.cloudH}` : gpuLabel()}</div>
+            {rtRef.current?.engine.timerExt && (
+              <div className="mb-1 lbl">GPU scene {rtRef.current.engine.profile.scene.toFixed(1)} · cloud {rtRef.current.engine.profile.cloud.toFixed(1)} · comp {rtRef.current.engine.profile.comp.toFixed(1)} ms</div>
+            )}
             <p><b>Resolved:</b> 3-D anelastic Navier–Stokes (∇·ρ₀u=0) on a 64×64×36 MAC grid (Δx=500 m, Δz 146→689 m, 32 km periodic box, 15 km lid), momentum + θ + water vapour + 5 hydrometeor species + 2 charge species advected with a mass-weighted TVD (van Leer) flux scheme, buoyancy from virtual potential temperature and condensate loading, exact FFT/tridiagonal pressure projection (div → round-off). Cold pools, gust fronts, updraft tilt and rotation are emergent. Nothing smaller than ~1.5 km is resolved.</p>
             <p className="mt-1"><b>Parameterised:</b> Deardorff 1.5-order TKE sub-grid closure (entrainment/mixing at cloud edges); surface energy balance (SW with slope/cloud shading, LW, sensible & latent flux, soil moisture, runoff); drag by land-cover roughness; kinematic terrain lifting at the lower boundary; bulk microphysics (Kessler warm rain, Bergeron/WBF deposition, riming, graupel, melting, freezing, evaporation, sedimentation); non-inductive charging (Saunders-type sign reversal at −12 °C, lumped coefficient); effective grid-scale breakdown field = 0.45·E_k(ρ); DBM leader growth on the solved potential; large-scale forcing as weak relaxation of domain-mean wind/θ/moisture and −1.5 K/day radiative cooling.</p>
             <p className="mt-1"><b>Visual only:</b> sub-grid cloud erosion noise (advected with cloud-weighted winds), rain streaks (placed where the simulated precipitation exists), splashes/ripples, vegetation sway, thunder synthesis from channel geometry (arrival time r/c, absorption, terrain obstruction).</p>
