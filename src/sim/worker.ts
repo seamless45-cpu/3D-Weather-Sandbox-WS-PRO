@@ -157,7 +157,7 @@ function loop() {
       realAcc += realDt;
       if (realAcc > 1) { actualSpeed = simAdv / realAcc; simAdv = 0; realAcc = 0; }
     }
-    if (now - lastSnap > 150) { lastSnap = now; snapshot(); }
+    if (now - lastSnap > 250) { lastSnap = now; snapshot(); }
   }
   setTimeout(loop, 8);
 }

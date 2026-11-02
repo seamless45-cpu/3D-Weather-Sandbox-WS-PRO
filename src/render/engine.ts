@@ -18,9 +18,9 @@ export interface Quality {
 export function qualityFor(tier: Tier): Quality {
   // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
   // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
-  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.6, stepScale: 2.4, minCloudScale: 0.3, M: 256, rain: 2400, treeGrid: 18, msaa: 0, splashes: false, shafts: 12, steps: 24, maxPixels: 1.4e6, maxCloudPixels: 0.8e6 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.7, stepScale: 1.4, minCloudScale: 0.36, M: 256, rain: 6000, treeGrid: 32, msaa: 0, splashes: true, shafts: 32, steps: 56, maxPixels: 2.2e6, maxCloudPixels: 1.1e6 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.44, M: 256, rain: 12000, treeGrid: 56, msaa: 2, splashes: true, shafts: 64, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.5, stepScale: 2.6, minCloudScale: 0.36, M: 256, rain: 1800, treeGrid: 16, msaa: 0, splashes: false, shafts: 10, steps: 20, maxPixels: 1.2e6, maxCloudPixels: 0.6e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.6, stepScale: 1.5, minCloudScale: 0.42, M: 256, rain: 5000, treeGrid: 28, msaa: 0, splashes: true, shafts: 28, steps: 48, maxPixels: 2.2e6, maxCloudPixels: 0.9e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.52, M: 256, rain: 12000, treeGrid: 56, msaa: 2, splashes: true, shafts: 64, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -119,7 +119,13 @@ export class Engine {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', alpha: false });
     this.renderer.setPixelRatio(q.pr);
     this.renderer.autoClear = false;
-    try { this.timerExt = (this.renderer.getContext() as WebGL2RenderingContext).getExtension('EXT_disjoint_timer_query_webgl2'); } catch { this.timerExt = null; }
+    // Opt-in only: reading query results every frame is a pipeline sync and can itself
+    // perturb the frame times we are trying to measure. ?profile=1 enables it.
+    try {
+      const gl = this.renderer.getContext() as WebGL2RenderingContext;
+      this.timerExt = new URLSearchParams(location.search).has('profile')
+        ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+    } catch { this.timerExt = null; }
     this.camera = new THREE.PerspectiveCamera(72, 1, 0.3, 90000);
     this.camera.rotation.order = 'YXZ';
 
@@ -162,8 +168,10 @@ export class Engine {
       new THREE.ShaderMaterial({ vertexShader: vs, fragmentShader: fs, uniforms: { ...U, ...extra }, ...(this.defs ? { defines: { ...this.defs } } : {}), ...opts });
 
     // ---- sky
-    const sky = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mk(S.skyVert, S.skyFrag, {}, { depthTest: false, depthWrite: false }));
-    sky.frustumCulled = false; sky.renderOrder = -10; this.scene.add(sky);
+    // Drawn after the opaque pass with a depth test: the sky shader only runs for pixels the
+    // terrain/trees did not cover, instead of shading the whole screen and being overdrawn.
+    const sky = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mk(S.skyVert, S.skyFrag, {}, { depthTest: true, depthWrite: false }));
+    sky.frustumCulled = false; sky.renderOrder = 1.5; this.scene.add(sky);
 
     // ---- terrain (camera-centred lattice mesh; heights fetched from the shared lattice texture)
     const SG = q.M;
@@ -572,38 +580,41 @@ export class Engine {
     // ---- dynamic resolution for the cloud pass
     this.fps += (1 / rawDt - this.fps) * Math.min(1, rawDt * 0.15);
     const frameDt = rawDt * 1000;
-    if (frameDt > 26) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
+    if (frameDt > 28) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 13) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
     // A single huge spike reacts immediately instead of waiting for a 1.6 s average. Cut
     // everything at once (pixels, cloud buffer, steps, step size) but rate-limit it so a
     // sustained stall cannot turn into a reallocation storm.
-    if (this.adaptive && frameDt > 50 && nowMs - this.lastSpike > 700) {
+    if (this.adaptive && frameDt > 50 && nowMs - this.lastSpike > 900) {
       this.lastSpike = nowMs;
-      this.prScale = Math.max(0.4, this.prScale - 0.15);
-      this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.08);
+      // Only the march and the cloud buffer here: reallocating the scene target on a spike
+      // causes the very hitch we are reacting to and can oscillate.
       this.dynStep = Math.min(3.2, this.dynStep + 0.5);
       uMax.value = Math.max(18, uMax.value - 8);
-      this.resize(this.cssW, this.cssH);
-      this.lowTimer = 0;
-    }
-    if (this.lowTimer > 0.7) {
-      const p = this.profile;
-      const cloudBound = p.cloud > p.scene * 1.15 && p.cloud > 1.0;
-      if (cloudBound) {
-        // the march is the expensive part: coarsen it before touching screen resolution
-        if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
-        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
-        else uMax.value = Math.max(18, uMax.value - 4);
-      } else {
-        // scene/geometry or fill-rate bound: drop the screen resolution first
-        if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
-        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
-        else uMax.value = Math.max(18, uMax.value - 4);
+      if (this.cloudScale > this.q.minCloudScale) {
+        this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.08);
+        this.rebuildCloud();
       }
       this.lowTimer = 0;
     }
-    if (this.highTimer > 4) {
+    if (this.lowTimer > 1.0) {
+      const p = this.profile;
+      const cloudBound = p.cloud > p.scene * 1.15 && p.cloud > 1.0;
+      // Order matters: steps and screen resolution are much less visible than the cloud
+      // buffer, so the cloud scale is the LAST thing to go.
+      if (cloudBound) {
+        if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
+        else if (uMax.value > 18) uMax.value -= 4;
+        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
+      } else {
+        if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
+        else if (uMax.value > 18) uMax.value -= 4;
+        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
+      }
+      this.lowTimer = 0;
+    }
+    if (this.highTimer > 8) {
       if (uMax.value < this.q.steps) uMax.value = Math.min(this.q.steps, uMax.value + 2);
       else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
       else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
