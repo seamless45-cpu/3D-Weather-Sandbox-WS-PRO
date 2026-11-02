@@ -10,13 +10,17 @@ export type Tier = 'low' | 'mid' | 'high';
 export interface Quality {
   tier: Tier; pr: number; cloudScale: number; stepScale: number; minCloudScale: number;
   M: number; rain: number; treeGrid: number; msaa: number; splashes: boolean; shafts: number; steps: number;
+  /** Hard budgets in device pixels. A 4K/retina window must not multiply the cost by 4. */
+  maxPixels: number; maxCloudPixels: number;
 }
 
 /** Preset for each performance tier. `low` targets entry-level mobile GPUs (Adreno 6xx, Mali-G5x). */
 export function qualityFor(tier: Tier): Quality {
-  if (tier === 'low') return { tier, pr: 0.62, cloudScale: 0.28, stepScale: 2.6, minCloudScale: 0.2, M: 256, rain: 2400, treeGrid: 22, msaa: 0, splashes: false, shafts: 12, steps: 24 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.5, stepScale: 1.5, minCloudScale: 0.3, M: 256, rain: 6000, treeGrid: 40, msaa: 0, splashes: true, shafts: 32, steps: 72 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.7, stepScale: 1.0, minCloudScale: 0.4, M: 512, rain: 12000, treeGrid: 72, msaa: 2, splashes: true, shafts: 64, steps: 80 };
+  // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
+  // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.6, stepScale: 2.4, minCloudScale: 0.3, M: 256, rain: 2400, treeGrid: 18, msaa: 0, splashes: false, shafts: 12, steps: 24, maxPixels: 1.4e6, maxCloudPixels: 0.8e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.7, stepScale: 1.4, minCloudScale: 0.36, M: 256, rain: 6000, treeGrid: 32, msaa: 0, splashes: true, shafts: 32, steps: 56, maxPixels: 2.2e6, maxCloudPixels: 1.1e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.44, M: 256, rain: 12000, treeGrid: 56, msaa: 2, splashes: true, shafts: 64, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -40,13 +44,17 @@ export function detectGpuTier(): Tier {
     const s = name.toLowerCase();
     const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
     const cores = navigator.hardwareConcurrency || 4;
+    // Software rasterisers (SwiftShader/llvmpipe) can never fill a volumetric buffer: the old
+    // fallback put them on the high tier, which is why the app felt frozen on some machines.
+    if (/swiftshader|llvmpipe|softpipe|software|basic render/.test(s)) return 'low';
     const adreno = s.match(/adreno[^0-9]*([0-9]{3})/);
     if (adreno) return parseInt(adreno[1], 10) >= 700 ? 'mid' : 'low';   // 6xx and older: entry level
-    if (/mali-4|mali-t|mali-g[0-4]|powervr|videocore|adreno/.test(s)) return 'low';
-    if (/mali-g[5-9]|apple gpu|intel/.test(s)) return 'mid';
+    if (/mali-4|mali-t|mali-g[0-4]|powervr|videocore/.test(s)) return 'low';
+    if (/uhd|hd graphics|hd 4[0-9]{2}|hd 5[0-9]{2}|gma/.test(s)) return 'low';
+    if (/mali-g[5-9]|apple gpu|iris|intel|radeon|vega/.test(s)) return 'mid';
     if (coarse) return 'low';        // unknown mobile GPU: assume the entry-level path
     if (cores <= 4) return 'mid';
-    return 'high';
+    return 'mid';                    // conservative: unknown desktop GPU, let the user opt into high
   } catch { return 'mid'; }
 }
 
@@ -94,7 +102,12 @@ export class Engine {
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
-  lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1;
+  lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0;
+  cloudW = 0; cloudH = 0;
+  // GPU time per pass in ms (EXT_disjoint_timer_query_webgl2); null when unavailable.
+  timerExt: any = null;
+  profile = { scene: 0, cloud: 0, comp: 0 };
+  private timerQ: WebGLQuery[][] = [[], [], []];
   flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0); defs?: Record<string, number>; cssW = 1; cssH = 1;
   adaptive = true;   // runtime degradation; disabled with ?noadapt for diagnostics
   fps = 60;
@@ -106,6 +119,7 @@ export class Engine {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', alpha: false });
     this.renderer.setPixelRatio(q.pr);
     this.renderer.autoClear = false;
+    try { this.timerExt = (this.renderer.getContext() as WebGL2RenderingContext).getExtension('EXT_disjoint_timer_query_webgl2'); } catch { this.timerExt = null; }
     this.camera = new THREE.PerspectiveCamera(72, 1, 0.3, 90000);
     this.camera.rotation.order = 'YXZ';
 
@@ -283,10 +297,16 @@ export class Engine {
     return g;
   }
 
+  /** Largest pixel ratio that keeps the scene pass inside this tier's pixel budget. */
+  private maxPixelRatio(): number {
+    return Math.min(this.q.pr, Math.sqrt(this.q.maxPixels / Math.max(1, this.cssW * this.cssH)));
+  }
+
   resize(w: number, h: number) {
     this.cssW = w; this.cssH = h;
+    const pr = Math.max(0.3, this.maxPixelRatio() * this.prScale);
+    this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
-    const pr = this.renderer.getPixelRatio();
     const W = Math.max(2, Math.floor(w * pr)), H = Math.max(2, Math.floor(h * pr));
     this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
     this.rtScene?.dispose();
@@ -298,7 +318,9 @@ export class Engine {
   }
   private makeCloudRT(W: number, H: number) {
     for (const r of this.rtCloud) r.dispose();
-    const cw = Math.max(2, Math.floor(W * this.cloudScale)), ch = Math.max(2, Math.floor(H * this.cloudScale));
+    const scale = Math.min(this.cloudScale, Math.sqrt(this.q.maxCloudPixels / Math.max(1, W * H)));
+    const cw = Math.max(2, Math.floor(W * scale)), ch = Math.max(2, Math.floor(H * scale));
+    this.cloudW = cw; this.cloudH = ch;
     // count: 2 -> MRT. Attachment 0 is the cloud radiance/transmittance, attachment 1 the
     // scattering depth used for temporal reprojection and the edge-aware upscale.
     this.rtCloud = [0, 1].map(() => new THREE.WebGLRenderTarget(cw, ch, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false, count: 2 }));
@@ -406,8 +428,39 @@ export class Engine {
     return l;
   }
 
+  private beginTimer(i: number) {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (!this.timerExt) return;
+    const q = gl.createQuery();
+    gl.beginQuery(this.timerExt.TIME_ELAPSED_EXT, q);
+    this.timerQ[i].push(q);
+  }
+  private endTimer() {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (!this.timerExt) return;
+    gl.endQuery(this.timerExt.TIME_ELAPSED_EXT);
+  }
+  private pollTimer(i: number, key: 'scene' | 'cloud' | 'comp') {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (!this.timerExt) return;
+    const arr = this.timerQ[i];
+    for (let k = arr.length - 1; k >= 0; k--) {
+      const q = arr[k];
+      if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) {
+        const ns = gl.getQueryParameter(q, gl.QUERY_RESULT);
+        if (!gl.getParameter(this.timerExt.GPU_DISJOINT_EXT)) this.profile[key] = this.profile[key] * 0.8 + (ns / 1e6) * 0.2;
+        gl.deleteQuery(q);
+        arr.splice(k, 1);
+      }
+    }
+  }
+
   render(dtReal: number, cam: { x: number; y: number; z: number; yaw: number; pitch: number; fov: number }) {
-    this.time += dtReal;
+    // dtReal is the *real* frame time; the simulation clock is capped so a stall does not
+    // teleport the animation, but fps/adaptive logic must see the true stall.
+    const rawDt = Math.max(1e-3, dtReal);
+    const dt = Math.min(0.1, dtReal);
+    this.time += dt;
     const U = this.U;
     this.camera.position.set(cam.x, cam.y, cam.z);
     this.camera.rotation.set(cam.pitch, cam.yaw, 0);
@@ -457,14 +510,14 @@ export class Engine {
       flashSum += (lum * 8) / (1 + (f.dist * f.dist) / (3500 * 3500));
       if (t > f.end) this.removeFlash(f);
     });
-    this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dtReal / 0.15));
+    this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dt / 0.15));
     U.uFlashOn.value = act.length > 0 ? 1 : 0;
 
     // ---- exposure: physically-motivated from sun elevation and overhead cloud optical depth, with flash compression
     const bright = lt.dayness * (0.3 + 0.7 * tc);
     let target = Math.pow(1 / (0.25 + 0.75 * bright), 0.7) * (1 + 7 * Math.pow(1 - lt.dayness, 2));
     this.expoTarget = target;
-    this.exposure += (this.expoTarget - this.exposure) * Math.min(1, dtReal / 2.2);
+    this.exposure += (this.expoTarget - this.exposure) * Math.min(1, dt / 2.2);
     const expFinal = this.exposure / (1 + 0.5 * this.flashLevel);
     this.compMat.uniforms.uExposure.value = expFinal;
     this.compMat.uniforms.uTime.value = this.time;
@@ -474,16 +527,19 @@ export class Engine {
     const wo = this.cloudMat.uniforms.uWindOff.value as THREE.Vector2[];
     for (let b = 0; b < 16; b++) wo[b].set(this.offCur[b * 2] + this.offVel[b * 2] * dts, this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts);
 
+    this.pollTimer(0, 'scene'); this.pollTimer(1, 'cloud'); this.pollTimer(2, 'comp');
     // ---- pass 1: scene
+    this.beginTimer(0);
     this.renderer.setRenderTarget(this.rtScene);
     this.renderer.clear(true, true, true);
     this.renderer.render(this.scene, this.camera);
+    this.endTimer();
 
     // ---- pass 2: ray-marched clouds (reduced resolution, temporal reprojection)
     const cm = this.cloudMat.uniforms;
-    const ang = Math.hypot(cam.yaw - this.lastAng[0], cam.pitch - this.lastAng[1]) / Math.max(dtReal, 1e-3);
+    const ang = Math.hypot(cam.yaw - this.lastAng[0], cam.pitch - this.lastAng[1]) / rawDt;
     this.lastAng = [cam.yaw, cam.pitch];
-    let blend = 0.86 * Math.exp(-ang * 1.2);
+    let blend = 0.93 * Math.exp(-ang * 1.2);
     if (this.flashLevel > 0.05) blend *= 0.35;
     cm.uBlend.value = this.frame < 3 ? 0 : blend;
     cm.uFrame.value = this.frame & 1023;
@@ -495,45 +551,63 @@ export class Engine {
     const prev = this.rtCloud[1 - this.cur], curRT = this.rtCloud[this.cur];
     cm.uHist.value = prev.textures[0];
     cm.uHistAux.value = prev.textures[1];
+    this.beginTimer(1);
     this.renderer.setRenderTarget(curRT);
     this.renderer.render(this.cloudScene, this.ortho);
+    this.endTimer();
 
     // ---- pass 3: composite + tone mapping
     this.compMat.uniforms.uScene.value = this.rtScene.texture;
     this.compMat.uniforms.uCloudRT.value = curRT.textures[0];
     this.compMat.uniforms.uCloudAux.value = curRT.textures[1];
     this.compMat.uniforms.uCloudRes.value.set(curRT.width, curRT.height);
+    this.beginTimer(2);
     this.renderer.setRenderTarget(null);
     this.renderer.render(this.compScene, this.ortho);
+    this.endTimer();
     this.prevVP.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
     this.cur = 1 - this.cur;
     this.frame++;
 
     // ---- dynamic resolution for the cloud pass
-    if (dtReal > 1e-4) this.fps += (1 / dtReal - this.fps) * Math.min(1, dtReal * 0.15);
-    const frameDt = dtReal * 1000;
-    if (frameDt > 26) { this.lowTimer += dtReal; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += dtReal; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
+    this.fps += (1 / rawDt - this.fps) * Math.min(1, rawDt * 0.15);
+    const frameDt = rawDt * 1000;
+    if (frameDt > 26) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 15) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
-    // A single huge spike (a cloud swallowing the camera) reacts immediately instead of waiting
-    // for a 1.6 s average: bigger steps first, they are far cheaper than pixels.
-    if (this.adaptive && frameDt > 55) {
-      this.dynStep = Math.min(3.2, this.dynStep + 0.45);
-      uMax.value = Math.max(20, uMax.value - 6);
+    // A single huge spike reacts immediately instead of waiting for a 1.6 s average. Cut
+    // everything at once (pixels, cloud buffer, steps, step size) but rate-limit it so a
+    // sustained stall cannot turn into a reallocation storm.
+    if (this.adaptive && frameDt > 50 && nowMs - this.lastSpike > 700) {
+      this.lastSpike = nowMs;
+      this.prScale = Math.max(0.4, this.prScale - 0.15);
+      this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.08);
+      this.dynStep = Math.min(3.2, this.dynStep + 0.5);
+      uMax.value = Math.max(18, uMax.value - 8);
+      this.resize(this.cssW, this.cssH);
       this.lowTimer = 0;
     }
-    if (this.lowTimer > 0.9) {
-      if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.35);
-      else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.06); this.rebuildCloud(); }
-      else if (this.renderer.getPixelRatio() > 0.4) { this.renderer.setPixelRatio(Math.max(0.4, this.renderer.getPixelRatio() - 0.12)); this.resize(this.cssW, this.cssH); }
-      else uMax.value = Math.max(18, uMax.value - 4);
+    if (this.lowTimer > 0.7) {
+      const p = this.profile;
+      const cloudBound = p.cloud > p.scene * 1.15 && p.cloud > 1.0;
+      if (cloudBound) {
+        // the march is the expensive part: coarsen it before touching screen resolution
+        if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
+        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
+        else uMax.value = Math.max(18, uMax.value - 4);
+      } else {
+        // scene/geometry or fill-rate bound: drop the screen resolution first
+        if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
+        else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
+        else uMax.value = Math.max(18, uMax.value - 4);
+      }
       this.lowTimer = 0;
     }
     if (this.highTimer > 4) {
       if (uMax.value < this.q.steps) uMax.value = Math.min(this.q.steps, uMax.value + 2);
       else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
       else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
-      else if (this.renderer.getPixelRatio() < this.q.pr) { this.renderer.setPixelRatio(Math.min(this.q.pr, this.renderer.getPixelRatio() + 0.1)); this.resize(this.cssW, this.cssH); }
+      else if (this.prScale < 1) { this.prScale = Math.min(1, this.prScale + 0.1); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
     }
     this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * this.dynStep;

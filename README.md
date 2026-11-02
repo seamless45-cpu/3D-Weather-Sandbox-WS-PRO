@@ -61,6 +61,14 @@ when a cloud base engulfs the viewer it skips the entry search, halves the march
 the history blend and switches terrain/water/vegetation to a cheap shadow path — the case that
 used to cost the most frames.
 
+The solver grid is what sets cloud sharpness: `mid` and `high` run 64×64 horizontally and
+48 levels, so the cloud texture carries 500 m structure instead of the 1 km cells the old
+fallback produced. Hard pixel budgets (`maxPixels` / `maxCloudPixels`) stop a 4K or retina
+window from multiplying the cost by four, and when `EXT_disjoint_timer_query_webgl2` is
+available the HUD reports the GPU time of the scene, cloud and composite passes. Runtime
+degradation reads those numbers and cuts whichever pass is actually slow — the march first
+when the cloud pass dominates, screen resolution first when the scene pass does.
+
 Diagnostics: append `?perf=low|mid|high` to force a tier and `&noadapt=1` to freeze the runtime
 degradation (useful when profiling).
 

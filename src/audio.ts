@@ -14,7 +14,9 @@ export class AudioEngine {
     if (this.ctx) { this.ctx.resume(); return; }
     this.terrain = terrain;
     const AC = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
-    const ctx = new AC();
+    // 22.05 kHz is plenty for wind/rain/thunder and halves the audio DSP cost on weak CPUs.
+    let ctx: AudioContext;
+    try { ctx = new AC({ sampleRate: 22050 }); } catch { ctx = new AC(); }
     this.ctx = ctx;
     this.master = ctx.createGain(); this.master.gain.value = this.enabled ? 0.8 : 0; this.master.connect(ctx.destination);
     // noise source
@@ -40,9 +42,11 @@ export class AudioEngine {
     src(white).connect(this.leafF); this.leafF.connect(this.leaf); this.leaf.connect(this.master);
     // reverb for thunder tails
     this.reverb = ctx.createConvolver();
-    const irLen = Math.floor(ctx.sampleRate * 4.5);
-    const ir = ctx.createBuffer(2, irLen, ctx.sampleRate);
-    for (let c = 0; c < 2; c++) { const a = ir.getChannelData(c); for (let i = 0; i < irLen; i++) a[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 1.2)) * (1 - Math.exp(-i / (ctx.sampleRate * 0.03))); }
+    // A 4.5 s stereo impulse response is a constant CPU cost even when nothing is playing.
+    const irLen = Math.floor(ctx.sampleRate * 1.5);
+    const ir = ctx.createBuffer(1, irLen, ctx.sampleRate);
+    const a = ir.getChannelData(0);
+    for (let i = 0; i < irLen; i++) a[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.45)) * (1 - Math.exp(-i / (ctx.sampleRate * 0.03)));
     this.reverb.buffer = ir;
     this.wet = ctx.createGain(); this.wet.gain.value = 0.45; this.reverb.connect(this.wet); this.wet.connect(this.master);
     this.dry = ctx.createGain(); this.dry.gain.value = 1; this.dry.connect(this.master);
