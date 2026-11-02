@@ -366,7 +366,7 @@ void main(){
   vec4 cl = texture(uClass, c / uDomain);
   float d = length(c - uCamXZ);
   float keep = step(hash12(cellId + 9.7), cl.r * 0.8) * step(cl.a, 0.5) * (1.0 - smoothstep(uHalf * uCS * 0.8, uHalf * uCS * 0.98, d));
-  float gh = groundH(c);
+  float gh = texture(uHeight, c / uDomain).r;   // 1 fetch instead of groundH's 4 texelFetch
   float sc = (0.7 + 0.8 * hh) * keep;
   float ang = hash12(cellId + 5.5) * 6.2831;
   float ca = cos(ang), sa = sin(ang);
@@ -760,7 +760,7 @@ void main(){
 #ifdef LOWQ
     float sr = rainD * 0.0055 * rainFade * 0.95;
 #else
-    float sr = rainD * 0.0055 * rainFade * (0.55 + 0.9 * vnoise2(vec2(p.x * 0.012 + p.z * 0.007, p.y * 0.0015)));
+    float sr = rainD * 0.0055 * rainFade * (0.55 + 0.9 * hash12(vec2(p.x * 0.012 + p.z * 0.007, p.y * 0.0015)));
 #endif
     float sig = sc + sr;
     if (sig > 1e-5){
@@ -771,8 +771,8 @@ void main(){
       // The phase is evaluated once per step (the anisotropy barely changes per octave).
       float ph = phase(cosT, 1.0);
       vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0;
-      for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * ph; a *= 0.46; b *= 0.38; }
-      sunL *= 0.56;
+      for (int o = 0; o < 3; o++){ sunL += a * exp(-tau * b) * ph; a *= 0.46; b *= 0.38; }
+      sunL *= 0.60;
       float powder = mix(1.0, 1.0 - 0.72 * exp(-d * 8.0), 0.8 * (1.0 - smoothstep(0.15, 0.85, cosT)));
       float cT = max(cosT, 0.0), cT2 = cT * cT, cT4 = cT2 * cT2;
       float silver = cT4 * cT4 * cT2 * (1.0 - smoothstep(0.05, 0.5, d));
