@@ -18,9 +18,9 @@ export interface Quality {
 export function qualityFor(tier: Tier): Quality {
   // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
   // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
-  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.5, stepScale: 2.6, minCloudScale: 0.36, M: 256, rain: 1800, treeGrid: 16, msaa: 0, splashes: false, shafts: 10, steps: 20, maxPixels: 1.2e6, maxCloudPixels: 0.6e6 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.6, stepScale: 1.5, minCloudScale: 0.42, M: 256, rain: 5000, treeGrid: 28, msaa: 0, splashes: true, shafts: 28, steps: 48, maxPixels: 2.2e6, maxCloudPixels: 0.9e6 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.52, M: 256, rain: 12000, treeGrid: 56, msaa: 2, splashes: true, shafts: 64, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.5, stepScale: 2.6, minCloudScale: 0.36, M: 256, rain: 1000, treeGrid: 16, msaa: 0, splashes: false, shafts: 8, steps: 20, maxPixels: 1.2e6, maxCloudPixels: 0.6e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.6, stepScale: 1.5, minCloudScale: 0.42, M: 256, rain: 2500, treeGrid: 28, msaa: 0, splashes: true, shafts: 18, steps: 48, maxPixels: 2.2e6, maxCloudPixels: 0.9e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.52, M: 256, rain: 6000, treeGrid: 56, msaa: 2, splashes: true, shafts: 24, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -73,8 +73,47 @@ export function readTierPref(): Tier | null {
   } catch { return null; }
 }
 
+function isCoarsePointer(): boolean {
+  try { return typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches; } catch { return false; }
+}
+function isMobile(): boolean {
+  try { return isCoarsePointer() || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent); } catch { return isCoarsePointer(); }
+}
+
+/**
+ * Auto-detected phones get a conservative GPU budget even when their GPU string looks
+ * flagship-class. An explicit ?perf=high / menu override is still honoured.
+ */
 export function detectQuality(): Quality {
-  return qualityFor(readTierPref() || detectGpuTier());
+  const pref = readTierPref();
+  const q = qualityFor(pref || detectGpuTier());
+  if (!pref && isMobile() && q.tier !== 'low') {
+    q.pr = Math.min(q.pr, 1);
+    q.cloudScale = Math.min(q.cloudScale, 0.55);
+    q.minCloudScale = Math.min(q.minCloudScale, 0.40);
+    q.stepScale = Math.max(q.stepScale, 1.35);
+    q.steps = Math.min(q.steps, 36);
+    q.maxPixels = Math.min(q.maxPixels, 1.8e6);
+    q.maxCloudPixels = Math.min(q.maxCloudPixels, 0.7e6);
+    q.rain = Math.min(q.rain, 2500);
+    q.treeGrid = Math.min(q.treeGrid, 32);
+    q.shafts = Math.min(q.shafts, 16);
+    q.splashes = false; q.msaa = 0;
+  }
+  return q;
+}
+
+/**
+ * Solver resolution is CPU-bound, not GPU-bound. A 64x64x48 storm step costs roughly four times
+ * a 32x32x36 one, so touch devices stay on the coarser grid; only a multi-core desktop gets the
+ * full 64x64x48 solver. The cloud texture still has 48 vertical samples (NZR) in every case.
+ */
+export function solverGrid(q: Quality): { n: number; nz: number } {
+  const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+  if (q.tier === 'low') return { n: 32, nz: 28 };
+  if (isMobile() || cores < 6) return { n: 32, nz: 36 };
+  if (q.tier === 'high') return { n: 64, nz: 48 };
+  return { n: 64, nz: 36 };
 }
 
 export interface FlashEvent {
@@ -102,8 +141,8 @@ export class Engine {
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
-  lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0;
-  cloudW = 0; cloudH = 0;
+  lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0; lastSoftSpike = 0;
+  cloudW = 0; cloudH = 0; stormLoad = 0; cheapMode = false;
   // GPU time per pass in ms (EXT_disjoint_timer_query_webgl2); null when unavailable.
   timerExt: any = null;
   profile = { scene: 0, cloud: 0, comp: 0 };
@@ -159,7 +198,7 @@ export class Engine {
       uWind: { value: this.localWind },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
-      uCamCloud: { value: 0 },
+      uCamCloud: { value: 0 }, uPrecipDensity: { value: 1 }, uCheapShadows: { value: 0 },
     };
     const U = this.U;
     // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
@@ -221,13 +260,14 @@ export class Engine {
       uniforms: {
         ...U, uNoise: { value: this.noiseTex }, uDepth: { value: null }, uHist: { value: null }, uHistAux: { value: null }, uInvProj: { value: new THREE.Matrix4() },
         uCamWorld: { value: new THREE.Matrix4() }, uPrevVP: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
-        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.steps }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
+        uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.steps },
+        uDetail: { value: 1 }, uCheapLight: { value: 0 }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
       },
     });
     const cq = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.cloudMat); cq.frustumCulled = false; this.cloudScene.add(cq);
     this.compMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.compFrag, depthTest: false, depthWrite: false,
-      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) } },
+      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uCheapUpsample: { value: 0 } },
     });
     const cp = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.compMat); cp.frustumCulled = false; this.compScene.add(cp);
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
@@ -346,6 +386,13 @@ export class Engine {
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
     if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
     this.localWind.set(s.local.u, s.local.v);
+    // Pre-empt the multicell transition: cloud coverage, core count and rain all predict the
+    // coming dense-march/precipitation cost, so quality starts easing before frames are lost.
+    const cf = typeof s.stats?.cloudFrac === 'number' ? s.stats.cloudFrac : 0;
+    const cores = typeof s.mode?.cores === 'number' ? s.mode.cores : 0;
+    const rain = typeof s.stats?.maxRain === 'number' ? s.stats.maxRain : 0;
+    const load = Math.min(1, 0.45 * Math.min(1, cf / 0.5) + 0.4 * Math.min(1, cores / 8) + 0.15 * Math.min(1, rain / 80));
+    this.stormLoad += (load - this.stormLoad) * 0.45;
   }
 
   /** How much condensate sits *at the camera* (0..1). Drives the cheap surface shaders and
@@ -379,11 +426,15 @@ export class Engine {
       const o = i * 10;
       const s = ev.segs;
       for (let v = 0; v < 4; v++) {
-        aA.set([s[o], s[o + 1], s[o + 2]], (i * 4 + v) * 3); aB.set([s[o + 3], s[o + 4], s[o + 5]], (i * 4 + v) * 3);
-        aS.set([s[o + 6], s[o + 7], s[o + 8], s[o + 9]], (i * 4 + v) * 4);
-        aC.set([v >= 2 ? 1 : 0, v % 2 === 0 ? -1 : 1], (i * 4 + v) * 2);
+        const av = (i * 4 + v) * 3, sv = (i * 4 + v) * 4, cv = (i * 4 + v) * 2;
+        aA[av] = s[o]; aA[av + 1] = s[o + 1]; aA[av + 2] = s[o + 2];
+        aB[av] = s[o + 3]; aB[av + 1] = s[o + 4]; aB[av + 2] = s[o + 5];
+        aS[sv] = s[o + 6]; aS[sv + 1] = s[o + 7]; aS[sv + 2] = s[o + 8]; aS[sv + 3] = s[o + 9];
+        aC[cv] = v >= 2 ? 1 : 0; aC[cv + 1] = v % 2 === 0 ? -1 : 1;
       }
-      ind.set([i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 2, i * 4 + 1, i * 4 + 3], i * 6);
+      const io = i * 6, iv = i * 4;
+      ind[io] = iv; ind[io + 1] = iv + 1; ind[io + 2] = iv + 2;
+      ind[io + 3] = iv + 2; ind[io + 4] = iv + 1; ind[io + 5] = iv + 3;
       const mx = (s[o] + s[o + 3]) / 2, my = (s[o + 1] + s[o + 4]) / 2, mz = (s[o + 2] + s[o + 5]) / 2;
       cx += mx; cy += my; cz += mz;
       if (my < lowY) lowY = my;
@@ -391,8 +442,9 @@ export class Engine {
     cx /= n; cy /= n; cz /= n;
     for (let i = 0; i < n; i++) {
       const o = i * 10; const my = (ev.segs[o + 1] + ev.segs[o + 4]) / 2;
-      const m = [(ev.segs[o] + ev.segs[o + 3]) / 2, my, (ev.segs[o + 2] + ev.segs[o + 5]) / 2];
-      if (my > cy) { hiSum = hiSum.map((v, k) => v + m[k]); hiN++; } else { loSum = loSum.map((v, k) => v + m[k]); loN++; }
+      const mx = (ev.segs[o] + ev.segs[o + 3]) / 2, mz = (ev.segs[o + 2] + ev.segs[o + 5]) / 2;
+      if (my > cy) { hiSum[0] += mx; hiSum[1] += my; hiSum[2] += mz; hiN++; }
+      else { loSum[0] += mx; loSum[1] += my; loSum[2] += mz; loN++; }
     }
     const off = new THREE.Vector3(Math.round((cam.x - cx) / L) * L, 0, Math.round((cam.z - cz) / L) * L);
     const geo = new THREE.BufferGeometry();
@@ -418,8 +470,10 @@ export class Engine {
     const last = ev.strokes.length ? ev.strokes[ev.strokes.length - 1].t : 0;
     const centre = new THREE.Vector3(cx, cy, cz).add(off);
     const fv: FlashVis = { ev, t0: performance.now(), mesh, mat, off, cloudPos, groundPos, end: Math.max(ev.ccEnd, last) + 1.4, dist: centre.distanceTo(cam) };
+    // Only three channels are exposed to uFlash[6]; more simultaneous bolt meshes just add
+    // overdraw and per-frame luminance work during a lightning burst.
+    while (this.flashes.length >= 3) this.removeFlash(this.flashes[0]);
     this.flashes.push(fv);
-    if (this.flashes.length > 5) this.removeFlash(this.flashes[0]);
     return fv;
   }
   private removeFlash(f: FlashVis) {
@@ -470,6 +524,15 @@ export class Engine {
     const dt = Math.min(0.1, dtReal);
     this.time += dt;
     const U = this.U;
+    // Storm-load and stall controls are shared uniform objects across all scene materials.
+    const cheap = this.cheapMode ? 1 : 0;
+    const mixK = Math.min(1, rawDt * 6);
+    U.uCheapShadows.value += (cheap - U.uCheapShadows.value) * mixK;
+    const density = Math.max(0.3, (1 - 0.55 * this.stormLoad) * (this.cheapMode ? 0.65 : 1));
+    U.uPrecipDensity.value += (density - U.uPrecipDensity.value) * Math.min(1, rawDt * 4);
+    this.cloudMat.uniforms.uDetail.value = this.cheapMode ? 0 : 1;
+    this.cloudMat.uniforms.uCheapLight.value = cheap;
+    this.compMat.uniforms.uCheapUpsample.value = cheap;
     this.camera.position.set(cam.x, cam.y, cam.z);
     this.camera.rotation.set(cam.pitch, cam.yaw, 0);
     if (Math.abs(this.camera.fov - cam.fov) > 0.01) { this.camera.fov = cam.fov; this.camera.updateProjectionMatrix(); }
@@ -548,6 +611,7 @@ export class Engine {
     const ang = Math.hypot(cam.yaw - this.lastAng[0], cam.pitch - this.lastAng[1]) / rawDt;
     this.lastAng = [cam.yaw, cam.pitch];
     let blend = 0.93 * Math.exp(-ang * 1.2);
+    if (this.cheapMode) blend = Math.min(0.96, blend * 1.03);   // lean on temporal history
     if (this.flashLevel > 0.05) blend *= 0.35;
     cm.uBlend.value = this.frame < 3 ? 0 : blend;
     cm.uFrame.value = this.frame & 1023;
@@ -580,18 +644,29 @@ export class Engine {
     // ---- dynamic resolution for the cloud pass
     this.fps += (1 / rawDt - this.fps) * Math.min(1, rawDt * 0.15);
     const frameDt = rawDt * 1000;
-    if (frameDt > 28) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 13) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
+    // Recovery must be reachable on ordinary 60 Hz displays (16.7 ms), not just 120 Hz ones.
+    if (frameDt > 28) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 19) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
-    // A single huge spike reacts immediately instead of waiting for a 1.6 s average. Cut
-    // everything at once (pixels, cloud buffer, steps, step size) but rate-limit it so a
-    // sustained stall cannot turn into a reallocation storm.
+    const stepCap = Math.max(16, Math.round(this.q.steps * (1 - 0.3 * this.stormLoad)));
+    if (uMax.value > stepCap) uMax.value = stepCap;
+    const stepFloor = Math.max(16, Math.floor(stepCap * 0.65));
+    // A cheap path reacts to the first bad frame without reallocating render targets: coarser
+    // march, fewer lighting/detail fetches, thinner precipitation, fewer upsample taps.
+    if (this.adaptive && frameDt > 40 && nowMs - this.lastSoftSpike > 250) {
+      this.lastSoftSpike = nowMs;
+      this.cheapMode = true;
+      this.dynStep = Math.max(this.dynStep, 2.0);
+      uMax.value = Math.min(uMax.value, stepFloor);
+      this.lowTimer = 0;
+    }
+    // A single huge spike also coarsens the cloud buffer, but is rate-limited so a sustained
+    // stall cannot turn into a reallocation storm.
     if (this.adaptive && frameDt > 50 && nowMs - this.lastSpike > 900) {
       this.lastSpike = nowMs;
-      // Only the march and the cloud buffer here: reallocating the scene target on a spike
-      // causes the very hitch we are reacting to and can oscillate.
+      this.cheapMode = true;
       this.dynStep = Math.min(3.2, this.dynStep + 0.5);
-      uMax.value = Math.max(18, uMax.value - 8);
+      uMax.value = Math.max(16, uMax.value - 8);
       if (this.cloudScale > this.q.minCloudScale) {
         this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.08);
         this.rebuildCloud();
@@ -600,28 +675,29 @@ export class Engine {
     }
     if (this.lowTimer > 1.0) {
       const p = this.profile;
-      const cloudBound = p.cloud > p.scene * 1.15 && p.cloud > 1.0;
-      // Order matters: steps and screen resolution are much less visible than the cloud
-      // buffer, so the cloud scale is the LAST thing to go.
+      // GPU timers are opt-in. With no timing data, assume the volumetric pass is the bottleneck
+      // instead of shrinking the whole screen first (the old zero-profile fallback did that).
+      const cloudBound = p.cloud > 0 ? p.cloud > p.scene * 1.15 : true;
       if (cloudBound) {
-        if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
-        else if (uMax.value > 18) uMax.value -= 4;
+        if (uMax.value > stepFloor) uMax.value = Math.max(stepFloor, uMax.value - 4);
+        else if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
         else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
       } else {
-        if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
-        else if (uMax.value > 18) uMax.value -= 4;
+        if (uMax.value > stepFloor) uMax.value = Math.max(stepFloor, uMax.value - 4);
+        else if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
         else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
       }
       this.lowTimer = 0;
     }
     if (this.highTimer > 8) {
-      if (uMax.value < this.q.steps) uMax.value = Math.min(this.q.steps, uMax.value + 2);
+      if (this.cheapMode) this.cheapMode = false;
+      else if (uMax.value < stepCap) uMax.value = Math.min(stepCap, uMax.value + 2);
       else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
       else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
       else if (this.prScale < 1) { this.prScale = Math.min(1, this.prScale + 0.1); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
     }
-    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * this.dynStep;
+    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * Math.max(this.dynStep, 1 + 0.7 * this.stormLoad);
   }
   private rebuildCloud() {
     const pr = this.renderer.getPixelRatio();

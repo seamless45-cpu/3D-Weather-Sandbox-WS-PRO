@@ -2,6 +2,7 @@ import { Terrain } from './sim/terrain';
 import { DOMAIN } from './sim/consts';
 
 const SOUND_SPEED = 343;
+const THUNDER_SR = 22050;
 
 export class AudioEngine {
   ctx: AudioContext | null = null;
@@ -9,6 +10,10 @@ export class AudioEngine {
   reverb!: ConvolverNode; wet!: GainNode; dry!: GainNode;
   enabled = true; t = 0; gust = 0;
   terrain: Terrain | null = null;
+  /** Reused white noise for thunder grains; avoids Math.random() millions of times per flash. */
+  noise!: Float32Array;
+  private lastThunderMs = -Infinity;
+  private thunderSources = new Set<AudioBufferSourceNode>();
 
   start(terrain: Terrain) {
     if (this.ctx) { this.ctx.resume(); return; }
@@ -16,7 +21,7 @@ export class AudioEngine {
     const AC = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
     // 22.05 kHz is plenty for wind/rain/thunder and halves the audio DSP cost on weak CPUs.
     let ctx: AudioContext;
-    try { ctx = new AC({ sampleRate: 22050 }); } catch { ctx = new AC(); }
+    try { ctx = new AC({ sampleRate: THUNDER_SR }); } catch { ctx = new AC(); }
     this.ctx = ctx;
     this.master = ctx.createGain(); this.master.gain.value = this.enabled ? 0.8 : 0; this.master.connect(ctx.destination);
     // noise source
@@ -26,6 +31,7 @@ export class AudioEngine {
     for (let i = 0; i < d.length; i++) { const w = Math.random() * 2 - 1; b0 = 0.99765 * b0 + w * 0.099046; b1 = 0.963 * b1 + w * 0.2965164; b2 = 0.57 * b2 + w * 1.0526913; d[i] = (b0 + b1 + b2 + w * 0.1848) * 0.2; }
     const white = ctx.createBuffer(1, ctx.sampleRate * 3, ctx.sampleRate);
     const wd = white.getChannelData(0); for (let i = 0; i < wd.length; i++) wd[i] = Math.random() * 2 - 1;
+    this.noise = wd;
     const src = (buf: AudioBuffer) => { const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true; s.start(); return s; };
     // wind: pink noise, band-limited, level & colour follow the simulated surface wind
     this.windF = ctx.createBiquadFilter(); this.windF.type = 'lowpass'; this.windF.frequency.value = 300; this.windF.Q.value = 0.6;
@@ -42,7 +48,7 @@ export class AudioEngine {
     src(white).connect(this.leafF); this.leafF.connect(this.leaf); this.leaf.connect(this.master);
     // reverb for thunder tails
     this.reverb = ctx.createConvolver();
-    // A 4.5 s stereo impulse response is a constant CPU cost even when nothing is playing.
+    // A 1.5 s mono impulse response keeps the convolution affordable on mobile audio threads.
     const irLen = Math.floor(ctx.sampleRate * 1.5);
     const ir = ctx.createBuffer(1, irLen, ctx.sampleRate);
     const a = ir.getChannelData(0);
@@ -67,16 +73,35 @@ export class AudioEngine {
     this.rain.gain.setTargetAtTime(Math.min(0.55, 0.45 * Math.sqrt(Math.min(rainRate, 80) / 80)), c, 0.4);
   }
 
-  /** Build the thunder waveform from the actual channel geometry: every segment is a grain arriving at r/c. */
+  /**
+   * Build a bounded thunder waveform from the channel geometry. Multicell stages can produce
+   * several breakdowns per second; the old 260-grain, 40-second synthesis blocked the UI for
+   * seconds on every flash. Grain count, grain tail and total duration are all hard-capped, and
+   * the filters/envelopes use recurrences over a shared noise buffer instead of per-sample exp()
+   * and Math.random() calls.
+   */
   thunder(segs: Float32Array, off: [number, number], listener: [number, number, number], flashStartDelay = 0) {
     if (!this.ctx || !this.enabled || !this.terrain) return;
-    const ctx = this.ctx, sr = 22050;
+    const ctx = this.ctx, sr = THUNDER_SR;
     const n = segs.length / 10;
     if (n < 2) return;
-    const step = Math.max(1, Math.floor(n / 260));
+    // One thunder per 180 ms and at most three overlapping tails. The solver still simulates every
+    // flash; this only stops a lightning burst from turning into a main-thread/audio DSP pile-up.
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowMs - this.lastThunderMs < 180) return;
+    while (this.thunderSources.size >= 3) {
+      const oldest = this.thunderSources.values().next().value as AudioBufferSourceNode | undefined;
+      if (!oldest) break;
+      this.thunderSources.delete(oldest);
+      try { (oldest as any).stop?.(); } catch { /* already stopped */ }
+    }
+    this.lastThunderMs = nowMs;
+
+    const MAX_GRAINS = 48;
+    const step = Math.max(1, Math.ceil(n / MAX_GRAINS));
     type G = { t: number; a: number; fc: number; tau: number; crack: number };
     const grains: G[] = [];
-    let tmin = 1e9, tmax = 0, dmin = 1e9;
+    let tmin = 1e9, tmax = 0;
     for (let i = 0; i < n; i += step) {
       const o = i * 10;
       const px = (segs[o] + segs[o + 3]) / 2 + off[0], py = (segs[o + 1] + segs[o + 4]) / 2, pz = (segs[o + 2] + segs[o + 5]) / 2 + off[1];
@@ -95,38 +120,56 @@ export class AudioEngine {
       const a = ((24 * len) / (d + 90)) * atten * (blocked ? 0.55 : 1);
       const fc = Math.max(60, (9000 / (1 + d / 900)) * (blocked ? 0.45 : 1));
       grains.push({ t, a, fc, tau: 0.12 + d * 0.00006 + Math.random() * 0.15, crack: d < 3500 && !blocked ? Math.exp(-d / 1500) : 0 });
-      tmin = Math.min(tmin, t); tmax = Math.max(tmax, t); dmin = Math.min(dmin, d);
+      tmin = Math.min(tmin, t); tmax = Math.max(tmax, t);
     }
-    const dur = Math.min(40, tmax - tmin + 7);
-    const total = Math.floor(dur * sr);
+    const dur = Math.min(10, tmax - tmin + 3);
+    const total = Math.max(1, Math.floor(dur * sr));
     const out = new Float32Array(total);
-    const addGrain = (t: number, a: number, fc: number, tau: number, attack: number) => {
+    const noise = this.noise && this.noise.length ? this.noise : (() => { const w = new Float32Array(1 << 15); for (let i = 0; i < w.length; i++) w[i] = Math.random() * 2 - 1; return w; })();
+    const noiseLen = noise.length;
+    let touched = 0;
+    // Per-sample filter and envelope state is advanced with multiplication. Only the few grain
+    // parameters need exp(); the old implementation called exp() and random() inside every loop.
+    const addGrain = (t: number, a: number, fc: number, tau: number, attack: number, maxTail: number) => {
       const i0 = Math.floor((t - tmin) * sr);
-      const len = Math.min(total - i0, Math.floor(tau * sr * 4));
-      if (i0 < 0 || len <= 0) return;
-      const alpha = 1 - Math.exp((-2 * Math.PI * fc) / sr);
-      let lp = 0, lp2 = 0;
+      if (i0 < 0 || i0 >= total) return;
+      const len = Math.min(total - i0, Math.floor(Math.min(tau * 2.2, maxTail) * sr));
+      if (len <= 0) return;
+      const alpha = 1 - Math.exp(-2 * Math.PI * fc / sr);
+      const decay = Math.exp(-1 / (tau * sr));
+      const atk = Math.max(1, Math.floor(attack * sr));
+      let lp = 0, lp2 = 0, decayPow = 1, j = (Math.random() * noiseLen) | 0;
       for (let i = 0; i < len; i++) {
-        const tt = i / sr;
-        const env = Math.min(1, tt / attack) * Math.exp(-tt / tau);
-        lp += alpha * ((Math.random() * 2 - 1) - lp); lp2 += alpha * (lp - lp2);
+        const w = noise[j]; if (++j === noiseLen) j = 0;
+        lp += alpha * (w - lp); lp2 += alpha * (lp - lp2);
+        const env = Math.min(1, (i + 1) / atk) * decayPow;
+        decayPow *= decay;
         out[i0 + i] += a * env * lp2 * 3.2;
       }
+      touched = Math.max(touched, i0 + len);
     };
     for (const g of grains) {
-      addGrain(g.t, g.a, g.fc, g.tau, 0.004);                                  // body
-      addGrain(g.t, g.a * 0.8, Math.min(220, g.fc), g.tau * 2.6, 0.03);          // low-frequency rolling rumble
-      addGrain(g.t + 0.35 + Math.random() * 1.8, g.a * 0.3, g.fc * 0.5, g.tau * 2, 0.05); // terrain echoes
-      if (g.crack > 0.02) addGrain(g.t, g.a * 1.8 * g.crack, 7000, 0.018, 0.0008);   // sharp near crack
+      addGrain(g.t, g.a, g.fc, g.tau, 0.004, 0.28);                                  // body
+      addGrain(g.t, g.a * 0.8, Math.min(220, g.fc), g.tau * 2.6, 0.03, 0.50);       // rolling rumble
+      addGrain(g.t + 0.35 + Math.random() * 1.8, g.a * 0.3, g.fc * 0.5, g.tau * 2, 0.05, 0.30); // terrain echo
+      if (g.crack > 0.02) addGrain(g.t, g.a * 1.8 * g.crack, 7000, 0.018, 0.0008, 0.05);     // near crack
     }
-    let peak = 0;
-    for (let i = 0; i < total; i++) { const v = Math.tanh(out[i] * 0.55); out[i] = v; if (Math.abs(v) > peak) peak = Math.abs(v); }
-    void peak; void dmin;
+    // Cubic soft clip: cheaper than tanh over the whole buffer.
+    for (let i = 0; i < touched; i++) {
+      const v = out[i] * 0.55;
+      out[i] = v > 1 ? 1 : v < -1 ? -1 : v * (1.5 - 0.5 * v * v);
+    }
     const buf = ctx.createBuffer(1, total, sr);
     buf.getChannelData(0).set(out);
     const s = ctx.createBufferSource(); s.buffer = buf;
-    const g = ctx.createGain(); g.gain.value = 0.9;
-    s.connect(g); g.connect(this.dry); g.connect(this.reverb);
+    const gain = ctx.createGain(); gain.gain.value = 0.9;
+    s.connect(gain); gain.connect(this.dry); gain.connect(this.reverb);
+    this.thunderSources.add(s);
+    const sn = s as any;
+    sn.onended = () => {
+      this.thunderSources.delete(s);
+      try { sn.disconnect?.(); gain.disconnect?.(); } catch { /* already disconnected */ }
+    };
     s.start(ctx.currentTime + tmin + flashStartDelay);
   }
 }
