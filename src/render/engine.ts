@@ -5,6 +5,7 @@ import { sunState } from '../sim/sun';
 import { computeLighting } from './skyModel';
 import { makeNoiseData } from './noise';
 import * as S from './glsl';
+import * as T from './tornadoGlsl';
 
 export type Tier = 'low' | 'mid' | 'high';
 export interface Quality {
@@ -18,9 +19,9 @@ export interface Quality {
 export function qualityFor(tier: Tier): Quality {
   // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
   // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
-  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.5, stepScale: 2.6, minCloudScale: 0.36, M: 256, rain: 1000, treeGrid: 16, msaa: 0, splashes: false, shafts: 8, steps: 20, maxPixels: 1.2e6, maxCloudPixels: 0.6e6 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.6, stepScale: 1.5, minCloudScale: 0.42, M: 256, rain: 2500, treeGrid: 28, msaa: 0, splashes: true, shafts: 18, steps: 48, maxPixels: 2.2e6, maxCloudPixels: 0.9e6 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.8, stepScale: 1.0, minCloudScale: 0.52, M: 256, rain: 6000, treeGrid: 56, msaa: 2, splashes: true, shafts: 24, steps: 64, maxPixels: 3.6e6, maxCloudPixels: 1.6e6 };
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.62, stepScale: 2.2, minCloudScale: 0.45, M: 256, rain: 2200, treeGrid: 16, msaa: 0, splashes: true, shafts: 12, steps: 30, maxPixels: 1.4e6, maxCloudPixels: 0.9e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.72, stepScale: 1.3, minCloudScale: 0.50, M: 256, rain: 6500, treeGrid: 28, msaa: 0, splashes: true, shafts: 24, steps: 64, maxPixels: 2.6e6, maxCloudPixels: 1.4e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.9, stepScale: 1.0, minCloudScale: 0.62, M: 256, rain: 14000, treeGrid: 56, msaa: 2, splashes: true, shafts: 32, steps: 96, maxPixels: 4.2e6, maxCloudPixels: 2.2e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -89,16 +90,16 @@ export function detectQuality(): Quality {
   const q = qualityFor(pref || detectGpuTier());
   if (!pref && isMobile() && q.tier !== 'low') {
     q.pr = Math.min(q.pr, 1);
-    q.cloudScale = Math.min(q.cloudScale, 0.55);
-    q.minCloudScale = Math.min(q.minCloudScale, 0.40);
-    q.stepScale = Math.max(q.stepScale, 1.35);
-    q.steps = Math.min(q.steps, 36);
-    q.maxPixels = Math.min(q.maxPixels, 1.8e6);
-    q.maxCloudPixels = Math.min(q.maxCloudPixels, 0.7e6);
-    q.rain = Math.min(q.rain, 2500);
-    q.treeGrid = Math.min(q.treeGrid, 32);
-    q.shafts = Math.min(q.shafts, 16);
-    q.splashes = false; q.msaa = 0;
+    q.cloudScale = Math.min(q.cloudScale, 0.66);
+    q.minCloudScale = Math.min(q.minCloudScale, 0.46);
+    q.stepScale = Math.max(q.stepScale, 1.2);
+    q.steps = Math.min(q.steps, 52);
+    q.maxPixels = Math.min(q.maxPixels, 2.2e6);
+    q.maxCloudPixels = Math.min(q.maxCloudPixels, 1.1e6);
+    q.rain = Math.min(q.rain, 5000);
+    q.treeGrid = Math.min(q.treeGrid, 36);
+    q.shafts = Math.min(q.shafts, 20);
+    q.msaa = 0;
   }
   return q;
 }
@@ -136,6 +137,8 @@ export class Engine {
   cloudScene = new THREE.Scene(); compScene = new THREE.Scene(); ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   cloudMat: THREE.ShaderMaterial; compMat: THREE.ShaderMaterial;
   terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh; shaftMesh: THREE.Mesh;
+  funnelMesh: THREE.Mesh; debrisPoints: THREE.Points; vehicleGroup: THREE.Group;
+  tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
@@ -200,6 +203,8 @@ export class Engine {
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
       uCamCloud: { value: 0 }, uPrecipDensity: { value: 1 }, uCheapShadows: { value: 0 },
       uRainIntensity: { value: 0 }, uFlashGlow: { value: 0 },
+      uTornado: { value: new THREE.Vector4(DOMAIN / 2, DOMAIN / 2, 220, 0) }, uTornadoTop: { value: 1200 },
+      uHeavyRain: { value: 0 }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uDenoise: { value: 1 },
     };
     const U = this.U;
     // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
@@ -253,6 +258,24 @@ export class Engine {
     if (!q.splashes) this.splashMesh.visible = false;
     this.splashMesh.frustumCulled = false; this.splashMesh.renderOrder = 3; this.scene.add(this.splashMesh);
 
+    // ---- solver-driven condensation funnel, debris cloud and intercept vehicle
+    const funnelGeo = new THREE.CylinderGeometry(1, 1, 1, 64, 36, true);
+    const funnelExtra = {
+      uTop: { value: 1200 }, uBottom: { value: 0 }, uRadius: { value: 220 },
+      uIntensity: { value: 0 }, uDebris: { value: 0 }, uFunnelSeed: { value: Math.random() * 6.283 },
+    };
+    this.funnelMesh = new THREE.Mesh(funnelGeo, mk(T.funnelVert, T.funnelFrag, funnelExtra, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+    this.funnelMesh.frustumCulled = false; this.funnelMesh.renderOrder = 3.5; this.funnelMesh.visible = false; this.scene.add(this.funnelMesh);
+    const debrisGeo = new THREE.BufferGeometry();
+    const debrisSeed = new Float32Array(900 * 3);
+    for (let i = 0; i < debrisSeed.length; i++) debrisSeed[i] = Math.random();
+    debrisGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(900 * 3), 3));
+    debrisGeo.setAttribute('aSeed', new THREE.BufferAttribute(debrisSeed, 3));
+    this.debrisPoints = new THREE.Points(debrisGeo, mk(T.debrisVert, T.debrisFrag, { uDebris: { value: 0 }, uTop: { value: 1200 } }, { transparent: true, depthWrite: false }));
+    this.debrisPoints.frustumCulled = false; this.debrisPoints.renderOrder = 3.6; this.debrisPoints.visible = false; this.scene.add(this.debrisPoints);
+    this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag));
+    this.vehicleGroup.visible = false; this.vehicleGroup.renderOrder = 4; this.scene.add(this.vehicleGroup);
+
     // ---- cloud + composite passes
     this.cloudMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.cloudFrag, depthTest: false, depthWrite: false,
@@ -268,17 +291,18 @@ export class Engine {
     const cq = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.cloudMat); cq.frustumCulled = false; this.cloudScene.add(cq);
     this.compMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.compFrag, depthTest: false, depthWrite: false,
-      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uCheapUpsample: { value: 0 } },
+      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uCheapUpsample: { value: 0 }, uDenoise: { value: 1 } },
     });
     const cp = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.compMat); cp.frustumCulled = false; this.compScene.add(cp);
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
   }
 
-  /** Two soft, independently seeded veils per precipitation column. The overlap hides the
-   *  single-billboard outline that made distant rain read as a flat grey card. */
+  /** Six fixed-azimuth, independently seeded planes per precipitation column. The overlap
+   *  forms a cylindrical rainshaft that reads as a volume from every camera angle. */
   private buildShafts(n: number): THREE.BufferGeometry {
     const g = new THREE.BufferGeometry();
-    const quads = n * n * 2;
+    const SHAFT_PLANES = 6;
+    const quads = n * n * SHAFT_PLANES;
     const col = new Float32Array(quads * 4 * 4);
     const corner = new Float32Array(quads * 4 * 2);
     const pos = new Float32Array(quads * 4 * 3);
@@ -288,13 +312,12 @@ export class Engine {
     for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
       const x = (i + 0.5) * cell, z = (j + 0.5) * cell;
       const base = ((((i * 73856093) ^ (j * 19349663)) >>> 0) % 997) / 997;
-      for (let layer = 0; layer < 2; layer++) {
-        const seed = (base + layer * 0.371) % 1;
+      for (let layer = 0; layer < SHAFT_PLANES; layer++) {
         for (let v = 0; v < 4; v++) {
           const vi = q * 4 + v;
           corner[vi * 2] = v === 1 || v === 3 ? 1 : 0;
           corner[vi * 2 + 1] = v >= 2 ? 1 : 0;
-          col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = seed; col[vi * 4 + 3] = layer;
+          col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = base; col[vi * 4 + 3] = layer;
         }
         idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4 + 2, q * 4 + 1, q * 4 + 3], q * 6);
         q++;
@@ -337,6 +360,38 @@ export class Engine {
     g.setAttribute('aCell', new THREE.InstancedBufferAttribute(cells, 2));
     g.instanceCount = grid * grid;
     return g;
+  }
+
+  /** Low-poly mesonet-style intercept truck: chassis, cabin, roof rack, probe mast and wheels. */
+  private buildVehicle(material: THREE.ShaderMaterial): THREE.Group {
+    const group = new THREE.Group();
+    const part = (geom: THREE.BufferGeometry, color: [number, number, number], x: number, y: number, z: number, rx = 0, ry = 0, rz = 0) => {
+      const g = geom.clone();
+      const n = g.getAttribute('position').count;
+      const cols = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cols[i * 3] = color[0]; cols[i * 3 + 1] = color[1]; cols[i * 3 + 2] = color[2]; }
+      g.setAttribute('aColor', new THREE.BufferAttribute(cols, 3));
+      const m = new THREE.Mesh(g, material);
+      m.position.set(x, y, z); m.rotation.set(rx, ry, rz); group.add(m);
+    };
+    const armored: [number, number, number] = [0.16, 0.19, 0.20];
+    const glass: [number, number, number] = [0.12, 0.20, 0.26];
+    const trim: [number, number, number] = [0.42, 0.40, 0.34];
+    part(new THREE.BoxGeometry(4.6, 1.05, 2.15), armored, 0, 0.95, 0);
+    part(new THREE.BoxGeometry(2.35, 1.15, 2.0), armored, -0.45, 1.95, 0);
+    part(new THREE.BoxGeometry(2.30, 0.65, 2.03), glass, -0.45, 2.18, 0);
+    part(new THREE.BoxGeometry(4.75, 0.16, 2.25), trim, 0, 1.52, 0);
+    part(new THREE.BoxGeometry(1.55, 0.10, 2.15), trim, 1.35, 1.55, 0);
+    part(new THREE.BoxGeometry(0.10, 1.95, 0.10), trim, 0.45, 2.85, 0.85);
+    part(new THREE.BoxGeometry(0.10, 1.95, 0.10), trim, 0.45, 2.85, -0.85);
+    part(new THREE.BoxGeometry(1.45, 0.09, 0.09), trim, 0.45, 3.82, 0);
+    part(new THREE.BoxGeometry(0.09, 1.65, 0.09), trim, -0.25, 3.0, 0);
+    part(new THREE.BoxGeometry(0.55, 0.55, 0.55), [0.55, 0.12, 0.08], -0.25, 3.95, 0);
+    const wheel = new THREE.CylinderGeometry(0.56, 0.56, 0.38, 16);
+    for (const x of [-1.55, 1.55]) for (const z of [-1.16, 1.16]) {
+      part(wheel, [0.045, 0.045, 0.05], x, 0.56, z, Math.PI / 2, 0, 0);
+    }
+    return group;
   }
 
   private buildParticles(n: number): THREE.InstancedBufferGeometry {
@@ -399,13 +454,27 @@ export class Engine {
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
     if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
     this.localWind.set(s.local.u, s.local.v);
+    this.tornado = s.tornado || null;
+    this.chargeTripole = typeof s.charge?.tripole === 'number' ? s.charge.tripole : 0;
     // Pre-empt the multicell transition: cloud coverage, core count and rain all predict the
     // coming dense-march/precipitation cost, so quality starts easing before frames are lost.
     const cf = typeof s.stats?.cloudFrac === 'number' ? s.stats.cloudFrac : 0;
     const cores = typeof s.mode?.cores === 'number' ? s.mode.cores : 0;
     const rain = typeof s.stats?.maxRain === 'number' ? s.stats.maxRain : 0;
+    this.heavyRain = typeof s.heavyRain === 'number' ? s.heavyRain : Math.min(1, rain / 95);
     const load = Math.min(1, 0.45 * Math.min(1, cf / 0.5) + 0.4 * Math.min(1, cores / 8) + 0.15 * Math.min(1, rain / 80));
     this.stormLoad += (load - this.stormLoad) * 0.45;
+  }
+
+  /** Place the player-driven intercept vehicle from the controller's pose. */
+  setVehiclePose(pose: any) {
+    this.vehiclePose = pose;
+    const v = this.vehicleGroup;
+    if (!pose || !pose.active) { v.visible = false; return; }
+    const gh = this.terrain.groundHeight(pose.x, pose.z);
+    v.visible = true;
+    v.position.set(pose.x, gh + 0.05, pose.z);
+    v.rotation.set(0, pose.heading || 0, pose.roll || 0);
   }
 
   /** How much condensate sits *at the camera* (0..1). Drives the cheap surface shaders and
@@ -586,15 +655,39 @@ export class Engine {
     const cheap = this.cheapMode ? 1 : 0;
     const mixK = Math.min(1, rawDt * 6);
     U.uCheapShadows.value += (cheap - U.uCheapShadows.value) * mixK;
-    const density = Math.max(0.3, (1 - 0.55 * this.stormLoad) * (this.cheapMode ? 0.65 : 1));
+    // Heavy rain must get denser, not thinner: storm load only trims in the emergency cheap path.
+    const density = Math.max(0.65, (1 - 0.15 * this.stormLoad + 0.25 * this.heavyRain) * (this.cheapMode ? 0.85 : 1));
     U.uPrecipDensity.value += (density - U.uPrecipDensity.value) * Math.min(1, rawDt * 4);
     this.cloudMat.uniforms.uDetail.value = this.cheapMode ? 0 : 1;
     this.cloudMat.uniforms.uCheapLight.value = cheap;
     this.compMat.uniforms.uCheapUpsample.value = cheap;
+    this.denoise = this.cheapMode ? 0.45 : 1;
+    U.uDenoise.value += (this.denoise - U.uDenoise.value) * mixK;
+    this.compMat.uniforms.uDenoise.value = U.uDenoise.value;
+    this.cloudMat.uniforms.uDenoise.value = U.uDenoise.value;
+    U.uHeavyRain.value += (this.heavyRain - U.uHeavyRain.value) * Math.min(1, rawDt * 2);
     this.camera.position.set(cam.x, cam.y, cam.z);
     this.camera.rotation.set(cam.pitch, cam.yaw, 0);
     if (Math.abs(this.camera.fov - cam.fov) > 0.01) { this.camera.fov = cam.fov; this.camera.updateProjectionMatrix(); }
     this.camera.updateMatrixWorld(true);
+    // ---- solver-driven vortex and intercept vehicle
+    const tor = this.tornado;
+    const intensity = tor && tor.active ? tor.intensity : 0;
+    U.uTornado.value.set(tor ? tor.x : DOMAIN / 2, tor ? tor.z : DOMAIN / 2, tor ? tor.radius : 220, intensity);
+    U.uTornadoTop.value = tor && tor.active ? tor.funnelTop : 1200;
+    const fu = this.funnelMesh.material as THREE.ShaderMaterial;
+    fu.uniforms.uIntensity.value = intensity;
+    fu.uniforms.uDebris.value = tor ? tor.debris : 0;
+    fu.uniforms.uRadius.value = tor ? tor.radius : 220;
+    fu.uniforms.uTop.value = tor && tor.active ? tor.funnelTop : 1200;
+    fu.uniforms.uBottom.value = tor && tor.active ? tor.funnelBottom : 0;
+    const height = Math.max(100, fu.uniforms.uTop.value - fu.uniforms.uBottom.value);
+    this.funnelMesh.position.set(U.uTornado.value.x, fu.uniforms.uBottom.value + height * 0.5, U.uTornado.value.y);
+    this.funnelMesh.scale.set(fu.uniforms.uRadius.value, height, fu.uniforms.uRadius.value);
+    this.funnelMesh.visible = !!tor && tor.active && intensity > 0.04 && tor.distance < 26000;
+    (this.debrisPoints.material as THREE.ShaderMaterial).uniforms.uDebris.value = tor && tor.active ? tor.debris : 0;
+    this.debrisPoints.visible = this.funnelMesh.visible && tor && tor.debris > 0.08 && tor.distance < 9000;
+    this.setVehiclePose(this.vehiclePose);
 
     // ---- lighting from the sun and the simulated sky state
     const sun = sunState(this.lastSimTime);
@@ -607,9 +700,9 @@ export class Engine {
     U.uSkyAmb.value.set(lt.skyAmb[0], lt.skyAmb[1], lt.skyAmb[2]).multiplyScalar(0.55 + 0.45 * dim);
     U.uHorizon.value.set(...lt.horizon); U.uGroundAmb.value.set(...lt.groundAmb); U.uTwilight.value = lt.twilight;
     U.uTime.value = this.time;
-    U.uVis.value = Math.max(3000, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.05 * this.rainAtCam));
+    U.uVis.value = Math.max(2400, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.075 * this.rainAtCam + 0.8 * this.heavyRain));
     // Local rain drives how many near-camera drops survive and how bright the veils are.
-    U.uRainIntensity.value = Math.max(0, Math.min(1, this.rainAtCam / 25));
+    U.uRainIntensity.value = Math.max(0, Math.min(1, this.rainAtCam / 45));
     U.uCamXZ.value.set(cam.x, cam.z);
     // camera engulfed by condensate: lets the surface shaders skip their cloud-shadow stack
     U.uCamCloud.value = this.camCloudAt(cam.x, cam.y, cam.z);
@@ -672,8 +765,8 @@ export class Engine {
     const cm = this.cloudMat.uniforms;
     const ang = Math.hypot(cam.yaw - this.lastAng[0], cam.pitch - this.lastAng[1]) / rawDt;
     this.lastAng = [cam.yaw, cam.pitch];
-    let blend = 0.93 * Math.exp(-ang * 1.2);
-    if (this.cheapMode) blend = Math.min(0.96, blend * 1.03);   // lean on temporal history
+    let blend = 0.955 * Math.exp(-ang * 1.2);
+    if (this.cheapMode) blend = Math.min(0.975, blend * 1.02);   // lean on temporal history
     if (this.flashLevel > 0.05) blend *= 0.35;
     cm.uBlend.value = this.frame < 3 ? 0 : blend;
     cm.uFrame.value = this.frame & 1023;
@@ -695,6 +788,7 @@ export class Engine {
     this.compMat.uniforms.uCloudRT.value = curRT.textures[0];
     this.compMat.uniforms.uCloudAux.value = curRT.textures[1];
     this.compMat.uniforms.uCloudRes.value.set(curRT.width, curRT.height);
+    U.uCloudRes.value.set(curRT.width, curRT.height);
     this.beginTimer(2);
     this.renderer.setRenderTarget(null);
     this.renderer.render(this.compScene, this.ortho);
@@ -710,12 +804,12 @@ export class Engine {
     if (frameDt > 28) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 19) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
-    const stepCap = Math.max(16, Math.round(this.q.steps * (1 - 0.3 * this.stormLoad)));
+    const stepCap = Math.max(24, Math.round(this.q.steps * (1 - 0.15 * this.stormLoad)));
     if (uMax.value > stepCap) uMax.value = stepCap;
     const stepFloor = Math.max(16, Math.floor(stepCap * 0.65));
     // A cheap path reacts to the first bad frame without reallocating render targets: coarser
     // march, fewer lighting/detail fetches, thinner precipitation, fewer upsample taps.
-    if (this.adaptive && frameDt > 40 && nowMs - this.lastSoftSpike > 250) {
+    if (this.adaptive && frameDt > 55 && nowMs - this.lastSoftSpike > 350) {
       this.lastSoftSpike = nowMs;
       this.cheapMode = true;
       this.dynStep = Math.max(this.dynStep, 2.0);
@@ -724,7 +818,7 @@ export class Engine {
     }
     // A single huge spike also coarsens the cloud buffer, but is rate-limited so a sustained
     // stall cannot turn into a reallocation storm.
-    if (this.adaptive && frameDt > 50 && nowMs - this.lastSpike > 900) {
+    if (this.adaptive && frameDt > 70 && nowMs - this.lastSpike > 1400) {
       this.lastSpike = nowMs;
       this.cheapMode = true;
       this.dynStep = Math.min(3.2, this.dynStep + 0.5);
@@ -759,7 +853,7 @@ export class Engine {
       else if (this.prScale < 1) { this.prScale = Math.min(1, this.prScale + 0.1); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
     }
-    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * Math.max(this.dynStep, 1 + 0.7 * this.stormLoad);
+    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * Math.max(this.dynStep, 1 + 0.28 * this.stormLoad);
   }
   private rebuildCloud() {
     const pr = this.renderer.getPixelRatio();

@@ -1,10 +1,8 @@
 // Bulk cloud microphysics (6 water species, Kessler warm-rain + Lin/Rutledge-style cold-rain simplifications),
-// sedimentation, non-inductive charge separation and charge relaxation. All phase changes release/absorb latent heat in theta.
+// sedimentation of hydrometeors and their charge, and conductivity relaxation. All phase changes release/absorb latent heat in theta.
 import type { Atmosphere } from './atmosphere';
 import { CP, LV, LF, LS, RV, T0 } from './consts';
 import { qsl, qsi } from './thermo';
-
-const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 
 export const rhoFac = (rho: number) => Math.min(1.8, Math.sqrt(1.2 / rho));
 export const vtRain = (rhoq: number, rf: number) => Math.min(9.5, 0.4 + 4.6 * Math.pow(rhoq * 1000, 0.2)) * rf;
@@ -12,18 +10,17 @@ export const vtSnow = (rf: number) => 0.9 * rf;
 export const vtGraupel = (rhoq: number, rf: number) => Math.min(14, 3.5 + 4 * Math.pow(rhoq * 1000, 0.3)) * rf;
 export const vtIce = (rf: number) => 0.12 * rf;
 
-export const K_NI = 4e-4; // effective non-inductive charging coefficient [C m^3 kg^-2 ... lumped]
+// Electrification is handled by charging.ts from the post-microphysics hydrometeor spectra.
 
 export function microphysics(a: Atmosphere, dt: number) {
   const { nz, nxy } = a;
-  const th = a.th, qv = a.qv, qc = a.qc, qi = a.qi, qr = a.qr, qs = a.qs, qg = a.qg, qh = a.qh, ql = a.ql;
+  const th = a.th, qv = a.qv, qc = a.qc, qi = a.qi, qr = a.qr, qs = a.qs, qg = a.qg;
   const P = a.params;
   a.colHydro.fill(0);
   a.tauCol.fill(0);
   let anyH = false;
   for (let k = 0; k < nz; k++) {
     const Pi = a.prof.pi[k], p = a.prof.p[k], rho = a.prof.rho[k], dzk = a.g.dz[k];
-    const rf = rhoFac(rho);
     const LFc = LF / CP;
     for (let ij = 0; ij < nxy; ij++) {
       const idx = k * nxy + ij;
@@ -95,8 +92,8 @@ export function microphysics(a: Atmosphere, dt: number) {
       // 6. collision-coalescence (autoconversion + accretion)
       if (tqc > 1e-9) {
         const autoThr = 5e-4 * P.dropletSpawn;                       // more droplets -> higher threshold
-        const auto = tqc > autoThr ? (1.2e-3 * (tqc - autoThr)) / P.dropletSpawn : 0;
-        const accr = tqr > 1e-9 ? 2.2 * tqc * Math.pow(tqr, 0.875) : 0;
+        const auto = tqc > autoThr ? (1.2e-3 * (tqc - autoThr) * P.precipEfficiency) / P.dropletSpawn : 0;
+        const accr = tqr > 1e-9 ? 2.2 * tqc * Math.pow(tqr, 0.875) * P.precipEfficiency : 0;
         const conv = Math.min(tqc, dt * (auto + accr));
         tqc -= conv; tqr += conv;
       }
@@ -105,8 +102,8 @@ export function microphysics(a: Atmosphere, dt: number) {
         if (tqi > 2e-4) { const au = Math.min(tqi, dt * 1e-3 * (tqi - 2e-4)); tqi -= au; tqs += au; }
         if (tqs > 1e-8 && tqi > 1e-8) { const ac = Math.min(tqi, dt * 0.8 * tqi * Math.pow(tqs, 0.6)); tqi -= ac; tqs += ac; }
         if (tqc > 1e-8) {
-          const rs = tqs > 1e-8 ? dt * 0.35 * tqc * Math.pow(tqs, 0.75) : 0;
-          const rg = tqg > 1e-8 ? dt * 0.5 * tqc * Math.pow(tqg, 0.75) : 0;
+          const rs = tqs > 1e-8 ? dt * 0.35 * tqc * Math.pow(tqs, 0.75) * P.precipEfficiency : 0;
+          const rg = tqg > 1e-8 ? dt * 0.5 * tqc * Math.pow(tqg, 0.75) * P.precipEfficiency : 0;
           let tot = rs + rg, sc = 1;
           if (tot > 0.9 * tqc) sc = (0.9 * tqc) / tot;
           const rs2 = rs * sc, rg2 = rg * sc; tot *= sc;
@@ -119,22 +116,13 @@ export function microphysics(a: Atmosphere, dt: number) {
         if (tqv < q) {
           const rr = rho * tqr;
           let ev = (((1.6 + 124.9 * Math.pow(rr, 0.2046)) * Math.pow(rr, 0.525)) / (2.55e8 / (p * q) + 5.4e5)) * ((q - tqv) / (rho * q));
-          ev *= 3 * P.evaporation;
+          ev *= 2.2 * P.evaporation;
           const lim = (q - tqv) / (1 + (LV * LV * q) / (CP * RV * T * T));
           const e = Math.min(ev * dt, tqr, lim);
           tqr -= e; tqv += e; T -= (LV / CP) * e;
         }
       }
-      // non-inductive charge separation (graupel-ice rebounding collisions in supercooled liquid)
-      if (T < T0 - 2 && tqg > 1e-6 && tqi + 0.3 * tqs > 1e-7 && tqc > 1e-6) {
-        const rhoqg = rho * tqg, rhoqi = rho * (tqi + 0.3 * tqs);
-        const vrel = Math.max(1.5, vtGraupel(rhoqg, rf) - 0.4);
-        const fL = Math.min(1, (rho * tqc * 1000) / 0.8);
-        const fT = clamp((T0 - T - 2) / 8, 0, 1) * clamp((T - 233.15) / 12, 0, 1);
-        const dq = (K_NI * rhoqg * rhoqi * vrel * fL * fT * dt) / rho;
-        const sgn = T > T0 - 12 ? 1 : -1; // reversal temperature ~ -12C
-        qh[idx] += sgn * dq; ql[idx] -= sgn * dq;
-      }
+      // Charge separation is applied in charging.ts after the whole column is updated.
       qv[idx] = tqv < 0 ? 0 : tqv; qc[idx] = tqc < 0 ? 0 : tqc; qi[idx] = tqi < 0 ? 0 : tqi;
       qr[idx] = tqr < 0 ? 0 : tqr; qs[idx] = tqs < 0 ? 0 : tqs; qg[idx] = tqg < 0 ? 0 : tqg;
       th[idx] = T / Pi;
@@ -166,7 +154,7 @@ export function sedimentation(a: Atmosphere, dt: number) {
       vtr[k] = qr > 1e-9 ? (frozen ? vtSnow(rf) : vtRain(rho * qr, rf)) : 0;
       vts[k] = qs > 1e-9 ? vtSnow(rf) : 0;
       vtg[k] = qg > 1e-9 ? vtGraupel(rho * qg, rf) : 0;
-      vti[k] = a.qi[idx] > 1e-9 ? vtIce(rf) : 0;
+      vti[k] = a.qi[idx] > 1e-9 || Math.abs(a.ql[idx]) > 1e-12 ? vtIce(rf) : 0;
       const hs = qr + qs + qg;
       vth[k] = hs > 1e-9 ? (qr * vtr[k] + qs * vts[k] + qg * vtg[k]) / hs : 0;
       if (hs > 0 || a.qi[idx] > 0) any = 1;
@@ -176,6 +164,8 @@ export function sedimentation(a: Atmosphere, dt: number) {
     const gs = sedCol(a, a.qs, ij, vts, dt);
     const gg = sedCol(a, a.qg, ij, vtg, dt);
     sedCol(a, a.qi, ij, vti, dt);
+    // Light ice crystals carry the opposite-sign charge and settle with their terminal speed.
+    sedCol(a, a.ql, ij, vti, dt);
     sedCol(a, a.qh, ij, vth, dt);
     const g = gr + gs + gg;
     a.surfPrec[ij] = g / dt;

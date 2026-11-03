@@ -109,7 +109,8 @@ export function stormMode(a: Atmosphere, snd: LocalSounding): StormMode {
     if (S.cloudFrac > 0.02) label = 'Shallow cumulus, no deep updrafts';
     else if (snd.sb.cape > 100 && snd.sb.cin < -50) label = 'Convection suppressed (CIN)';
     else label = 'Clear / stable';
-  } else if (S.maxUH > 150 && snd.shear06 > 15 && cores <= 4) label = 'Supercell-like (rotating updraft)';
+  } else if (a.tornado.state.active && S.maxUH > 70 && cores <= 4) label = `Tornadic supercell (EF${Math.max(0, a.tornado.state.ef)})`;
+  else if (S.maxUH > 150 && snd.shear06 > 15 && cores <= 4) label = 'Supercell-like (rotating updraft)';
   else if (cores >= 5 && lin > 0.8 && S.coldPool > 0.03) label = 'Squall line / bow echo';
   else if (cores >= 6 && S.coldPool > 0.05) label = 'MCS / merged cold-pool complex';
   else if (cores >= 2) label = snd.shear06 > 10 ? 'Multicell cluster (gust-front regeneration)' : 'Pulse multicells';

@@ -6,7 +6,9 @@ A headless anelastic (Ogura–Phillips) atmospheric solver runs in a Web Worker 
 ray-marched volumetric cloud renderer built on three.js. Weather starts from a clear-sky
 sounding and has to *earn* its storms: surface heating builds CAPE, convection initiates when
 the environment allows it, and cold pools, gust fronts, hail, lightning and thunder emerge from
-the simulation rather than from scripted animation.
+the simulation rather than from scripted animation. A coupled sub-grid vortex, mixed-phase
+charge separation, heavier rain cores and a player-drivable intercept vehicle now build on the
+same solved fields.
 
 ## Live site
 
@@ -33,7 +35,9 @@ npm run dev     # dev server on http://localhost:5173 (also bound to 0.0.0.0)
 modern browser. It is the whole app inlined into one file and runs straight from disk
 (`file://`) or any static host. Rebuild it with `npm run build:standalone`.
 
-Then pick an initial environment and press **▶ enter simulation**. The first storms typically
+Then pick an initial environment and press **▶ enter simulation**. Press **V** in the simulation to
+enter or leave the intercept vehicle; **W/S** throttle, **A/D** steer, **Space** is the handbrake and
+**P** deploys the roof probe. The first storms typically
 appear after ~3 simulated hours of daytime heating, so run at a time-lapse speed of ×15 or
 higher if you do not want to wait in real time.
 
@@ -44,12 +48,13 @@ mid-range mobile/Apple/integrated parts, and `low` for entry-level mobile (Adren
 Mali-T/G5x and similar). The menu shows the detected GPU next to `RENDER QUALITY` and lets you
 override it with **auto / low / mid / high**; the choice is stored in `localStorage`.
 
-On the `low` tier every shader compiles a cut-down variant (`#ifdef LOWQ`): a 26-step cloud march
-with one-tap sun transmittance and one-octave detail, single-tap cloud shading on terrain, water
-and trees, no splash crowns, fewer trees and particles, no MSAA and a reduced pixel ratio.
-Whatever the tier, the renderer also degrades at runtime — first to a cheap dense-march path,
-then by coarsening steps, cloud buffer and finally screen resolution — and recovers when frames
-are comfortable again. Recovery works on 60 Hz displays as well as high-refresh ones. The `ⓘ`
+On the `low` tier every shader compiles a cut-down variant (`#ifdef LOWQ`) with fewer march
+steps, one-tap sun transmittance, simpler cloud shading and reduced buffers. The project now
+prioritises maximum realism: the `low`/`mid`/`high` budgets were raised (up to 14,000 near-camera
+drops, 32×32 rainshaft columns, 96 cloud steps and 2.2 M cloud pixels on `high`), heavy rain
+increases precipitation density instead of thinning it, and adaptive degradation only engages on
+sustained stalls. The multicell/MCS performance fixes are retained, but frame rate is deliberately
+secondary to physical and visual fidelity on mid/low devices. Recovery works on 60 Hz displays as well as high-refresh ones. The `ⓘ`
 panel reports tier, measured fps, pixel ratio and cloud scale, which is the quickest way to see
 what the device settled on.
 
@@ -80,8 +85,13 @@ cellular billows, domain-warped edges, softer density cutoffs and a height/ice p
 convective towers upright while flattening anvils. Lighting adds rim-lit silver edges, darker rainy
 bases, warmer low-sun tones and a broad flash glow through the whole cloud body.
 
-Precipitation is split into individually sized drops and crystals near the camera and two
-overlapping, wind-sheared veils farther away. Drops follow a skewed size distribution (many small,
+Precipitation is split into individually sized drops and crystals near the camera and six
+fixed-azimuth, wind-sheared planes per distant column that overlap into cylindrical rainshafts
+rather than camera-facing billboards. The 8-bit rain channels use a soft-knee companding curve, so
+violent 60–150 mm/h cores remain distinct instead of all clipping to one value. A precipitation
+efficiency control scales collision-coalescence, accretion and riming, while reduced rain
+ evaporation lets heavy cores survive to the ground; `uHeavyRain` raises drop survival, length,
+splash density and shaft opacity together. Drops follow a skewed size distribution (many small,
 a few large), fall at size-dependent speeds, drift differently with wind, and render as tapered
 teardrops with a refracted highlight rather than uniform white lines. Frozen particles become
 six-arm crystals; splashes get irregular crowns and secondary droplets. The distant veils use
@@ -95,6 +105,40 @@ per-segment flicker. Cloud/ground point lights are joined by a broad, decaying s
 so a flash lights the storm instead of only the bolt itself. These are visual refinements: the
 solver still produces the channel geometry and the thunder is still synthesised from it.
 
+
+### Tornadoes, charge separation and intercept vehicle
+
+Tornadogenesis is a **physics-driven parameterization**, not a scripted effect or a nested LES.
+`src/sim/tornado.ts` scores the smoothed low-level rotating updraft from the solved vorticity,
+convergence and vertical velocity, then combines 2–5 km updraft helicity with a storm-local
+0–1 km hodograph (shear and helicity), CAPE, LCL and cold-pool strength. Persistence gates genesis;
+the active vortex follows the rotating-updraft maximum and feeds a bounded Rankine tangential wind
+plus frictional inflow back into the lowest solver levels before the pressure projection. Core
+radius, EF-like 3-second gust, cyclostrophic pressure deficit, condensation-funnel height and debris
+load are derived from that state and the simulated cloud base. The renderer adds a wall-cloud
+lowering, a helical condensation funnel, a debris annulus, hook-echo rain wrapping and a dry inflow
+notch in the rainshafts.
+
+Electrification replaces the old single-coefficient source with `src/sim/charging.ts`: LWC-dependent
+Saunders-type charge-sign reversal, collision-rate scaling from graupel/ice and relative fall speed,
+inductive charging in the solved vertical field, a relaxed upper-positive / mid-negative /
+lower-positive tripole with screening layers, charge carried on both heavy and light hydrometeors,
+and conductivity decay. The charge-separation rate, tripole index, upper/mid/lower charge reservoirs
+and flash-energy proxy are exposed in the snapshot. A separate `chargeRate` slider scales the whole
+electrification system.
+
+Cloud grain is attacked from three directions at once: a mostly static per-pixel ray-march offset
+plus reduced temporal jitter, neighbourhood-min/max clamping of the reprojected history, a 16-tap
+depth/transmittance-weighted upsample, and a small bilateral radiance filter in the composite. The
+fixed step hash no longer varies per frame, fine erosion is damped, and `uDenoise` raises the
+history blend while suppressing speckle/flicker/blocky cloud patches. The renderer still uses MRT
+scattering depth for temporal reprojection and edge-aware upsampling.
+
+The intercept vehicle is player-driven (`src/controls.ts`): a bicycle-model truck with throttle,
+braking, drag, steering, handbrake, terrain-slope traction limits, suspension roll and a deployable
+probe. The solver's vortex state supplies Rankine wind drag, pressure deficit, debris damage and
+distance/bearing telemetry. The vehicle mesh, funnel and debris are all rendered with the same sky,
+fog, sun and flash lighting as the rest of the scene.
 
 ### Multicell / MCS stage
 
@@ -151,11 +195,13 @@ Weisman–Klemp CAPE/EL) and then integrates the full 3-D model, printing diagno
 30 simulated minutes and every lightning flash.
 
 ```bash
-npm test                          # preset=pulse, 64x64x36, 4 simulated hours
-npm test -- super 32 36 4.5       # preset, N, NZ, hours
+npm test -- 2600 16 28 1          # CAPE J/kg, horizontal N, vertical NZ, simulated hours
+npm test -- 2600 32 36 4 --eff=2.8 --charge=1
 ```
 
-Valid presets: `capped`, `fairwx`, `pulse`, `squall`, `super`.
+Optional flags: `--lake=`, `--land=`, `--spawn=`, `--freeze=`, `--evap=`, `--eff=`, `--charge=`,
+`--melt=`, `--precipT=`. The long run now also prints tornado intensity/EF, charge-separation rate
+and tripole diagnostics.
 
 The script exits non-zero if a validation check fails, the preset is unknown, or the solution
 blows up, so it is safe to use in CI. A passing run looks like:
@@ -179,11 +225,15 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
 * **Physics** — Deardorff 1.5-order TKE sub-grid closure, surface energy balance (shortwave
   with slope/cloud shading, longwave, sensible and latent fluxes, soil moisture, runoff),
   roughness drag, terrain lifting at the lower boundary, bulk microphysics (Kessler warm rain,
-  Bergeron/WBF, riming, graupel, melting/freezing, evaporation, sedimentation), Saunders-type
-  non-inductive charging and dielectric-breakdown-model lightning with branched channels.
+  Bergeron/WBF, riming, graupel, melting/freezing, evaporation, sedimentation with
+  adjustable precipitation efficiency), f-plane Coriolis, LWC-dependent non-inductive/inductive
+  charge separation with tripole screening, and dielectric-breakdown-model lightning with branched
+  channels.
 * **Rendering** — ray-marched clouds with advected Perlin-Worley billows, ice/updraft-aware towers
   and anvils, soft cloud illumination, size-distributed raindrops and snow crystals, wind-sheared
-  precipitation veils, mitered/tapered lightning ribbons, terrain, water and synthesised thunder.
+  six-plane cylindrical rainshafts, denoised/reprojected cloud upsampling, helical
+  condensation funnel and debris, player-driven intercept vehicle, mitered/tapered lightning
+  ribbons, terrain, water and synthesised thunder.
 
 ## Notes
 
@@ -191,5 +241,8 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
 * The UI has been smoke-tested headlessly in Chromium: the dev server, the production build and
   the standalone file all mount, initialise the worker and render the volumetric scene.
 * The terrain and solver are periodic and flat-level; nothing smaller than ~1.5 km is resolved.
+  The tornado core is a coupled sub-grid parameterization, not a nested metre-scale LES.
+* Realism is prioritised over frame rate: mid/low devices may drop FPS in mature storms. Use
+  `?perf=low&noadapt=0` to let the adaptive path recover frames.
 * `3d-atmospheric-weather-simulation (2).zip` is the original uploaded archive; the extracted
   sources at the repository root are the working copy.

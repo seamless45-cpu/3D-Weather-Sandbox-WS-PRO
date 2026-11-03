@@ -15,6 +15,10 @@ export interface SimParams {
   freezing: number;
   /** Rain evaporation/sublimation rate multiplier. */
   evaporation: number;
+  /** Warm-rain collision/coalescence and riming efficiency multiplier. */
+  precipEfficiency: number;
+  /** Non-inductive/inductive electrification rate multiplier. */
+  chargeRate: number;
   /** Melting rate multiplier. */
   melting: number;
   /** Precipitation-type threshold [°C]: below this, precipitation is treated as frozen. */
@@ -27,7 +31,9 @@ export const DEFAULT_PARAMS: SimParams = {
   cape: 2600,
   dropletSpawn: 1,
   freezing: 1,
-  evaporation: 1,
+  evaporation: 0.42,
+  precipEfficiency: 2.8,
+  chargeRate: 1,
   melting: 1,
   precipTempC: 1,
 };
@@ -51,6 +57,8 @@ export const PARAM_SPECS: ParamSpec[] = [
   { key: 'dropletSpawn', label: 'Droplet spawn', unit: '×', min: 0.2, max: 4, step: 0.05, decimals: 2, hint: 'CCN concentration: more, smaller droplets → slower rain' },
   { key: 'freezing', label: 'Freezing rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'supercooled water → ice / rain → graupel' },
   { key: 'evaporation', label: 'Evaporation rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'rain evaporating below cloud base (cold pools, virga)' },
+  { key: 'precipEfficiency', label: 'Precip efficiency', unit: '×', min: 0.2, max: 3, step: 0.05, decimals: 2, hint: 'collision-coalescence, accretion and riming → heavier rain cores' },
+  { key: 'chargeRate', label: 'Charge separation', unit: '×', min: 0.1, max: 3, step: 0.05, decimals: 2, hint: 'mixed-phase charging, inductive charging and screening layers' },
   { key: 'melting', label: 'Melting rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'snow/graupel melting below the 0 °C level' },
   { key: 'precipTempC', label: 'Precipitation threshold', unit: '°C', min: -20, max: 20, step: 0.5, decimals: 1, hint: 'below this temperature precipitation falls as snow/hail' },
 ];
@@ -68,6 +76,8 @@ export function clampParams(p: Partial<SimParams>): SimParams {
     dropletSpawn: clamp(num(p.dropletSpawn, d.dropletSpawn), 0.2, 4),
     freezing: clamp(num(p.freezing, d.freezing), 0.1, 4),
     evaporation: clamp(num(p.evaporation, d.evaporation), 0.1, 4),
+    precipEfficiency: clamp(num(p.precipEfficiency, d.precipEfficiency), 0.2, 3),
+    chargeRate: clamp(num(p.chargeRate, d.chargeRate), 0.1, 3),
     melting: clamp(num(p.melting, d.melting), 0.1, 4),
     precipTempC: clamp(num(p.precipTempC, d.precipTempC), -20, 20),
   };

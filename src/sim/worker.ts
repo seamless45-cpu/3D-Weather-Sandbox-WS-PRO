@@ -84,7 +84,9 @@ function buildClouds(a: Atmosphere): Uint8ClampedArray {
       const vw = 0.25 * (w[c0] + w[c0 + nxy]) * inv + 0.25 * (w[c1] + w[c1 + nxy]) * f;
       const o = (m * nxy + ij) * 4;
       out[o] = 255 * (cond / 0.0035);
-      out[o + 1] = 255 * (pr / 0.004);
+      // Companding keeps the 8-bit precipitation channel monotonic through violent rain/hail
+      // cores instead of clipping everything above ~4 g/kg to the same value.
+      out[o + 1] = 255 * (1 - Math.exp(-pr / 0.0055));
       out[o + 2] = 255 * ((vqi + vqs + vqg) / (vqc + vqi + vqs + vqg + 1e-9));
       out[o + 3] = 255 * (0.5 + (2 * vw) / 30);
     }
@@ -100,7 +102,8 @@ function buildSurf(a: Atmosphere): Uint8ClampedArray {
   mean /= nxy;
   for (let ij = 0; ij < nxy; ij++) {
     out[ij * 4] = 255 * a.soilM[ij];
-    out[ij * 4 + 1] = a.rainRate[ij] * 5;
+    // Soft-knee encoding: 25 mm/h ~0.43, 80 mm/h ~0.83, 150 mm/h ~0.96.
+    out[ij * 4 + 1] = 255 * (1 - Math.exp(-a.rainRate[ij] / 45));
     out[ij * 4 + 2] = (a.surfW[ij] / 3) * 255;
     out[ij * 4 + 3] = 255 * ((mean - a.th[ij]) / 4);
   }
@@ -152,6 +155,8 @@ function snapshot() {
     type: 'snap', time: a.time, speed: actualSpeed, stepMs, dt: a.dt, paused,
     cloud, surf, windOff: windOff.slice(), stats: { ...a.stats }, sounding: snd, mode, capeMean: capeM.mean, capeMax: capeM.max,
     diag: d, local: { u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn, wetness: a.soilM[ij], surfW: a.surfW[ij] },
+    tornado: a.tornado.snapshot(cam.x, cam.z), charge: { ...a.chargeDiag },
+    heavyRain: Math.min(1, a.stats.maxRain / 95),
     sunSin: a.sunSin, empty: emptyTex, snowLevel: precipTypeHeight(a), params: a.params, envCape: a.env.cape,
   };
   const transfer: Transferable[] = [cloud.buffer as ArrayBuffer, surf.buffer as ArrayBuffer];
