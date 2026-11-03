@@ -9,15 +9,19 @@ const wrapDelta = (d: number) => d - DOMAIN * Math.round(d / DOMAIN);
 export interface VehicleState {
   active: boolean;
   x: number; z: number; heading: number;
-  vx: number; vz: number; speed: number; roll: number;
-  damage: number; probe: boolean;
+  vx: number; vz: number; speed: number;
+  pitch: number; roll: number; steer: number; bounce: number;
+  damage: number; probe: boolean; lights: boolean; brake: boolean;
   wind: number; pressureDrop: number; distance: number; bearing: number;
+  closing: number;      // m/s toward the vortex (positive = closing in)
+  prevDist: number;
 }
 
 export interface VehiclePose {
-  active: boolean; x: number; z: number; heading: number; roll: number;
-  speed: number; damage: number; probe: boolean;
-  wind: number; pressureDrop: number; distance: number; bearing: number;
+  active: boolean; x: number; z: number; heading: number;
+  pitch: number; roll: number; steer: number; bounce: number;
+  speed: number; damage: number; probe: boolean; lights: boolean; brake: boolean;
+  wind: number; pressureDrop: number; distance: number; bearing: number; closing: number;
 }
 
 /** Player controller with a foot mode and a fully player-driven intercept vehicle. */
@@ -33,6 +37,7 @@ export class Player {
   private terrain: Terrain;
   private touches = new Map<number, { x: number; y: number }>(); private pinch = 0;
   private cleanup: (() => void)[] = [];
+  private bounceV = 0; private tT = 0;
 
   constructor(el: HTMLElement, terrain: Terrain, spawn: [number, number]) {
     this.terrain = terrain;
@@ -40,8 +45,9 @@ export class Player {
     this.eyeY = terrain.groundHeight(this.x, this.z) + EYE; this.y = this.eyeY;
     this.vehicle = {
       active: false, x: this.x, z: this.z, heading: this.yaw,
-      vx: 0, vz: 0, speed: 0, roll: 0, damage: 0, probe: false,
-      wind: 0, pressureDrop: 0, distance: Infinity, bearing: 0,
+      vx: 0, vz: 0, speed: 0, pitch: 0, roll: 0, steer: 0, bounce: 0,
+      damage: 0, probe: false, lights: false, brake: false,
+      wind: 0, pressureDrop: 0, distance: Infinity, bearing: 0, closing: 0, prevDist: Infinity,
     };
     const on = (t: EventTarget, ev: string, fn: (e: any) => void, opts?: AddEventListenerOptions) => {
       t.addEventListener(ev, fn, opts); this.cleanup.push(() => t.removeEventListener(ev, fn, opts as any));
@@ -50,6 +56,7 @@ export class Player {
       this.keys.add(e.code);
       if (e.code === 'KeyV' && !e.repeat) this.toggleVehicle();
       if (e.code === 'KeyP' && !e.repeat && this.mode === 'vehicle') this.vehicle.probe = !this.vehicle.probe;
+      if (e.code === 'KeyL' && !e.repeat && this.mode === 'vehicle') this.vehicle.lights = !this.vehicle.lights;
       if (['Space', 'ArrowUp', 'ArrowDown'].includes(e.code)) e.preventDefault();
     });
     on(window, 'keyup', (e: KeyboardEvent) => this.keys.delete(e.code));
@@ -102,6 +109,8 @@ export class Player {
       this.mode = 'vehicle'; v.active = true;
       v.x = this.x; v.z = this.z; v.heading = this.yaw;
       v.vx = 0; v.vz = 0; v.speed = 0; v.damage = 0; v.probe = false;
+      v.pitch = 0; v.roll = 0; v.steer = 0; v.bounce = 0; v.closing = 0; v.prevDist = Infinity;
+      this.bounceV = 0;
     } else {
       this.mode = 'foot'; v.active = false;
       this.x = v.x; this.z = v.z; this.vx = 0; this.vz = 0;
@@ -112,9 +121,11 @@ export class Player {
   vehiclePose(): VehiclePose {
     const v = this.vehicle;
     return {
-      active: v.active, x: v.x, z: v.z, heading: v.heading, roll: v.roll,
-      speed: v.speed, damage: v.damage, probe: v.probe,
+      active: v.active, x: v.x, z: v.z, heading: v.heading,
+      pitch: v.pitch, roll: v.roll, steer: v.steer, bounce: v.bounce,
+      speed: v.speed, damage: v.damage, probe: v.probe, lights: v.lights, brake: v.brake,
       wind: v.wind, pressureDrop: v.pressureDrop, distance: v.distance, bearing: v.bearing,
+      closing: v.closing,
     };
   }
 
@@ -157,6 +168,7 @@ export class Player {
 
   private updateVehicle(dt: number, tornado: any) {
     const v = this.vehicle;
+    this.tT += dt;
     let throttle = this.vf, steer = this.vs;
     if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) throttle += 1;
     if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) throttle -= 1;
@@ -164,18 +176,38 @@ export class Player {
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) steer -= 1;
     throttle = clamp(throttle, -1, 1); steer = clamp(steer, -1, 1);
     const handbrake = this.keys.has('Space');
-    // Bicycle-model steering: the faster the truck, the slower the yaw rate.
-    const steerRate = steer * (0.9 - 0.55 * Math.min(1, Math.abs(v.speed) / 40));
+
+    // Bicycle-model steering: the faster the truck, the slower the yaw rate. The visual
+    // front wheels follow the same (smoothed) input.
+    const steerRate = steer * (0.95 - 0.58 * Math.min(1, Math.abs(v.speed) / 42));
     v.heading += steerRate * dt;
     this.yaw += steerRate * dt;
     v.heading = wrap(v.heading);
-    const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
-    const accel = throttle > 0 ? 13 : throttle < 0 ? -19 : 0;
-    const drag = 0.010 * v.speed * Math.abs(v.speed) + 0.30 * v.speed + (handbrake ? 14 * Math.sign(v.speed) : 0);
-    v.speed = clamp(v.speed + (accel - drag) * dt, -9, 44);
-    v.vx = fx * v.speed; v.vz = fz * v.speed;
+    v.steer += (steer - v.steer) * Math.min(1, dt * 8);
 
-    // Rankine-vortex wind force, pressure deficit and debris damage from the solver snapshot.
+    const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
+    const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
+    // Grip model: split the velocity into forward and lateral components so the truck can
+    // understeer, break traction under the handbrake and be pushed sideways by the vortex.
+    let fwd = v.vx * fx + v.vz * fz;
+    let lat = v.vx * rx + v.vz * rz;
+
+    // Power curve with speed falloff; hull damage steals power.
+    const dmg = v.damage;
+    const power = 15.5 * (1 - 0.34 * dmg) * (1 - 0.75 * Math.min(1, Math.abs(fwd) / 50));
+    const accel = throttle >= 0 ? power * throttle : 21 * throttle;
+    const drag = 0.010 * fwd * Math.abs(fwd) + 0.30 * fwd;
+    fwd += (accel - (drag + (handbrake ? 16 * Math.sign(fwd) : 0))) * dt;
+    if (Math.abs(throttle) < 0.02) fwd *= Math.exp(-dt * 0.55);   // engine braking
+    fwd = clamp(fwd, -11, 50);
+
+    // Lateral grip: firm normally, cut by the handbrake (drift), by damage and by water.
+    const grip = (handbrake ? 1.15 : 7.0) * (1 - 0.4 * dmg);
+    lat *= Math.exp(-dt * grip);
+    const latCap = 0.45 * Math.abs(fwd) + 2.5;
+    if (Math.abs(lat) > latCap) lat *= latCap / Math.abs(lat);
+
+    // Rankine-vortex wind force, turbulence gusts, pressure deficit and debris damage.
     let wind = 0, pressure = 0, distance = Infinity, bearing = 0;
     if (tornado && tornado.active) {
       const dx = wrapDelta(v.x - tornado.x), dz = wrapDelta(v.z - tornado.z);
@@ -184,30 +216,66 @@ export class Player {
       const inflow = -0.2 * tornado.maxWind * Math.exp(-r / (1.8 * R));
       const wx = -(dz / r) * vt + (dx / r) * inflow;
       const wz = (dx / r) * vt + (dz / r) * inflow;
-      const relx = wx - v.vx, relz = wz - v.vz;
+      const vwx = fx * fwd + rx * lat, vwz = fz * fwd + rz * lat;
+      const relx = wx - vwx, relz = wz - vwz;
       const rel = Math.hypot(relx, relz);
-      // F = 0.5 rho Cd A |v_rel| v_rel / mass; CdA/m ~ 0.0027 m^2/kg for a 2.1 t truck.
-      const force = 0.0027 * rel;
-      v.vx += relx * force * dt; v.vz += relz * force * dt;
+      // F = 0.5 rho Cd A |v_rel| v_rel / mass; CdA/m ~ 0.0027 m^2/kg for a 2.1 t truck,
+      // rising with load on the flat sides as the wind gets extreme.
+      const force = 0.0031 * rel * (1 + 0.5 * Math.min(1, rel / 45));
+      const rf = relx * fx + relz * fz, rl = relx * rx + relz * rz;
+      fwd += rf * force * dt; lat += rl * force * dt;
       wind = Math.hypot(wx, wz);
       pressure = tornado.pressureDrop * Math.exp(-(r * r) / (6 * R * R));
       distance = r;
       bearing = Math.atan2(-dx, dz);    // bearing from vehicle toward vortex centre
-      v.damage = clamp(v.damage + Math.max(0, wind - 32) * dt * 0.00018, 0, 1);
+      // Turbulent gusts: buffeting the hull and steering around near the core.
+      const prox = Math.exp(-r / 4200);
+      const gust = (Math.sin(this.tT * 2.3 + v.x * 0.011) + 0.7 * Math.sin(this.tT * 3.7 + v.z * 0.014)) * wind * prox;
+      lat += gust * 0.045 * dt * 60 * 0.016;
+      v.heading += gust * 0.00035 * dt * 60 * 0.016;
+      v.damage = clamp(v.damage + Math.max(0, wind - 30) * dt * 0.00022, 0, 1);
     } else {
       v.damage = Math.max(0, v.damage - dt * 0.00008);
     }
+    // Closing speed toward the vortex (for the HUD): + = getting closer.
+    if (isFinite(distance) && isFinite(v.prevDist)) {
+      const c = (v.prevDist - distance) / Math.max(dt, 1e-3);
+      v.closing += (c - v.closing) * Math.min(1, dt * 3);
+    }
+    v.prevDist = distance;
     v.wind = wind; v.pressureDrop = pressure; v.distance = distance; v.bearing = bearing;
+    v.brake = throttle < -0.05 || handbrake;
 
-    // Terrain slope limits traction; water and steep slopes stop the vehicle.
-    const nx = wrap(v.x + v.vx * dt), nz = wrap(v.z + v.vz * dt);
+    // Terrain slope limits traction; water and steep slopes slow or stop the vehicle.
+    let nx = wrap(v.x + (fx * fwd + rx * lat) * dt), nz = wrap(v.z + (fz * fwd + rz * lat) * dt);
     const h0 = this.terrain.groundHeight(v.x, v.z), h1 = this.terrain.groundHeight(nx, nz);
     const slope = Math.abs(h1 - h0) / Math.max(1, Math.hypot(nx - v.x, nz - v.z));
     if (h1 > -0.3 && slope < 0.55) { v.x = nx; v.z = nz; }
-    else { v.vx *= 0.15; v.vz *= 0.15; v.speed *= 0.15; }
-    v.roll += (clamp(-steer * Math.abs(v.speed) / 90 + (v.vx * fz - v.vz * fx) / 220, -0.16, 0.16) - v.roll) * Math.min(1, dt * 5);
+    else { fwd *= 0.15; lat *= 0.15; }
+    // Ponds and creeks: drag rises fast with depth (the truck fords, it does not float).
+    const depth = Math.max(0, -h1);
+    if (depth > 0.02) fwd *= Math.exp(-dt * (1.1 + 4.5 * Math.min(1, depth)));
+
+    v.speed = fwd;
+    v.vx = fx * fwd + rx * lat; v.vz = fz * fwd + rz * lat;
+
+    // ---- suspension: pitch from longitudinal slope + squat/dive, roll from cross slope +
+    // cornering lean, and a springy bounce over rough ground.
+    const hF = this.terrain.groundHeight(v.x + fx * 2.2, v.z + fz * 2.2);
+    const hB = this.terrain.groundHeight(v.x - fx * 2.2, v.z - fz * 2.2);
+    const hL = this.terrain.groundHeight(v.x + rx * 1.1, v.z + rz * 1.1);
+    const hR = this.terrain.groundHeight(v.x - rx * 1.1, v.z - rz * 1.1);
+    const pitchT = clamp(Math.atan2(hF - hB, 4.4) + accel * 0.0035, -0.30, 0.30);
+    const rollT = clamp(Math.atan2(hR - hL, 2.2) - v.steer * Math.min(1, Math.abs(fwd) / 30) * 0.10 - lat * 0.012, -0.24, 0.24);
+    v.pitch += (pitchT - v.pitch) * Math.min(1, dt * 7);
+    v.roll += (rollT - v.roll) * Math.min(1, dt * 6);
+    const rough = Math.abs(hF + hB - 2 * h0);
+    const bumpT = -Math.min(0.3, rough * 0.45) * Math.min(1, Math.abs(fwd) / 14);
+    this.bounceV += ((bumpT - v.bounce) * 46 - this.bounceV * 6.5) * dt;
+    v.bounce = clamp(v.bounce + this.bounceV * dt, -0.35, 0.35);
+
     const gh = Math.max(0, this.terrain.groundHeight(v.x, v.z));
-    this.eyeY += (gh + 2.45 - this.eyeY) * (1 - Math.exp(-dt * 10));
+    this.eyeY += (gh + 2.45 + v.bounce - this.eyeY) * (1 - Math.exp(-dt * 10));
     this.y = this.eyeY;
     this.x = v.x; this.z = v.z;
     this.vx = v.vx; this.vz = v.vz;

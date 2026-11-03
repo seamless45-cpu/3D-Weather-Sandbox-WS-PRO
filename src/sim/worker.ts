@@ -17,6 +17,7 @@ let budget = 0, lastT = 0, lastSnap = 0, simAdv = 0, realAcc = 0, actualSpeed = 
 let capeM: ReturnType<typeof capeMap> | null = null;
 let lastCape = -1, lastCapeReal = 0, capeStride = 4;
 let lastFlashPost = 0;
+let showCharges = false;
 let windOff = new Float32Array(32);
 let lastSnapSimTime = 0;
 let emptyTex = false;
@@ -110,6 +111,52 @@ function buildSurf(a: Atmosphere): Uint8ClampedArray {
   return out;
 }
 
+/**
+ * Decimated charge-particle field for the show-charges toggle: one point per significant
+ * charge pocket riding on hydrometeors, 5 floats each (x, y, z, signed magnitude, phase).
+ * Built only while the toggle is on, so the normal snapshot stays lean.
+ */
+function buildCharges(a: Atmosphere): Float32Array {
+  const { nx, nz, nxy } = a;
+  const g = a.g;
+  const qh = a.qh, ql = a.ql;
+  const cellOk = (c: number, q: number) =>
+    q !== 0 && a.qc[c] + a.qi[c] + a.qs[c] + a.qg[c] + a.qr[c] > 1e-7;
+  // Pass 1: count pockets and find the peak |q| so the magnitude scale adapts to storm stage.
+  let count = 0, maxQ = 1e-12;
+  for (let k = 0; k < nz; k++) for (let ij = 0; ij < nxy; ij++) {
+    const c = k * nxy + ij;
+    const q = qh[c] + ql[c];
+    if (!cellOk(c, q)) continue;
+    const aq = Math.abs(q);
+    if (aq < 2e-10) continue;
+    count++; if (aq > maxQ) maxQ = aq;
+  }
+  const MAXCH = 6000;
+  const stride = Math.max(1, Math.ceil(count / MAXCH));
+  const out = new Float32Array(Math.ceil(count / stride) * 5);
+  let n = 0, seen = 0;
+  for (let k = 0; k < nz && n * 5 < out.length; k++) {
+    for (let ij = 0; ij < nxy && n * 5 < out.length; ij++) {
+      const c = k * nxy + ij;
+      const q = qh[c] + ql[c];
+      if (!cellOk(c, q)) continue;
+      const aq = Math.abs(q);
+      if (aq < 2e-10) continue;
+      if ((seen++ % stride) !== 0) continue;
+      const i = ij % nx, j = (ij / nx) | 0;
+      const o = n * 5;
+      out[o] = (i + 0.15 + 0.7 * Math.random()) * g.dx;
+      out[o + 1] = g.zc[k];
+      out[o + 2] = (j + 0.15 + 0.7 * Math.random()) * g.dy;
+      out[o + 3] = (q > 0 ? 1 : -1) * Math.min(1, aq / maxQ);
+      out[o + 4] = Math.random();
+      n++;
+    }
+  }
+  return out.subarray(0, n * 5);
+}
+
 function updateWindOffsets(a: Atmosphere, dtSim: number) {
   const { nxy } = a;
   const B = 16;
@@ -163,6 +210,10 @@ function snapshot() {
   };
   const transfer: Transferable[] = [cloud.buffer as ArrayBuffer, surf.buffer as ArrayBuffer];
   if (d) transfer.push(d.data.buffer as ArrayBuffer, d.ua.buffer as ArrayBuffer, d.va.buffer as ArrayBuffer);
+  if (showCharges) {
+    const ch = buildCharges(a);
+    if (ch.length) { msg.charges = ch; transfer.push(ch.buffer as ArrayBuffer); }
+  }
   ctx.postMessage(msg, transfer);
 }
 
@@ -244,6 +295,7 @@ ctx.onmessage = (ev: MessageEvent) => {
       break;
     }
     case 'cfg': if (m.paused !== undefined) paused = m.paused; if (m.speed !== undefined) speed = m.speed; break;
+    case 'charges': showCharges = !!m.enabled; break;
     case 'cam': cam = { x: m.x, z: m.z }; break;
     case 'diag': {
       const nextStride = m.field === 'cape' ? 2 : 4;

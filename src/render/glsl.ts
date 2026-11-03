@@ -15,6 +15,11 @@ uniform vec2 uCloudRes; uniform float uDenoise;
 uniform sampler3D uCloud;
 uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
+uniform sampler2D uFluid;   // GPU stable-fluids horizontal flow (m/s, domain-periodic)
+// Horizontal flow at a world position from the fluid pass. Clouds, rain shafts, near-camera
+// drops and the funnel all lean through this same evolving field, so every visual element
+// swirls with the same turbulent motion instead of sliding along a constant wind vector.
+vec2 fluidVel(vec2 xz){ return texture(uFluid, xz / uDomain).rg; }
 const vec3 BR = vec3(5.8e-6, 13.5e-6, 33.1e-6);
 const float BMIE = 21e-6;
 
@@ -466,6 +471,10 @@ void main(){
   float dist = length(rel);
   if (dist > 56.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 p = cameraPosition + rel;
+  // The drops ride the fluid field as well as the mean wind: coherent swirls and eddies
+  // instead of a uniform drift. Bounded (no uTime factor), so a changing flow never pops.
+  vec2 fv = fluidVel(p.xz);
+  p.xz += fv * (0.70 + 0.35 * sin(uTime * 1.1 + phase * 6.2831)) * 1.4;
   vec4 s = sampleCloud(p);
   float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
   float inten = clamp(pow(s.g, 0.40) * local, 0.0, 1.0);
@@ -563,27 +572,29 @@ void main(){
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// Rain curtains. Two overlapping veils per column, textured with advected 3-D Perlin-Worley
-// noise plus finer anisotropic streaks. The soft multi-lobe edge hides the billboard outline.
+// Rain curtains. Six bowed, vertically-subdivided planes per column form a cylindrical
+// shaft whose silhouette is torn by per-row noise, whose whole body leans and sways through
+// the GPU fluid field, and whose interior falls through three scrolling noise layers.
 // ---------------------------------------------------------------------------------------------
 export const shaftVert = /* glsl */ `
 ${COMMON}
 ${TERRAIN_FN}
 attribute vec4 aCol;      // x, z, seed, plane index
-attribute vec2 aCorner;   // 0..1 across / up the quad
+attribute vec2 aCorner;   // 0..1 across / 0..1 up the quad
 uniform sampler2D uSurf;  // .g = companded rain rate (0..1)
 uniform vec2 uShaftWind;
 uniform float uSnowLevel;
 #define SHAFT_PLANES 6.0
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
+varying vec2 vFlow;
 void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
   float layer = aCol.w;
   float seed = fract(aCol.z + layer * 0.371);
-  vRain = 0.0; vU = 0.0; vV = 0.5; vSeed = seed; vSnow = 0.0; vDist = 0.0;
-  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0;
+  vRain = 0.0; vU = 0.0; vV = 0.0; vSeed = seed; vSnow = 0.0; vDist = 0.0;
+  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0; vFlow = vec2(0.0);
   if (rain <= 0.008 || seed > max(1.0, uPrecipDensity)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // Wrap precipitation around the mesocyclone, leaving a dry lower inflow notch.
   vec2 tv = xz - uTornado.xy;
@@ -605,23 +616,40 @@ void main(){
   float gy = groundH(xz);
   float depth = max(top - gy, 300.0);
   float h = aCorner.y;
-  vec3 p = vec3(xz.x, mix(gy + 20.0, top, h), xz.y);
-  // Wind shear tilts the shaft progressively toward the ground.
-  float fall = (top - p.y) * 0.00042;
-  p.x += uShaftWind.x * fall * 220.0;
-  p.z += uShaftWind.y * fall * 220.0;
-  // Six planes at fixed azimuths read as a volume from every camera angle; a slight
-  // per-plane radial offset avoids z-fighting where the cards intersect.
+
+  // ---- fluid dynamics: the shaft leans with the GPU flow field (more with height, i.e.
+  // shear), and each column wobbles on its own phase so neighbours never move in lockstep.
+  vec2 fv = fluidVel(xz);
+  vFlow = fv;
+  vec2 lean = fv * (0.55 + 1.45 * pow(h, 1.15)) * 3.0;
+  lean += vec2(sin(uTime * 0.23 + seed * 31.0), cos(uTime * 0.19 + seed * 17.0)) * (24.0 * h);
+
+  float y = mix(gy + 20.0, top, h);
+  // Wind shear tilts the fall streaks progressively toward the ground.
+  float fall = (top - y) * 0.00042;
+  vec2 shear = uShaftWind * fall * 220.0;
+  vec3 p = vec3(xz.x + lean.x + shear.x, y, xz.y + lean.y + shear.y);
+
+  // Six planes at fixed azimuths read as a volume from every camera angle; each plane bows
+  // outward so the assembly reads as a cylinder rather than six flat cards.
   float az = (layer / SHAFT_PLANES) * 2.0 * PI + seed * 0.35;
   vec3 right = vec3(cos(az), 0.0, sin(az));
   float width = mix(230.0, 1050.0, pow(h, 1.25)) * (0.62 + 0.85 * fract(seed * 13.7)) + depth * 0.075;
-  p += right * ((aCorner.x - 0.5) * width + (fract(seed * 31.0) - 0.5) * 90.0);
+  // Ragged silhouette: two octaves of row noise bend the width, so no edge is ever straight.
+  float rowN = vnoise2(vec2(seed * 149.0, h * 5.0 + uTime * 0.045)) - 0.5;
+  float rowN2 = vnoise2(vec2(seed * 61.0 + 7.3, h * 11.0 - uTime * 0.06)) - 0.5;
+  width *= 1.0 + rowN * 0.55 + rowN2 * 0.30;
+  float across = aCorner.x - 0.5;
+  float bow = (1.0 - 4.0 * across * across) * width * 0.17 * (0.6 + 0.4 * fract(seed * 5.1));
+  p += right * (across * width + (fract(seed * 31.0) - 0.5) * 90.0);
+  p += vec3(-right.z, 0.0, right.x) * bow;
+
   gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
   vRain = smoothstep(0.005, 0.42, rain) * (0.92 + 0.42 * uHeavyRain);
   vU = h;
-  vV = aCorner.x * 2.0 - 1.0;
+  vV = across * 2.0;
   vWorld = vec2(p.x, p.z);
-  vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, mix(gy, top, h));
+  vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, y);
   vDist = length(cameraPosition - p);
 }`;
 export const shaftFrag = /* glsl */ `
@@ -629,32 +657,64 @@ ${COMMON}
 uniform sampler3D uNoise;
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
+varying vec2 vFlow;
 void main(){
   if (vRain < 0.01) discard;
-  float edge = exp(-1.8 * vV * vV) * (1.0 - smoothstep(0.80, 1.0, abs(vV)));
+  // Soft multi-lobe edge, then torn by noise: the card boundary itself becomes wispy.
+  float edge = exp(-1.5 * vV * vV) * (1.0 - smoothstep(0.76, 1.0, abs(vV)));
   if (edge < 0.01) discard;
+
   // Integer numbers of noise tiles across the 32 km domain: no seams at periodic boundaries.
   float shaftP = uDomain / 12.0;
-  vec2 nxy = vWorld / shaftP;
-  vec4 nA = texture(uNoise, vec3(nxy + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.22 - uTime * 0.035));
-  vec4 nB = texture(uNoise, vec3(nxy * 4.0 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.55 - uTime * 0.085));
-  float streak = 0.22 + 0.58 * nA.r + 0.44 * nA.g + 0.78 * (nB.r * 0.55 + nB.g * 0.45);
-  float topFade = 1.0 - smoothstep(0.78, 1.0, vU);
-  float botFade = smoothstep(0.0, 0.055, vU);
+  // Fall streaks: each layer scrolls downward at its own terminal-fall rate (parallax).
+  float fallA = uTime * 0.055;
+  float fallB = uTime * 0.14;
+  // The fluid field advects the interior structure, so rain inside the shaft circulates.
+  vec2 nxy = vWorld / shaftP + vFlow * 0.00045;
+  vec4 nA = texture(uNoise, vec3(nxy + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.20 - fallA));
+  vec4 nB = texture(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB));
+  vec4 nC = texture(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7));
+  // Sub-columns of heavier / lighter precipitation inside one shaft.
+  float strand = 0.42 + 0.58 * (0.55 * nB.r + 0.45 * nC.a);
+  float streak = 0.20 + 0.48 * nA.r + 0.38 * nA.g + 0.66 * (nB.r * 0.5 + nB.g * 0.5) + 0.34 * (nC.r - 0.5);
+  streak *= strand;
+  // Torn edges: the fine layer erodes the silhouette where it is already thin.
+  float erode = 0.5 + 0.5 * (nB.g * 0.6 + nC.g * 0.4);
+  edge = pow(edge, mix(1.7, 0.85, erode));
+
+  float topFade = 1.0 - smoothstep(0.74, 1.0, vU);
+  // Virga: ragged evaporating tendrils with a per-column bottom height.
+  float ragged = fract(vSeed * 7.77);
+  float botFade = smoothstep(0.0, 0.03 + 0.11 * ragged, vU);
+  float tendril = mix(1.0, smoothstep(0.14, 0.58, nB.b + 0.28 * nC.b), (1.0 - smoothstep(0.02, 0.32, vU)) * 0.85);
   float body = pow(vU, 0.22);
   float planeGain = 0.86 + 0.16 * sin(vLayer * 2.399 + vSeed * 6.2831);
-  float a = vRain * streak * edge * topFade * botFade * mix(0.62, 1.08, vU) * (0.66 + 0.44 * body) * planeGain;
+  float a = vRain * streak * edge * topFade * botFade * tendril * mix(0.62, 1.08, vU) * (0.66 + 0.44 * body) * planeGain;
   a *= clamp(0.72 + 0.85 * uRainIntensity + 0.95 * uHeavyRain, 0.72, 2.65);
   // Near shafts must be visible; the old 120..650 m fade erased exactly the rain under the storm.
-  a *= smoothstep(20.0, 150.0, vDist);
+  a *= smoothstep(16.0, 140.0, vDist);
   a *= 1.0 - smoothstep(14000.0, 28000.0, vDist);
-  a = min(a, 0.88);
+  // Far shafts soften their internal stripes so distant curtains read as volume, not bands.
+  float far = smoothstep(2500.0, 12000.0, vDist);
+  a *= mix(1.0, 0.82 + 0.18 * smoothstep(0.2, 1.0, streak), far);
+  a = min(a, 0.9);
   if (a < 0.003) discard;
+
+  // ---- lighting
+  vec3 toCam = normalize(vec3(vWorld.x, 0.0, vWorld.y) - cameraPosition);
+  float fwd = max(dot(toCam, uSunDir), 0.0);   // looking sunward through the shaft
+  float back = max(dot(-toCam, uSunDir), 0.0); // the sun directly behind the shaft
   vec3 rainCol = (uSkyAmb * 1.05 + uSunCol * 0.24 + vec3(0.01)) * vec3(0.70, 0.76, 0.88);
   vec3 snowCol = (uSkyAmb * 1.1 + uSunCol * 0.4 + vec3(0.02)) * vec3(1.06, 1.06, 1.1);
-  vec3 col = mix(rainCol, snowCol, vSnow) * mix(0.86, 1.0, vU);
-  float cs = dot(normalize(vec3(vWorld.x, 0.0, vWorld.y) - cameraPosition), uSunDir);
-  col *= 1.0 + 0.55 * pow(max(cs, 0.0), 4.0);
+  vec3 col = mix(rainCol, snowCol, vSnow);
+  // Vertical light: bright where the shaft enters the lit cloud base, dark near the ground.
+  col *= mix(0.70, 1.14, vU);
+  // Dense cores self-shadow; thin edges scatter more sunlight through them.
+  float density = vRain * strand;
+  col *= 1.0 - 0.30 * smoothstep(0.35, 1.1, density);
+  // Forward scatter: a backlit shaft glows along its sunward face.
+  col *= 1.0 + 0.95 * pow(fwd, 3.0) * (0.35 + 0.65 * (1.0 - smoothstep(0.4, 1.0, density)));
+  col *= 1.0 + 0.35 * pow(back, 4.0);
   col *= 1.0 - 0.18 * vHook;   // hook echo is darker / rain-wrapped
   if (uFlashOn > 0.5) col += flashLight(vec3(vWorld.x, 300.0, vWorld.y), vec3(0.0, 1.0, 0.0)) * 0.5 + uFlashCol * uFlashGlow * 0.16;
   gl_FragColor = vec4(col, a);
@@ -668,6 +728,7 @@ attribute vec4 aS; attribute vec2 aCorner; attribute vec2 aSeed;
 uniform vec3 uOff; uniform float uT; uniform float uStep; uniform float uRS; uniform float uN;
 uniform float uStrokeT[8]; uniform float uStrokeA[8];
 uniform float uCCEnd; uniform float uCCAmp; uniform float uLeaderEnd;
+uniform float uPol;   // -1 = negative CG, +1 = positive CG, 0 = intracloud
 varying float vLum; varying float vSide; varying float vOrder; varying float vAlong;
 varying float vFlicker; varying float vBead;
 void main(){
@@ -703,11 +764,18 @@ void main(){
   vOrder = aS.z;
   vAlong = aCorner.x * 2.0 - 1.0;
   vSide = aCorner.y;
-  vFlicker = clamp(0.86 + 0.10 * sin(uT * 210.0 + aSeed.x * 37.0) + 0.06 * sin(uT * 470.0 + aSeed.y * 19.0), 0.62, 1.08);
+  // Negative strokes strobe fast (stepped-leader return strokes); positive strokes are a
+  // single sustained discharge with a slower, smoother intensity wobble.
+  float flickSpeed = uPol > 0.5 ? 70.0 : 210.0;
+  float flick2 = uPol > 0.5 ? 160.0 : 470.0;
+  float flickAmp = uPol > 0.5 ? 0.05 : 0.10;
+  vFlicker = clamp(0.86 + flickAmp * sin(uT * flickSpeed + aSeed.x * 37.0) + 0.06 * sin(uT * flick2 + aSeed.y * 19.0), 0.62, 1.08);
   vBead = 0.86 + 0.14 * sin(aS.y * 0.055 + aSeed.y * 31.0);
   float dist = length(cameraPosition - mix(A, B, aCorner.x));
   float w = (0.42 + 2.25 * sqrt(max(lum, 0.0))) * aS.w * 1.05 + dist * 0.00085;
   w *= mix(1.0, 0.72, clamp(aS.z / 3.0, 0.0, 1.0));
+  // Positive CG channels carry far higher peak current: a visibly thicker, steadier channel.
+  w *= mix(1.0, 1.4, step(0.5, uPol));
   vec3 p = mix(A, B, aCorner.x) + side * aCorner.y * w * 3.0;
   // Extend both ends slightly along the local tangent so mitered joints never show a gap.
   p += mix(d0, d1, aCorner.x) * (aCorner.x * 2.0 - 1.0) * w * 0.16;
@@ -716,6 +784,7 @@ void main(){
 export const boltFrag = /* glsl */ `
 varying float vLum; varying float vSide; varying float vOrder; varying float vAlong;
 varying float vFlicker; varying float vBead;
+uniform float uPol;
 void main(){
   float s = abs(vSide);
   float core = exp(-s * s * 24.0);
@@ -725,7 +794,12 @@ void main(){
   vec3 hot = vec3(1.0, 0.98, 0.94);
   vec3 blue = vec3(0.62, 0.78, 1.0);
   vec3 violet = vec3(0.38, 0.44, 0.96);
+  // Positive CG: hotter white-violet core from the much larger peak current.
+  // Negative CG: classic blue-white return stroke. IC: dimmer, violet.
+  vec3 tint = uPol > 0.5 ? vec3(1.0, 0.96, 1.02) : (uPol < -0.5 ? vec3(0.86, 0.94, 1.06) : vec3(0.82, 0.84, 1.05));
+  float gain = uPol > 0.5 ? 1.35 : (uPol < -0.5 ? 1.0 : 0.8);
   vec3 c = (hot * core * 15.0 + mix(blue, hot, core) * glow * 3.0 + violet * halo * 0.55) * vLum * vFlicker * vBead * endFade;
+  c *= tint * gain;
   c *= mix(1.0, 0.58, clamp(vOrder / 3.0, 0.0, 1.0));   // thin branches are dimmer
   gl_FragColor = vec4(c, 1.0);
 }`;
@@ -789,9 +863,9 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   float updraft = clamp((s.a - 0.5) * 2.0, -1.0, 1.0);
   float cover = smoothstep(0.003, 0.58, base);
   // Integer noise periods per 32 km domain. A constant wind offset preserves periodicity;
-  // the old 5200 m / 900 m / 260 m periods left a discontinuity at the wrap seam.
+  // the fluid displacement is also domain-periodic, so the tiling survives it too.
   float broadP = uDomain / 6.0, midP = uDomain / 32.0, fineP = uDomain / 128.0;
-  vec2 wo = windOffAt(p.y);
+  vec2 wo = windOffAt(p.y) + fluidVel(p.xz) * 7.0;
   vec3 np = p + vec3(wo.x, 0.0, wo.y);
   vec4 nA = texture(uNoise, np / broadP);
   // A gentle domain-periodic organisation: broad bands + cellular billows, no per-frame drift.
@@ -801,25 +875,34 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   vec2 warp = (nA.gb - 0.5) * mix(420.0, 950.0, smoothstep(0.35, 0.95, iceF));
   vec3 np2 = np + vec3(warp.x, warp.y * 0.25, warp.y);
   vec4 nB = texture(uNoise, np2 / midP);
+  // Second, finer warp: this is what turns smooth blobs into lobed cauliflower with creases.
+  vec2 warp2 = (nB.ba - 0.5) * 165.0;
+  vec3 np3 = np2 + vec3(warp2.x, warp2.y * 0.4, warp2.y);
+  vec4 nC = texture(uNoise, np3 / midP);
   float towerW = smoothstep(0.04, 0.82, updraft);
   float iceW = smoothstep(0.35, 0.95, iceF);
   float hW = smoothstep(1800.0, 5400.0, p.y);
   float anvilW = iceW * smoothstep(6200.0, 10000.0, p.y);
-  float lowShape = cover * (0.50 + 0.78 * billow) * (0.84 + 0.28 * band);
-  float towerShape = cover * (0.54 + 0.84 * billow) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
-  float anvilShape = cover * (0.62 + 0.46 * nA.r) * (0.84 + 0.30 * nB.r) * (1.0 - 0.12 * billow);
+  // Billow transform: rounded lobes with sharp creases instead of evenly puffy cotton.
+  float lobes = 1.0 - abs(2.0 * nC.g - 1.0);
+  lobes = mix(0.5, lobes, 0.5 + 0.3 * billow);
+  float lowShape = cover * (0.46 + 0.58 * billow + 0.34 * lobes) * (0.84 + 0.28 * band);
+  float towerShape = cover * (0.48 + 0.60 * billow + 0.40 * lobes) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
+  float anvilShape = cover * (0.62 + 0.46 * nA.r) * (0.84 + 0.30 * nC.r) * (1.0 - 0.12 * billow);
   float shape = mix(lowShape, towerShape, hW);
   shape = mix(shape, anvilShape, anvilW);
   if (!detail) return clamp(shape, 0.0, 1.0);
-  float mid = 0.65 * nB.r + 0.35 * (1.0 - nB.g);
-  shape *= 0.84 + mix(0.32, 0.20, uDenoise) * mid;
-  float fine = nB.b * 0.62 + nB.a * 0.38;
+  float mid = 0.60 * nC.r + 0.40 * (1.0 - nC.g);
+  shape *= 0.82 + mix(0.34, 0.22, uDenoise) * mid;
+  float fine = nC.b * 0.62 + nC.a * 0.38;
   if (t < 3400.0) {
-    vec4 nC = texture(uNoise, np2 / fineP);
-    fine = fine * 0.62 + (0.55 * nC.r + 0.45 * (1.0 - nC.g)) * 0.38;
+    vec4 nD = texture(uNoise, np3 / fineP);
+    fine = fine * 0.58 + (0.55 * nD.r + 0.45 * (1.0 - nD.g)) * 0.42;
   }
   edge = 1.0 - smoothstep(0.08, 0.72, shape);
-  float erosion = (1.0 - fine) * mix(0.12 + 0.34 * edge, 0.07 + 0.20 * edge, uDenoise) * mix(0.72, 1.02, 1.0 - iceW);
+  // Erosion eats exposed edges more than cores; the lobe term carves the creases deeper.
+  float erosion = (1.0 - fine) * mix(0.14 + 0.36 * edge, 0.09 + 0.22 * edge, uDenoise) * mix(0.70, 1.05, 1.0 - iceW);
+  erosion += (1.0 - lobes) * 0.12 * edge;
   float d = clamp((shape - erosion) / max(0.24, 1.0 - erosion * 0.60), 0.0, 1.0);
   // Soft cutoff: hard density thresholds are what make a voxel grid read as stacked boxes.
   return smoothstep(0.0, 0.18, d) * d;
@@ -909,8 +992,8 @@ void main(){
       // The phase is evaluated once per step (the anisotropy barely changes per octave).
       float ph = phase(cosT, 1.0);
       vec3 sunL = vec3(0.0); float a = 1.0, b = 1.0;
-      for (int o = 0; o < 3; o++){ sunL += a * exp(-tau * b) * ph; a *= 0.46; b *= 0.38; }
-      sunL *= 0.60;
+      for (int o = 0; o < 4; o++){ sunL += a * exp(-tau * b) * ph; a *= 0.46; b *= 0.38; }
+      sunL *= 0.54;
       float powder = mix(1.0, 1.0 - 0.68 * exp(-d * 7.0), 0.8 * (1.0 - smoothstep(0.15, 0.85, cosT)));
       float cT = max(cosT, 0.0), cT2 = cT * cT, cT4 = cT2 * cT2;
       float rim = smoothstep(0.35, 0.95, edge) * (1.0 - d);
@@ -919,10 +1002,20 @@ void main(){
       // one-tap vertical occlusion: how much cloud sits above this sample
       float aoU = 1.0;
       if (uCheapLight < 0.5 && d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
-      float hDark = mix(0.40, 1.0, smoothstep(0.02, 0.42, hF));
-      hDark *= 1.0 - 0.28 * smoothstep(0.08, 0.80, rainD);   // precipitation darkens the base
+      // one-tap directional (side) shading: denser cloud toward the sun means this face is
+      // turned away from the light — the single biggest cue that separates real cumulus
+      // from uniformly lit cotton wool.
+      float sideShade = 1.0;
+      if (uCheapLight < 0.5 && (i & 1) == 0) {
+        float dSun = sampleCloud(p + uSunDir * 430.0).r;
+        sideShade = mix(0.70, 1.16, smoothstep(-0.30, 0.30, d - dSun));
+      }
+      float hDark = mix(0.34, 1.0, smoothstep(0.02, 0.46, hF));
+      hDark *= 1.0 - 0.36 * smoothstep(0.06, 0.75, rainD);   // precipitation darkens the base
+      // Shadowed cloud volume scatters skylight in, so it reads blue-grey; tops warm up.
+      vec3 ambTint = mix(vec3(0.74, 0.84, 1.06), vec3(1.02, 1.0, 0.97), smoothstep(0.0, 0.65, hF));
       vec3 amb = mix(uGroundAmb * 0.55, uSkyAmb, smoothstep(0.0, 0.75, hF));
-      amb *= (0.16 + 0.84 * aoU) * (0.70 + 0.52 * d) * hDark;
+      amb *= (0.16 + 0.84 * aoU) * (0.70 + 0.52 * d) * hDark * ambTint;
       // light that has bounced around inside the cloud: lifts the core without flattening edges
       amb += uSunCol * sunL * (0.05 + 0.13 * d) * mix(0.35, 1.0, hF);
       // A flash illuminates the whole cloud body, not just six discrete point samples.
@@ -930,8 +1023,8 @@ void main(){
       vec3 sunTint = mix(vec3(1.0), vec3(1.18, 0.93, 0.78), clamp(uTwilight * 0.8 + 0.25 * (1.0 - uSunDir.y), 0.0, 0.65));
       vec3 fl = uFlashOn > 0.5 ? flashLight(p, vec3(0.0, 1.0, 0.0)) : vec3(0.0);
       vec3 iceTint = mix(vec3(1.0), vec3(0.95, 0.97, 1.06), iceF);
-      vec3 Sc = (uSunCol * sunTint * sunL * (0.55 + 0.70 * silver) * powder + amb + fl * 0.28) * iceTint;
-      vec3 Sr = (uSunCol * sunTint * 0.09 * sunL + amb * 0.8 + fl * 0.18) * vec3(0.78, 0.84, 0.94);
+      vec3 Sc = (uSunCol * sunTint * sunL * sideShade * (0.55 + 0.70 * silver) * powder + amb + fl * 0.28) * iceTint;
+      vec3 Sr = (uSunCol * sunTint * 0.09 * sunL * sideShade + amb * 0.8 + fl * 0.18) * vec3(0.78, 0.84, 0.94);
       vec3 S = (sc * Sc + sr * Sr) / sig;
       float Ts = exp(-sig * stepLen);
       float wgt = T * (1.0 - Ts);
@@ -1046,3 +1139,47 @@ void main(){
   gl_FragColor = vec4(col, 1.0);
 }
 `;
+
+// ---------------------------------------------------------------------------------------------
+// Charge particles for the show-charges toggle: point sprites drawn as crisp + / − glyphs,
+// red for net-positive charge, blue for net-negative, sized and faded by |q|.
+// ---------------------------------------------------------------------------------------------
+export const chargeVert = /* glsl */ `
+${COMMON}
+attribute vec2 aQ;   // x = signed magnitude (sign * 0..1), y = phase
+varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW;
+void main(){
+  vSign = sign(aQ.x);
+  vMag = clamp(abs(aQ.x), 0.0, 1.0);
+  vPhase = aQ.y;
+  vec4 mv = viewMatrix * vec4(position, 1.0);
+  float dist = length(mv.xyz);
+  // Gentle bob so the field reads as suspended charge, not a static decal.
+  vec3 wp = position;
+  wp.y += sin(uTime * 1.3 + aQ.y * 6.2831) * 6.0;
+  vW = wp;
+  gl_PointSize = clamp((7.0 + 17.0 * vMag) * (1500.0 / max(dist, 1.0)), 3.0, 90.0);
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+}`;
+
+export const chargeFrag = /* glsl */ `
+${COMMON}
+varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW;
+void main(){
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float aa = 0.12;
+  // '+' = horizontal AND vertical bars, '−' = horizontal bar only.
+  float barH = (1.0 - smoothstep(0.14 - aa, 0.14 + aa, abs(q.y))) * (1.0 - smoothstep(0.58 - aa, 0.58 + aa, abs(q.x)));
+  float barV = (1.0 - smoothstep(0.14 - aa, 0.14 + aa, abs(q.x))) * (1.0 - smoothstep(0.58 - aa, 0.58 + aa, abs(q.y)));
+  float glyph = vSign > 0.0 ? max(barH, barV) : barH;
+  float glow = exp(-dot(q, q) * 2.6) * 0.30;
+  float tw = 0.78 + 0.22 * sin(uTime * 2.4 + vPhase * 6.2831);
+  vec3 pos = vec3(1.0, 0.30, 0.24);
+  vec3 neg = vec3(0.30, 0.62, 1.0);
+  vec3 col = mix(neg, pos, step(0.0, vSign));
+  col = mix(col, vec3(1.0), glyph * 0.65);
+  if (uFlashOn > 0.5) col += flashLight(vW, vec3(0.0, 1.0, 0.0)) * 0.2;
+  float a = (glyph * 0.95 + glow) * (0.35 + 0.65 * vMag) * tw;
+  if (a < 0.02) discard;
+  gl_FragColor = vec4(col, a);
+}`;
