@@ -8,6 +8,10 @@ uniform float uCamCloud;   // 0 = clear air at the camera, 1 = camera inside con
 // Storm-load controls: thin precipitation instances and simplify shadow/visibility taps.
 uniform float uPrecipDensity; uniform float uCheapShadows; uniform float uRainIntensity;
 uniform float uFlashGlow;
+// Sub-grid vortex (x, z, radius, intensity), heavy-rain envelope and denoise controls.
+// x/z use the same periodic world coordinates as sampleCloud().
+uniform vec4 uTornado; uniform float uTornadoTop; uniform float uHeavyRain;
+uniform vec2 uCloudRes; uniform float uDenoise;
 uniform sampler3D uCloud;
 uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
@@ -463,12 +467,12 @@ void main(){
   if (dist > 56.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 p = cameraPosition + rel;
   vec4 s = sampleCloud(p);
-  float local = clamp(0.35 + 0.65 * uRainIntensity, 0.35, 1.0);
-  float inten = pow(s.g, 0.62) * local;
+  float local = clamp(0.35 + 0.65 * uRainIntensity + 0.35 * uHeavyRain, 0.35, 1.0);
+  float inten = clamp(pow(s.g, 0.52) * local, 0.0, 1.0);
   if (mix(rnd, rnd2, flake) > inten) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   if (p.y < 1400.0 && p.y < groundH(p.xz) + 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // A drop is a motion-blurred teardrop: rounded bright head, tapering tail. Flakes are short.
-  float len = mix(0.35 + 1.25 * cls, 0.16 + 0.12 * cls, flake) * (1.0 + clamp(dist * 0.025, 0.0, 2.0)) * (0.72 + 0.28 * uRainIntensity);
+  float len = mix(0.35 + 1.25 * cls, 0.16 + 0.12 * cls, flake) * (1.0 + clamp(dist * 0.025, 0.0, 2.0)) * (0.72 + 0.28 * uRainIntensity + 0.25 * uHeavyRain);
   float wid = mix(0.0035 + 0.005 * cls, 0.014 + 0.010 * cls, flake) * (1.0 + dist * 0.0007);
   vec3 dirV = normalize(vel);
   vec3 center = p - dirV * len * 0.5;
@@ -481,7 +485,7 @@ void main(){
   vec3 col = uSkyAmb * 1.1 + uSunCol * (0.10 + 0.75 * fwd) + uGroundAmb * 0.4 + vec3(0.015);
   if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 0.0, 1.0)) * 0.8 + uFlashCol * uFlashGlow * 0.12;
   vCol = mix(col, col * vec3(1.06, 1.06, 1.12) + vec3(0.045), flake);
-  vAlpha = smoothstep(0.35, 1.5, dist) * (1.0 - smoothstep(34.0, 56.0, dist)) * mix(0.62 + 0.22 * cls, 0.42, flake);
+  vAlpha = smoothstep(0.35, 1.5, dist) * (1.0 - smoothstep(34.0, 56.0, dist)) * mix(0.62 + 0.22 * cls, 0.42, flake) * (0.78 + 0.35 * uHeavyRain);
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const rainFrag = /* glsl */ `
@@ -531,8 +535,8 @@ void main(){
   vec2 xz = cameraPosition.xz + rel;
   float gh = groundH(xz);
   vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
-  float local = clamp(0.35 + 0.65 * uRainIntensity, 0.35, 1.0);
-  float inten = pow(s.g, 0.68) * local;
+  float local = clamp(0.35 + 0.65 * uRainIntensity + 0.35 * uHeavyRain, 0.35, 1.0);
+  float inten = clamp(pow(s.g, 0.58) * local, 0.0, 1.0);
   float ph = fract(uTime * (1.6 + 0.8 * aDrop.x) + aSeed.z * 13.0 + aDrop.z);
   float vis = step(fract(aSeed.z * 37.7 + aDrop.z), inten * 0.9) * step(0.004, s.g) * step(0.0, gh);
   float r = (0.035 + 0.16 * ph) * (0.7 + 0.7 * aDrop.x);
@@ -553,7 +557,7 @@ void main(){
   float ring = smoothstep(0.48, 0.72, rr) * (1.0 - smoothstep(0.72, 0.98, rr)) * (0.65 + 0.35 * spikes);
   float mist = (1.0 - smoothstep(0.0, 0.95, rr)) * 0.10;
   float droplets = smoothstep(0.82, 0.98, rr) * (0.5 + 0.5 * spikes) * 0.07;
-  float a = (ring * 0.30 + mist + droplets) * (1.0 - vPh) * (1.0 - vPh) * 0.85 * vVis;
+  float a = (ring * 0.30 + mist + droplets) * (1.0 - vPh) * (1.0 - vPh) * 0.85 * vVis * (1.0 + 0.35 * uHeavyRain);
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
@@ -565,22 +569,34 @@ void main(){
 export const shaftVert = /* glsl */ `
 ${COMMON}
 ${TERRAIN_FN}
-attribute vec4 aCol;      // x, z, seed, layer
-attribute vec2 aCorner;   // 0..1 across the quad
-uniform sampler2D uSurf;  // .g = rain rate (0..1)
+attribute vec4 aCol;      // x, z, seed, plane index
+attribute vec2 aCorner;   // 0..1 across / up the quad
+uniform sampler2D uSurf;  // .g = companded rain rate (0..1)
 uniform vec2 uShaftWind;
 uniform float uSnowLevel;
+#define SHAFT_PLANES 6.0
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
-varying float vDist; varying vec2 vWorld; varying float vLayer;
+varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
 void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
   float layer = aCol.w;
   float seed = fract(aCol.z + layer * 0.371);
   vRain = 0.0; vU = 0.0; vV = 0.5; vSeed = seed; vSnow = 0.0; vDist = 0.0;
-  vWorld = vec2(0.0); vLayer = layer;
+  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0;
   if (rain <= 0.02 || seed > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
-  // cloud base: walk up the column until the precipitation field appears
+  // Wrap precipitation around the mesocyclone, leaving a dry lower inflow notch.
+  vec2 tv = xz - uTornado.xy;
+  tv -= uDomain * floor(tv / uDomain + 0.5);
+  float tr = length(tv);
+  float core = exp(-tr * tr / max(1.0, 18.0 * uTornado.z * uTornado.z));
+  float angle = atan(tv.y, tv.x);
+  float hook = uTornado.w * core * smoothstep(1.0, 3.2, tr / max(80.0, uTornado.z));
+  xz += vec2(-sin(angle), cos(angle)) * hook * 420.0;
+  float notch = uTornado.w * smoothstep(0.0, 1.0, tr / max(80.0, uTornado.z)) * (1.0 - smoothstep(1.0, 4.0, tr / max(80.0, uTornado.z)));
+  rain *= 1.0 - 0.65 * notch * smoothstep(0.0, 1.0, -tv.y / max(80.0, uTornado.z));
+  vHook = hook;
+  // Cloud base: walk up the column until the precipitation field appears.
   float top = 3800.0;
   for (int i = 0; i < 6; i++){
     float h = 400.0 + float(i) * 1150.0;
@@ -588,45 +604,46 @@ void main(){
   }
   float gy = groundH(xz);
   float depth = max(top - gy, 300.0);
-  vec3 p = vec3(xz.x, mix(gy + 20.0, top, aCorner.y), xz.y);
+  float h = aCorner.y;
+  vec3 p = vec3(xz.x, mix(gy + 20.0, top, h), xz.y);
   // Wind shear tilts the shaft progressively toward the ground.
   float fall = (top - p.y) * 0.00042;
   p.x += uShaftWind.x * fall * 220.0;
   p.z += uShaftWind.y * fall * 220.0;
-  float width = mix(170.0, 820.0, pow(aCorner.y, 1.35)) * (0.55 + 0.85 * fract(seed * 13.7)) * mix(0.72, 1.12, layer) + depth * 0.055;
-  vec3 toCam = normalize(cameraPosition - p);
-  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
-  p += right * (aCorner.x - 0.5) * width;
+  // Six planes at fixed azimuths read as a volume from every camera angle; a slight
+  // per-plane radial offset avoids z-fighting where the cards intersect.
+  float az = (layer / SHAFT_PLANES) * 2.0 * PI + seed * 0.35;
+  vec3 right = vec3(cos(az), 0.0, sin(az));
+  float width = mix(170.0, 820.0, pow(h, 1.35)) * (0.55 + 0.85 * fract(seed * 13.7)) + depth * 0.055;
+  p += right * ((aCorner.x - 0.5) * width + (fract(seed * 31.0) - 0.5) * 90.0);
   gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
-  vRain = smoothstep(0.02, 0.6, rain);
-  vU = aCorner.y;
+  vRain = smoothstep(0.02, 0.6, rain) * (0.82 + 0.30 * uHeavyRain);
+  vU = h;
   vV = aCorner.x * 2.0 - 1.0;
   vWorld = vec2(p.x, p.z);
-  vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, mix(gy, top, aCorner.y));
+  vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, mix(gy, top, h));
   vDist = length(cameraPosition - p);
 }`;
 export const shaftFrag = /* glsl */ `
 ${COMMON}
 uniform sampler3D uNoise;
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
-varying float vDist; varying vec2 vWorld; varying float vLayer;
+varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
 void main(){
   if (vRain < 0.01) discard;
-  // Soft, slightly irregular horizontal edges: never let the card outline show.
   float edge = exp(-2.2 * vV * vV) * (1.0 - smoothstep(0.72, 1.0, abs(vV)));
   if (edge < 0.01) discard;
-  // Advected 3-D noise gives coherent clumps; the stretched 2-D noise adds falling filaments.
   vec4 nA = texture(uNoise, vec3(vWorld * 0.00035 + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.22 - uTime * 0.035));
   float fall = uTime * 34.0;
   float n1 = vnoise2(vec2(vWorld.x * 0.020 + vWorld.y * 0.011 + vSeed * 17.0, (vU * 900.0 - fall) * 0.014));
   float n2 = vnoise2(vec2(vWorld.x * 0.055 - vWorld.y * 0.031 + vSeed * 41.0, (vU * 900.0 - fall * 1.6) * 0.035));
-  float streak = 0.16 + 0.55 * nA.r + 0.42 * nA.g + 0.72 * (n1 * 0.55 + n2 * 0.45);
+  float streak = 0.18 + 0.55 * nA.r + 0.42 * nA.g + 0.72 * (n1 * 0.55 + n2 * 0.45);
   float topFade = 1.0 - smoothstep(0.62, 1.0, vU);
   float botFade = smoothstep(0.0, 0.12, vU);
   float body = pow(vU, 0.28);
-  float layerGain = mix(0.82, 0.58, vLayer);
-  float a = vRain * streak * edge * topFade * botFade * mix(0.38, 0.78, vU) * (0.45 + 0.55 * body) * layerGain;
-  a *= clamp(0.4 + 0.6 * uRainIntensity, 0.4, 1.0);
+  float planeGain = 0.60 + 0.12 * sin(vLayer * 2.399 + vSeed * 6.2831);
+  float a = vRain * streak * edge * topFade * botFade * mix(0.38, 0.78, vU) * (0.45 + 0.55 * body) * planeGain;
+  a *= clamp(0.4 + 0.6 * uRainIntensity + 0.35 * uHeavyRain, 0.4, 1.5);
   a *= smoothstep(120.0, 650.0, vDist);
   a *= 1.0 - smoothstep(8000.0, 18000.0, vDist);
   if (a < 0.004) discard;
@@ -635,6 +652,7 @@ void main(){
   vec3 col = mix(rainCol, snowCol, vSnow) * mix(0.82, 1.0, vU);
   float cs = dot(normalize(vec3(vWorld.x, 0.0, vWorld.y) - cameraPosition), uSunDir);
   col *= 1.0 + 0.55 * pow(max(cs, 0.0), 4.0);
+  col *= 1.0 - 0.22 * vHook;   // hook echo is darker / rain-wrapped
   if (uFlashOn > 0.5) col += flashLight(vec3(vWorld.x, 300.0, vWorld.y), vec3(0.0, 1.0, 0.0)) * 0.5 + uFlashCol * uFlashGlow * 0.16;
   gl_FragColor = vec4(col, a);
 }`;
@@ -753,6 +771,13 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   vec4 s = sampleCloud(p);
   rainD = s.g; iceF = s.b; edge = 0.0;
   float base = s.r;
+  // Lowered, rain-free wall cloud / condensation funnel source around the simulated vortex.
+  vec2 td = p.xz - uTornado.xy;
+  td -= uDomain * floor(td / uDomain + 0.5);
+  float tr = length(td);
+  float wall = uTornado.w * exp(-tr * tr / max(1.0, 9.0 * uTornado.z * uTornado.z));
+  wall *= 1.0 - smoothstep(uTornadoTop * 0.55, uTornadoTop * 1.35, p.y);
+  base += wall * 0.45 * smoothstep(0.0, 0.25, p.y / max(1.0, uTornadoTop));
   if (base < 0.002) return 0.0;
   float updraft = clamp((s.a - 0.5) * 2.0, -1.0, 1.0);
   float cov = smoothstep(0.012, 0.78, base);
@@ -771,7 +796,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   if (!detail) return clamp(shape, 0.0, 1.0);
   vec4 nB = texture(uNoise, np2 / 900.0);
   float mid = 0.65 * nB.r + 0.35 * (1.0 - nB.g);
-  shape *= 0.72 + 0.56 * mid;
+  shape *= 0.76 + mix(0.52, 0.32, uDenoise) * mid;
   float fine = nB.b * 0.65 + nB.a * 0.35;
   // The finest octave only pays for itself close to the camera, where it is visible.
   if (t < 3400.0) {
@@ -779,7 +804,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
     fine = fine * 0.62 + (0.55 * nC.r + 0.45 * (1.0 - nC.g)) * 0.38;
   }
   edge = 1.0 - smoothstep(0.08, 0.72, shape);
-  float erosion = (1.0 - fine) * (0.18 + 0.50 * edge) * mix(0.75, 1.1, 1.0 - anvil);
+  float erosion = (1.0 - fine) * mix(0.18 + 0.50 * edge, 0.10 + 0.30 * edge, uDenoise) * mix(0.75, 1.1, 1.0 - anvil);
   float d = clamp((shape - erosion) / max(0.22, 1.0 - erosion * 0.65), 0.0, 1.0);
   // Soft cutoff: hard density thresholds are what make a voxel grid read as stacked boxes.
   return smoothstep(0.0, 0.22, d) * d;
@@ -816,11 +841,14 @@ void main(){
   if (rd.y > 1e-4) t1 = min(t1, (15000.0 - ro.y) / rd.y);
   else if (rd.y < -1e-4) t1 = min(t1, max(0.0, -ro.y / rd.y));
   t1 = min(t1, tTer);
-  float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
+  float staticJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  float frameJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
+  // Mostly a fixed per-pixel offset: temporal jitter is dithered, not a new random walk each frame.
+  float jitter = mix(staticJ, frameJ, mix(0.35, 0.12, uDenoise));
   float cosT = dot(rd, uSunDir);
   vec3 L = vec3(0.0); float T = 1.0; float tHit = -1.0;
   float tSum = 0.0, wSum = 0.0;
-  float t = 60.0 * jitter * uStepScale;
+  float t = mix(60.0, 34.0, uDenoise) * jitter * uStepScale;
   // ---- coarse entry search: hop over the clear air before the condensate (<=9 cheap fetches)
   if (uCamCloud < 0.35){
     float cstep = clamp(t1 * 0.09, 260.0, 1700.0) * uStepScale;
@@ -842,7 +870,7 @@ void main(){
     vec3 p = ro + rd * t;
     float stepLen = clamp(0.045 * t + 55.0, 55.0, 1200.0) * uStepScale;
     // vary the step length per pixel *and* per frame: breaks slice banding without a fixed pattern
-    stepLen *= 0.96 + 0.08 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, uFrame * 3.11));
+    stepLen *= 0.97 + 0.06 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, 0.0));
     // optically thick cloud does not need fine steps: grow them as the beam is extinguished
     stepLen *= mix(1.0, 2.6, 1.0 - T);
     float rainD, iceF, edge;
@@ -914,7 +942,18 @@ void main(){
   float valid = (pc.w > 0.0 && puv.x > 0.0 && puv.x < 1.0 && puv.y > 0.0 && puv.y < 1.0) ? 1.0 : 0.0;
   vec4 hist = texture(uHist, puv);
   float histD = texture(uHistAux, puv).r;
-  float b2 = uBlend * valid * (1.0 - smoothstep(0.2, 0.5, abs(hist.a - T)));
+  // Clamp history to the 3x3 neighbourhood range: removes speckles and one-frame black/white
+  // pops without smearing real cloud edges as much as a raw temporal blur would.
+  vec2 hx = 1.0 / uCloudRes;
+  vec4 h0 = texture(uHist, puv + vec2(hx.x, 0.0));
+  vec4 h1 = texture(uHist, puv - vec2(hx.x, 0.0));
+  vec4 h2 = texture(uHist, puv + vec2(0.0, hx.y));
+  vec4 h3 = texture(uHist, puv - vec2(0.0, hx.y));
+  vec4 hmin = min(min(hist, h0), min(min(h1, h2), h3));
+  vec4 hmax = max(max(hist, h0), max(max(h1, h2), h3));
+  vec4 histC = clamp(hist, hmin - vec4(0.04), hmax + vec4(0.04));
+  hist = mix(hist, histC, uDenoise);
+  float b2 = mix(uBlend, 0.975, uDenoise) * valid * (1.0 - smoothstep(0.2, 0.5, abs(hist.a - T)));
   float rel = abs(histD - tMean) / max(min(histD, tMean), 200.0);
   b2 *= 1.0 - smoothstep(0.3, 0.9, rel);
   b2 *= 1.0 - 0.9 * uCamCloud;   // inside cloud: trust the (cheap, short) current march
@@ -926,26 +965,32 @@ void main(){
 export const compFrag = /* glsl */ `
 uniform sampler2D uScene; uniform sampler2D uCloudRT; uniform sampler2D uCloudAux;
 uniform float uExposure; uniform float uTime; uniform vec2 uRes; uniform vec2 uCloudRes;
-uniform float uCheapUpsample;
+uniform float uCheapUpsample; uniform float uDenoise;
 varying vec2 vUv;
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
 
 // Edge-aware upsample of the reduced-resolution cloud buffer. A plain bilinear fetch
 // smears cloud edges into blocky steps; weighting the 4 neighbours by scattering-depth
 // similarity keeps the silhouette crisp without ringing.
-const vec2 CLOUD_OFF[8] = vec2[8](
+const vec2 CLOUD_OFF[16] = vec2[16](
   vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
-  vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0)
+  vec2(1.0, 1.0), vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(-1.0, -1.0),
+  vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0),
+  vec2(2.0, 2.0), vec2(-2.0, 2.0), vec2(2.0, -2.0), vec2(-2.0, -2.0)
 );
-const float CLOUD_W[8] = float[8](1.0, 1.0, 1.0, 1.0, 0.55, 0.55, 0.55, 0.55);
+const float CLOUD_W[16] = float[16](
+  1.0, 1.0, 1.0, 1.0, 0.72, 0.72, 0.72, 0.72,
+  0.45, 0.45, 0.45, 0.45, 0.25, 0.25, 0.25, 0.25
+);
 vec4 cloudSample(vec2 uv){
   vec2 tx = 1.0 / uCloudRes;
   vec4 c0 = texture(uCloudRT, uv);
   float d0 = texture(uCloudAux, uv).r;
   vec4 acc = c0 * 2.0;
   float wsum = 2.0;
-  for (int i = 0; i < 8; i++){
-    if (uCheapUpsample > 0.5 && i >= 4) break;   // 4 neighbours instead of 8 during a stall
+  int taps = uCheapUpsample > 0.5 ? 4 : (uDenoise > 0.5 ? 16 : 8);
+  for (int i = 0; i < 16; i++){
+    if (i >= taps) break;
     vec4 c = texture(uCloudRT, uv + CLOUD_OFF[i] * tx);
     float d = texture(uCloudAux, uv + CLOUD_OFF[i] * tx).r;
     // depth similarity keeps the silhouette crisp; transmittance jump rejects cloud/sky bleed
@@ -959,6 +1004,22 @@ vec4 cloudSample(vec2 uv){
 void main(){
   vec3 scene = texture(uScene, vUv).rgb;
   vec4 c = cloudSample(vUv);
+  // A small depth/range-aware bilateral filter removes residual checkerboard and speckle
+  // without crossing cloud/sky boundaries (checked on transmittance and scattering depth).
+  if (uDenoise > 0.01 && uCheapUpsample < 0.5) {
+    vec2 tx = 1.0 / uCloudRes;
+    float d0 = texture(uCloudAux, vUv).r;
+    vec3 rad = vec3(0.0); float wsum = 0.0;
+    for (int i = 0; i < 8; i++) {
+      vec2 uv = vUv + CLOUD_OFF[i] * tx;
+      vec4 q = texture(uCloudRT, uv);
+      float d = texture(uCloudAux, uv).r;
+      float w = CLOUD_W[i] / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
+      w *= 1.0 - 0.75 * smoothstep(0.12, 0.5, abs(q.a - c.a));
+      rad += q.rgb * w; wsum += w;
+    }
+    c.rgb = mix(c.rgb, (c.rgb * 2.0 + rad) / (2.0 + wsum), 0.45 * uDenoise);
+  }
   vec3 col = scene * c.a + c.rgb;
   col *= uExposure;
   col = aces(col);

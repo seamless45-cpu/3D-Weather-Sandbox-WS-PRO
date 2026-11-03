@@ -38,6 +38,7 @@ export default function App() {
   const [sound, setSound] = useState(true);
   const [about, setAbout] = useState(false);
   const [locked, setLocked] = useState(false);
+  const [vehicleMode, setVehicleMode] = useState<'foot' | 'vehicle'>('foot');
   const [, setTick] = useState(0);
   const [touch] = useState(() => typeof window !== 'undefined' && ('ontouchstart' in window || navigator.maxTouchPoints > 0));
   const [perf, setPerf] = useState<string>(() => readTierPref() || 'auto');
@@ -67,6 +68,7 @@ export default function App() {
         const engine = new Engine(canvas, q, terrain, n, NZR);
         const player = new Player(canvas, terrain, spawn);
         player.onLockChange = setLocked;
+        player.onModeChange = setVehicleMode;
         const audio = new AudioEngine();
         audio.start(terrain);
         const worker = new SimWorker();
@@ -107,7 +109,8 @@ export default function App() {
           const now = performance.now();
           const rawDt = Math.max(1e-3, (now - last) / 1000);
           const dt = Math.min(0.1, rawDt); last = now;
-          player.update(dt);
+          player.update(dt, snapRef.current?.tornado);
+          engine.setVehiclePose(player.vehiclePose());
           engine.render(rawDt, { x: player.x, y: player.y, z: player.z, yaw: player.yaw, pitch: player.pitch, fov: player.fov });
           camT += dt; audT += dt;
           if (camT > 0.2) { camT = 0; worker.postMessage({ type: 'cam', x: player.x, z: player.z }); }
@@ -168,6 +171,8 @@ export default function App() {
       eng.stormLoad = 0; eng.cheapMode = false;
       eng.U.uPrecipDensity.value = 1; eng.U.uCheapShadows.value = 0;
       eng.U.uRainIntensity.value = 0; eng.U.uFlashGlow.value = 0; eng.U.uFlashOn.value = 0;
+      eng.U.uHeavyRain.value = 0; eng.U.uTornado.value.set(16000, 16000, 220, 0);
+      eng.tornado = null; eng.vehiclePose = null; eng.heavyRain = 0;
     }
     rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f));
     setLastFlash(null);
@@ -176,6 +181,9 @@ export default function App() {
   const player = rtRef.current?.player;
   const sd = s?.sounding;
   const st = s?.stats;
+  const tor = s?.tornado;
+  const ch = s?.charge;
+  const veh = player?.vehiclePose();
   const heading = player ? (((-player.yaw * 180) / Math.PI) % 360 + 360) % 360 : 0;
   const card = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(heading / 45) % 8];
   const wind = s ? Math.hypot(s.local.u, s.local.v) : 0;
@@ -235,7 +243,7 @@ export default function App() {
               ))}
             </div>
             <button className="hbtn w-full !py-1 !text-[11px]" onClick={start}>▶ enter simulation</button>
-            <div className="mt-2 lbl leading-snug">{touch ? 'Drag: look · Pinch: zoom · Hold ▲▼ to walk' : 'Click view: mouse-look · WASD / arrows: walk · Shift: run · wheel: zoom · Esc: release cursor'}<br />Weather starts clear and evolves from surface heating; storms form only if the environment allows.</div>
+            <div className="mt-2 lbl leading-snug">{touch ? 'Drag: look · Pinch: zoom · Hold ▲▼◀▶ to move · V: vehicle · P: probe' : 'Click view: mouse-look · WASD / arrows: walk · Shift: run · wheel: zoom · V: intercept vehicle · P: deploy probe · Esc: release cursor'}<br />Weather starts clear and evolves from surface heating; storms form only if the environment allows.</div>
           </div>
         </div>
       )}
@@ -269,6 +277,7 @@ export default function App() {
             {SPEEDS.map((v) => <button key={v} className={`hbtn ${speed === v ? 'on' : ''}`} onClick={() => setSpeed(v)}>{v}×</button>)}
             <button className={`hbtn ${envOpen ? 'on' : ''}`} onClick={() => setEnvOpen((o) => !o)} title="Environment and microphysics controls">⚙ env</button>
             <button className="hbtn" onClick={reset} title="Reset to clear sky with the current parameters">⟲ clear</button>
+            <button className={`hbtn ${vehicleMode === 'vehicle' ? 'on' : ''}`} onClick={() => rtRef.current?.player.toggleVehicle()} title="Enter / exit the intercept vehicle">🚙 {vehicleMode === 'vehicle' ? 'exit' : 'drive'}</button>
             <button className={`hbtn ${diagOn ? 'on' : ''}`} onClick={() => setDiagOn((d) => !d)}>diag</button>
             <button className={`hbtn ${sound ? 'on' : ''}`} onClick={() => setSound((d) => !d)}>♪</button>
             <button className="hbtn" onClick={() => setAbout(true)}>i</button>
@@ -281,6 +290,10 @@ export default function App() {
             <div><span className="lbl">SHR0-6</span> {f0(sd?.shear06, 1)} <span className="lbl">m/s</span> <span className="lbl">WMAX</span> {f0(st?.maxW, 1)}</div>
             <div className="text-[#ffd27a]">{s?.mode?.label || '…'}</div>
             <div><span className="lbl">⚡</span> {st?.flashes ?? 0} {flashAge < 20 && <span className="lbl">last {lastFlash.type} {f0(lastFlash.dist / 1000, 1)}km</span>}</div>
+            <div className={tor?.active ? 'text-[#ff9a5a]' : 'lbl'}>
+              {tor?.active ? `🌪 EF${Math.max(0, tor.ef)} ${f0(tor.maxWind, 0)}m/s Δp ${f0(tor.pressureDrop, 0)}hPa · ${f0(tor.distance / 1000, 1)}km` : `🌪 potential ${f0(tor?.potential, 2)} · shear1 ${f0(tor?.shear1, 1)} SRH1 ${f0(tor?.srh1, 1)}`}
+            </div>
+            <div className="lbl">CHARGE sep {f0((st?.chargeSep ?? 0) / 1000, 1)}kC/s · tripole {f0(st?.chargeTripole, 2)} · E {f0((st?.maxE ?? 0) / 1000, 0)}kV/m</div>
           </div>
 
           {/* diagnostics panel */}
@@ -303,6 +316,8 @@ export default function App() {
                   <div><span className="lbl">CLD</span> qc {f0(st.maxQc * 1000, 2)} qi {f0(st.maxQi * 1000, 2)} g/kg · <span className="lbl">PCP</span> qr {f0(st.maxQr * 1000, 1)} qg {f0(st.maxQg * 1000, 1)}</div>
                   <div><span className="lbl">RAIN</span> {f0(st.maxRain, 0)}mm/h · <span className="lbl">CP</span> {f0(st.coldPool * 100, 1)}% (ΔΘ {f0(st.coldPoolMin, 1)}K) · <span className="lbl">UH</span> {f0(st.maxUH)}</div>
                   <div><span className="lbl">ELEC</span> Emax {f0(st.maxE / 1000, 0)}kV/m ({f0(st.maxEratio * 100)}% of breakdown) · Q+ {f0(st.chargePos, 1)}C Q− {f0(st.chargeNeg, 1)}C</div>
+                  <div><span className="lbl">CHARGE</span> NI {f0((ch?.sepRate ?? 0) / 1000, 1)} · IND {f0((ch?.inductiveRate ?? 0) / 1000, 1)} · SCR {f0((ch?.screeningRate ?? 0) / 1000, 1)} kC/s · tripole {f0(ch?.tripole, 2)}</div>
+                  <div><span className="lbl">VORTEX</span> {tor?.active ? `EF${Math.max(0, tor.ef)} ${f0(tor.maxWind, 0)}m/s R ${f0(tor.radius, 0)}m LCL ${km(tor.lcl)}km funnel ${km(tor.funnelBottom)}–${km(tor.funnelTop)}km` : `potential ${f0(tor?.potential, 2)} target ${f0(tor?.target, 2)}`}</div>
                   <div className="mt-0.5 lbl">NUMERICS</div>
                   <div>∇·ρu max {st.maxDiv.toExponential(1)}/s · CFL {f0(st.cfl, 2)} · dt {f0(s.dt, 1)}s · {f0(s.stepMs, 0)}ms/step</div>
                   <div>H₂O budget residual {(st.waterRes * 100).toExponential(1)}% · energy residual {f0(st.energyRes * 100, 1)}% · KE {st.KE.toExponential(1)}J</div>
@@ -330,11 +345,24 @@ export default function App() {
             </div>
           )}
 
+          {vehicleMode === 'vehicle' && veh && (
+            <div className="hud absolute bottom-1.5 right-1.5 z-10 px-1.5 py-1 tabular-nums">
+              <div><b>INTERCEPT</b> <span className="lbl">{f0(veh.speed, 1)}m/s · {f0(veh.speed * 3.6, 0)}km/h · {veh.probe ? 'PROBE OUT' : 'probe stowed'}</span></div>
+              <div className="lbl">vortex {isFinite(veh.distance) ? `${f0(veh.distance / 1000, 2)}km` : '—'} · wind {f0(veh.wind, 0)}m/s · Δp {f0(veh.pressureDrop, 1)}hPa</div>
+              <div className={veh.damage > 0.25 ? 'text-[#ff9a5a]' : 'lbl'}>hull damage {f0(veh.damage * 100, 0)}% · W/S throttle · A/D steer · Space handbrake · P probe</div>
+            </div>
+          )}
           {!touch && !locked && <div className="hud absolute bottom-1.5 left-1/2 z-10 -translate-x-1/2 px-2 py-0.5 lbl">click view to look · WASD walk · wheel zoom</div>}
           {touch && (
-            <div className="absolute bottom-3 right-3 z-10 flex flex-col gap-2">
-              <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(1)}>▲</button>
-              <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(-1)}>▼</button>
+            <div className="absolute bottom-3 right-3 z-10 flex items-end gap-2">
+              <div className="flex flex-col gap-2">
+                <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(1)}>▲</button>
+                <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(-1)}>▼</button>
+              </div>
+              <div className="flex gap-2">
+                <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(0, -1)}>◀</button>
+                <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(0, 1)}>▶</button>
+              </div>
             </div>
           )}
           <div className="pointer-events-none absolute left-1/2 top-1/2 z-10 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-200/40" />
@@ -350,10 +378,11 @@ export default function App() {
               <div className="mb-1 lbl">GPU scene {rtRef.current.engine.profile.scene.toFixed(1)} · cloud {rtRef.current.engine.profile.cloud.toFixed(1)} · comp {rtRef.current.engine.profile.comp.toFixed(1)} ms</div>
             )}
             <p><b>Resolved:</b> 3-D anelastic Navier–Stokes (∇·ρ₀u=0) on a 64×64×36 MAC grid (Δx=500 m, Δz 146→689 m, 32 km periodic box, 15 km lid), momentum + θ + water vapour + 5 hydrometeor species + 2 charge species advected with a mass-weighted TVD (van Leer) flux scheme, buoyancy from virtual potential temperature and condensate loading, exact FFT/tridiagonal pressure projection (div → round-off). Cold pools, gust fronts, updraft tilt and rotation are emergent. Nothing smaller than ~1.5 km is resolved.</p>
-            <p className="mt-1"><b>Parameterised:</b> Deardorff 1.5-order TKE sub-grid closure (entrainment/mixing at cloud edges); surface energy balance (SW with slope/cloud shading, LW, sensible & latent flux, soil moisture, runoff); drag by land-cover roughness; kinematic terrain lifting at the lower boundary; bulk microphysics (Kessler warm rain, Bergeron/WBF deposition, riming, graupel, melting, freezing, evaporation, sedimentation); non-inductive charging (Saunders-type sign reversal at −12 °C, lumped coefficient); effective grid-scale breakdown field = 0.45·E_k(ρ); DBM leader growth on the solved potential; large-scale forcing as weak relaxation of domain-mean wind/θ/moisture and −1.5 K/day radiative cooling.</p>
-            <p className="mt-1"><b>Visual only:</b> advected Perlin-Worley cloud billows with ice/updraft-aware towers and anvils, size-distributed raindrops and snow crystals, crown splashes, overlapping wind-sheared precipitation veils, mitered/tapered lightning ribbons with return strokes and broad cloud illumination, vegetation sway, and thunder synthesis from channel geometry (arrival time r/c, absorption, terrain obstruction).</p>
-            <p className="mt-1"><b>Diagnostics:</b> CAPE/CIN/LCL/LFC/EL from parcel ascent (virtual-temperature buoyancy, pseudo-adiabat) over the live column; validated against Bolton e<sub>s</sub>, Espy LCL and the Weisman–Klemp sounding. Water budget uses surface evaporation, precipitation and nudging fluxes; the energy residual excludes frictional heating and is approximate.</p>
-            <p className="mt-1 lbl">Limitations: periodic box, flat solver levels (terrain via lower-boundary w), single-moment microphysics, no aerosol, no Coriolis. Time-lapse (×N) compresses simulated time, including lightning rate.</p>
+            <p className="mt-1"><b>Parameterised:</b> Deardorff 1.5-order TKE closure; surface energy balance, soil moisture and land-cover drag; kinematic terrain lifting; bulk microphysics with precipitation-efficiency controls; f-plane Coriolis at 38°N; mixed-phase electrification (LWC-dependent charge-sign reversal, inductive charging and a tripole/screening structure carried by heavy and light hydrometeors); effective breakdown field = 0.45·E_k(ρ); DBM leader growth on the solved potential.</p>
+            <p className="mt-1"><b>Sub-grid vortex:</b> tornadogenesis is derived from the simulated low-level vorticity/convergence, 2–5 km updraft helicity, storm-local 0–1 km shear/heighticity, CAPE, LCL and cold pool. A bounded Rankine vortex feeds tangential wind and frictional inflow back into the lowest solver levels before projection; funnel height, core radius, EF-like wind, pressure deficit and debris follow from cyclostrophic balance and cloud base. It is a coupled parameterization, not a resolved LES.</p>
+            <p className="mt-1"><b>Visual / interaction:</b> denoised, temporally-clamped and reprojected Perlin-Worley clouds; six-plane cylindrical rainshafts with hook-echo wrapping and a dry inflow notch; heavier companded precipitation; helical condensation funnel and debris; a player-drivable intercept vehicle with aerodynamic drag, terrain slope limits, vortex wind/pressure/damage telemetry and a deployable probe.</p>
+            <p className="mt-1"><b>Diagnostics:</b> CAPE/CIN/LCL/LFC/EL from parcel ascent over the live column; validated against Bolton e<sub>s</sub>, Espy LCL and the Weisman–Klemp sounding. Water budget uses surface evaporation, precipitation and nudging fluxes; the energy residual excludes frictional heating and is approximate.</p>
+            <p className="mt-1 lbl">Limitations: periodic box, flat solver levels (terrain via lower-boundary w), single-moment microphysics, no aerosol, no nested tornado LES, no resolved cyclone/planetary dynamics. Time-lapse (×N) compresses simulated time, including lightning rate. Realism is prioritised over frame rate on mid/low devices.</p>
           </div>
         </div>
       )}

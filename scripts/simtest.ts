@@ -1,15 +1,16 @@
 /**
  * Headless smoke test for the convective atmosphere core.
  *
- * Usage: npm test -- [cape] [N] [NZ] [hours]
+ * Usage: npm test -- [cape] [N] [NZ] [hours] [--eff=.. --charge=..]
  *   cape   : target surface-based CAPE in J/kg          (default: 2200)
  *   N, NZ  : horizontal / vertical grid points          (default: 64 36)
  *   hours  : simulated hours to integrate               (default: 4)
+ *   flags  : lake, land, spawn, freeze, evap, eff, charge, melt, precipT
  *
  * Runs the analytical thermo validation suite first, then integrates the
- * full 3D model and prints diagnostics every 30 simulated minutes. Exits
- * non-zero if a validation check fails, the preset is unknown, or the
- * solution blows up (non-finite kinetic energy).
+ * full 3D model and prints diagnostics every 30 simulated minutes, including
+ * tornado, charge-separation and tripole diagnostics. Exits non-zero if a
+ * validation check fails or the solution blows up (non-finite kinetic energy).
  */
 import { Atmosphere } from '../src/sim/atmosphere';
 import { runValidation, parcelAscent } from '../src/sim/thermo';
@@ -35,6 +36,8 @@ const params: SimParams = clampParams({
   dropletSpawn: flags.get('spawn') ?? DEFAULT_PARAMS.dropletSpawn,
   freezing: flags.get('freeze') ?? DEFAULT_PARAMS.freezing,
   evaporation: flags.get('evap') ?? DEFAULT_PARAMS.evaporation,
+  precipEfficiency: flags.get('eff') ?? DEFAULT_PARAMS.precipEfficiency,
+  chargeRate: flags.get('charge') ?? DEFAULT_PARAMS.chargeRate,
   melting: flags.get('melt') ?? DEFAULT_PARAMS.melting,
   precipTempC: flags.get('precipT') ?? DEFAULT_PARAMS.precipTempC,
 });
@@ -69,6 +72,9 @@ let flashes = 0;
 let blowup = false;
 let peakW = 0;
 let peakRain = 0;
+let tornadoSeen = false;
+let peakTornado = 0;
+let peakTripole = 0;
 
 while (a.time < tEnd) {
   a.step();
@@ -90,6 +96,9 @@ while (a.time < tEnd) {
     const s = a.stats;
     peakW = Math.max(peakW, s.maxW);
     peakRain = Math.max(peakRain, s.maxRain);
+    tornadoSeen = tornadoSeen || s.tornadoActive > 0;
+    peakTornado = Math.max(peakTornado, s.tornadoIntensity);
+    peakTripole = Math.max(peakTripole, s.chargeTripole);
     console.log(
       `t=${(a.time / 3600).toFixed(2)}h dt=${a.dt.toFixed(1)} step=${((Date.now() - tw) / steps).toFixed(0)}ms ` +
         `maxW=${s.maxW.toFixed(1)}/${s.minW.toFixed(1)} qc=${(s.maxQc * 1e3).toFixed(2)} qi=${(s.maxQi * 1e3).toFixed(2)} ` +
@@ -97,7 +106,9 @@ while (a.time < tEnd) {
         `cp=${s.coldPool.toFixed(3)}/${s.coldPoolMin.toFixed(1)} Ts=${s.meanTs.toFixed(1)} div=${s.maxDiv.toExponential(1)} ` +
         `cfl=${s.cfl.toFixed(2)} wres=${s.waterRes.toExponential(1)} eres=${s.energyRes.toExponential(1)} ` +
         `E=${(s.maxE / 1e3).toFixed(0)}kV/m r=${s.maxEratio.toFixed(2)} fl=${flashes} UH=${s.maxUH.toFixed(0)} ` +
-        `KE=${s.KE.toExponential(1)} chMax=${a.chargeMax.toExponential(1)} Q+=${s.chargePos.toExponential(1)} Q-=${s.chargeNeg.toExponential(1)}`,
+        `KE=${s.KE.toExponential(1)} chMax=${a.chargeMax.toExponential(1)} Q+=${s.chargePos.toExponential(1)} Q-=${s.chargeNeg.toExponential(1)} ` +
+        `TOR=${s.tornadoActive ? `EF${s.tornadoEF} ${s.maxTornadoWind.toFixed(0)}m/s ${s.tornadoPressure.toFixed(0)}hPa` : `pot=${s.tornadoPotential.toFixed(2)}`} ` +
+        `CH=${(s.chargeSep / 1e3).toFixed(1)}kC/s tri=${s.chargeTripole.toFixed(2)}`,
     );
     if (!isFinite(s.KE)) {
       console.log('BLOWUP');
@@ -109,7 +120,8 @@ while (a.time < tEnd) {
 
 console.log(
   `total ${Date.now() - tw} ms, steps ${steps}, sim ${(hours).toFixed(2)} h, ` +
-    `flashes ${flashes}, peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h`,
+    `flashes ${flashes}, peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h, ` +
+  `tornado ${tornadoSeen ? 'YES' : 'no'}, peak vortex ${peakTornado.toFixed(2)}, peak tripole ${peakTripole.toFixed(2)}`,
 );
 console.log(blowup ? 'RESULT: FAIL (blow-up)' : failed ? `RESULT: FAIL (${failed} validation checks)` : 'RESULT: PASS');
 process.exit(blowup || failed ? 1 : 0);

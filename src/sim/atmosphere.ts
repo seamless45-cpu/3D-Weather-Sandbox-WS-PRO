@@ -12,6 +12,8 @@ import { Poisson } from './fft';
 import { Terrain, columnProps, ColumnProps } from './terrain';
 import { sunState } from './sun';
 import { microphysics, sedimentation, chargeDecay } from './micro';
+import { chargeSeparation, emptyChargeDiagnostics, type ChargeDiagnostics } from './charging';
+import { TornadoSystem } from './tornado';
 import { tryLightning } from './lightning';
 
 export interface Stats {
@@ -19,6 +21,8 @@ export interface Stats {
   maxE: number; maxEratio: number; KE: number; waterRes: number; energyRes: number; maxDiv: number; cfl: number;
   cloudFrac: number; coldPool: number; coldPoolMin: number; meanTs: number; maxUH: number; precipCum: number; flashes: number;
   waterTotal: number; chargePos: number; chargeNeg: number; maxCape: number;
+  tornadoActive: number; tornadoIntensity: number; tornadoPotential: number; tornadoEF: number;
+  maxTornadoWind: number; tornadoPressure: number; chargeSep: number; chargeTripole: number;
 }
 
 export class Atmosphere {
@@ -40,6 +44,7 @@ export class Atmosphere {
   bufX: Float32Array; fluxX: Float32Array; fluxPlane: Float32Array;
   time = 11 * 3600; dt = 4; step_n = 0; rng: () => number;
   anyHydro = false; chargeMax = 0; flashEvents: any[] = [];
+  tornado = new TornadoSystem(); chargeDiag: ChargeDiagnostics = emptyChargeDiagnostics();
   precipCum = 0; iceGroundCum = 0; evapCum = 0; nudgeWater = 0; w0Total = 0; mse0 = 0; srcEnergy = 0; flashCount = 0;
   stats: Stats; sunSin = 0; sunDirV: [number, number, number] = [0, 1, 0]; cflRate = 0;
   lastLightningT = -1e9;
@@ -461,6 +466,9 @@ export class Atmosphere {
     const g = this.g, pr = this.prof;
     const rho0 = this.rhoC[0], dz0 = g.dz[0], Pi0 = pr.pi[0];
     const area = g.dx * g.dy;
+    // f-plane Coriolis at the storm's nominal 38 N latitude. Add the inertial tendency after the
+    // synoptic relaxation so background shear and storm-relative helicity stay consistent.
+    const fCor = 2 * 7.2921159e-5 * Math.sin(38 * Math.PI / 180);
     // surface fluxes into lowest layer; drag
     for (let ij = 0; ij < nxy; ij++) {
       this.th[ij] += (this.Hf[ij] * dt) / (rho0 * CP * Pi0 * dz0);
@@ -493,7 +501,10 @@ export class Atmosphere {
       const sf = 1 / (1 + sponge * dt);
       for (let ij = 0; ij < nxy; ij++) {
         const c = k * nxy + ij;
-        this.uc[c] += du; this.vc[c] += dv; this.th[c] += dth; this.qv[c] += dq;
+        const uOld = this.uc[c], vOld = this.vc[c];
+        this.uc[c] = uOld + du + fCor * vOld * dt;
+        this.vc[c] = vOld + dv - fCor * uOld * dt;
+        this.th[c] += dth; this.qv[c] += dq;
         this.wc[c] *= sf;
       }
       const m = this.rhoC[k] * g.dz[k] * area * nxy;
@@ -660,8 +671,14 @@ export class Atmosphere {
     this.forcing(dt);
     this.facesFromCentered();
     microphysics(this, dt);
+    // Electrification is computed from the updated hydrometeor spectra, before sedimentation
+    // carries graupel/ice charge downward and conductivity relaxes the screening layers.
+    chargeSeparation(this, dt);
     sedimentation(this, dt);
     if (this.chargeMax > 1e-16 || this.anyHydro) chargeDecay(this, dt);
+    // Sub-grid vortex feedback is applied before buoyancy/terrain BC/projection so the pressure
+    // solve removes spurious divergence from the convergent Rankine inflow.
+    this.tornado.update(this, dt);
     this.buoyancy(dt);
     this.terrainBC();
     this.project(dt);
@@ -748,6 +765,12 @@ export class Atmosphere {
     S.cloudFrac = cloudCols / nxy; S.coldPool = cp / nxy; S.coldPoolMin = cpMin; S.meanTs = tsSum / nxy - 273.15;
     S.maxUH = uhMax; S.precipCum = this.precipCum; S.flashes = this.flashCount;
     S.chargePos = qpos; S.chargeNeg = qneg;
+    const T = this.tornado.state;
+    S.tornadoActive = T.active ? 1 : 0; S.tornadoIntensity = T.intensity; S.tornadoPotential = T.potential;
+    S.tornadoEF = T.active ? T.ef : -1; S.maxTornadoWind = T.active ? T.maxWind : 0;
+    S.tornadoPressure = T.active ? T.pressureDrop : 0;
+    S.chargeSep = this.chargeDiag.sepRate + this.chargeDiag.inductiveRate + this.chargeDiag.screeningRate;
+    S.chargeTripole = this.chargeDiag.tripole;
     const expected = this.w0Total + this.evapCum - this.precipCum + this.nudgeWater;
     S.waterRes = (water - expected) / Math.max(1, this.w0Total);
     const dM = this.totalMSE() - this.mse0;
@@ -776,6 +799,7 @@ export class Atmosphere {
     this.prof = buildProfile(this.g, this.env);
     this.rhoC = this.prof.rho; this.rhoF = this.prof.rhoF;
     this.rng = mulberry32((Math.random() * 1e9) | 0);
+    this.tornado.reset(); this.chargeDiag = emptyChargeDiagnostics();
     this.buildSolvers();
     for (let k = 0; k < this.nz; k++) for (let ij = 0; ij < this.nxy; ij++) this.M0[k * this.nxy + ij] = this.rhoC[k];
     this.init();
