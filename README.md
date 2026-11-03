@@ -80,31 +80,31 @@ the whole screen first.
 ### Cloud, precipitation and lightning visuals
 
 Cloud shape is no longer a direct copy of the 500 m solver cells. The renderer combines the simulated
-condensate, ice fraction, rain and updraft with an advected tileable Perlin-Worley volume: broad
-cellular billows, domain-warped edges, softer density cutoffs and a height/ice profile that keeps
-convective towers upright while flattening anvils. Lighting adds rim-lit silver edges, darker rainy
-bases, warmer low-sun tones and a broad flash glow through the whole cloud body.
+condensate, ice fraction, rain and updraft with an advected **domain-periodic** Perlin-Worley volume:
+6 broad tiles, 32 billow tiles and 128 detail tiles per 32 km domain. Every noise scale divides the
+solver box by an integer, so wrapping camera/wind coordinates no longer produces a seam or a sudden
+replacement of one cloud structure by another. Coherent low-level bands, upright updraft towers and
+flattened ice anvils replace the old uniform noise-blob coverage. Smooth vertical and horizon
+extinction replaces the hard 15 km lid / 45 km ray-march box, and the engulfed-camera branch is
+continuous instead of a binary switch. A lower history blend prevents obsolete cloud fields from
+ghosting back into view; reprojection still suppresses grain. Lighting adds rim-lit silver edges,
+darker rainy bases, warmer low-sun tones and a broad flash glow through the whole cloud body.
 
 Precipitation is split into individually sized drops and crystals near the camera and six
 fixed-azimuth, wind-sheared planes per distant column that overlap into cylindrical rainshafts
-rather than camera-facing billboards. The 8-bit rain channels use a soft-knee companding curve, so
-violent 60–150 mm/h cores remain distinct instead of all clipping to one value. A precipitation
-efficiency control scales collision-coalescence, accretion and riming, while reduced rain
- evaporation lets heavy cores survive to the ground; `uHeavyRain` raises drop survival, length,
-splash density and shaft opacity together. Drops follow a skewed size distribution (many small,
-a few large), fall at size-dependent speeds, drift differently with wind, and render as tapered
-teardrops with a refracted highlight rather than uniform white lines. Frozen particles become
-six-arm crystals; splashes get irregular crowns and secondary droplets. The distant veils use
-advected 3-D noise plus anisotropic falling filaments and soft multi-lobe edges, so the billboard
-outline does not read as a grey card.
-
-Lightning uses a bidirectional DBM leader with a descending/ascending bias, smoother forward-cone
-growth and shallow, order-limited forks. Each rendered channel is a continuous camera-facing ribbon
-with mitered joints, width taper, leader beads, multiple return strokes, continuing current and
-per-segment flicker. Cloud/ground point lights are joined by a broad, decaying sky and cloud glow,
-so a flash lights the storm instead of only the bolt itself. These are visual refinements: the
-solver still produces the channel geometry and the thunder is still synthesised from it.
-
+rather than camera-facing billboards. The solver now defaults to `precipEfficiency = 4.2` and
+`evaporation = 0.28`, the worker's 8-bit rain channels use a soft-knee companding curve, and
+`heavyRain` reaches full strength at 55 mm/h rather than 95 mm/h. Drop, splash and shaft budgets
+are roughly doubled, `uPrecipDensity` no longer culls particles during a storm, local rain intensity
+uses an exponential response instead of a 45 mm/h linear scale, and fog shortens more under heavy
+rain. Distant curtains are wider, brighter and visible from about 20 m out to 28 km: the old
+120–650 m near fade that erased shafts directly under the storm has been removed. Shaft noise uses
+integer domain tiles, and the obsolete shaft geometry bounding sphere is gone. Drops follow a
+skewed size distribution (many small, a few large), fall at size-dependent speeds, drift differently
+with wind, and render as tapered teardrops with a refracted highlight rather than uniform white
+lines. Frozen particles become six-arm crystals; splashes get irregular crowns and secondary
+droplets. The distant veils use advected 3-D noise plus anisotropic falling filaments and soft
+multi-lobe edges, so the billboard outline does not read as a grey card.
 
 ### Tornadoes, charge separation and intercept vehicle
 
@@ -131,8 +131,9 @@ Cloud grain is attacked from three directions at once: a mostly static per-pixel
 plus reduced temporal jitter, neighbourhood-min/max clamping of the reprojected history, a 16-tap
 depth/transmittance-weighted upsample, and a small bilateral radiance filter in the composite. The
 fixed step hash no longer varies per frame, fine erosion is damped, and `uDenoise` raises the
-history blend while suppressing speckle/flicker/blocky cloud patches. The renderer still uses MRT
-scattering depth for temporal reprojection and edge-aware upsampling.
+history blend while suppressing speckle/flicker/blocky cloud patches. The main history weight is
+0.92 rather than 0.955 so a changed condensate snapshot cannot leave a stale formation behind.
+The renderer still uses MRT scattering depth for temporal reprojection and edge-aware upsampling.
 
 The intercept vehicle is player-driven (`src/controls.ts`): a bicycle-model truck with throttle,
 braking, drag, steering, handbrake, terrain-slope traction limits, suspension roll and a deployable

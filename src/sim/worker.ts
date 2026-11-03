@@ -129,7 +129,9 @@ function updateWindOffsets(a: Atmosphere, dtSim: number) {
     const k = Math.min(a.nz - 1, Math.floor((b + 0.5) / B * a.nz));
     const u = windW[b] > 1e-4 ? windU[b] / windW[b] : a.prof.u[k];
     const v = windW[b] > 1e-4 ? windV[b] / windW[b] : a.prof.v[k];
-    windOff[b * 2] += u * dtSim; windOff[b * 2 + 1] += v * dtSim;
+    const wrap = (v: number) => ((v % DOMAIN) + DOMAIN) % DOMAIN;
+    windOff[b * 2] = wrap(windOff[b * 2] + u * dtSim);
+    windOff[b * 2 + 1] = wrap(windOff[b * 2 + 1] + v * dtSim);
   }
 }
 
@@ -156,7 +158,7 @@ function snapshot() {
     cloud, surf, windOff: windOff.slice(), stats: { ...a.stats }, sounding: snd, mode, capeMean: capeM.mean, capeMax: capeM.max,
     diag: d, local: { u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn, wetness: a.soilM[ij], surfW: a.surfW[ij] },
     tornado: a.tornado.snapshot(cam.x, cam.z), charge: { ...a.chargeDiag },
-    heavyRain: Math.min(1, a.stats.maxRain / 95),
+    heavyRain: Math.min(1, a.stats.maxRain / 55),
     sunSin: a.sunSin, empty: emptyTex, snowLevel: precipTypeHeight(a), params: a.params, envCape: a.env.cape,
   };
   const transfer: Transferable[] = [cloud.buffer as ArrayBuffer, surf.buffer as ArrayBuffer];
