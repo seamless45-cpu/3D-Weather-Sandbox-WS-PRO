@@ -19,9 +19,9 @@ export interface Quality {
 export function qualityFor(tier: Tier): Quality {
   // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
   // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
-  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.62, stepScale: 2.2, minCloudScale: 0.45, M: 256, rain: 2200, treeGrid: 16, msaa: 0, splashes: true, shafts: 12, steps: 30, maxPixels: 1.4e6, maxCloudPixels: 0.9e6 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.72, stepScale: 1.3, minCloudScale: 0.50, M: 256, rain: 6500, treeGrid: 28, msaa: 0, splashes: true, shafts: 24, steps: 64, maxPixels: 2.6e6, maxCloudPixels: 1.4e6 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.9, stepScale: 1.0, minCloudScale: 0.62, M: 256, rain: 14000, treeGrid: 56, msaa: 2, splashes: true, shafts: 32, steps: 96, maxPixels: 4.2e6, maxCloudPixels: 2.2e6 };
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.62, stepScale: 2.2, minCloudScale: 0.45, M: 256, rain: 5000, treeGrid: 16, msaa: 0, splashes: true, shafts: 18, steps: 30, maxPixels: 1.4e6, maxCloudPixels: 0.9e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.72, stepScale: 1.3, minCloudScale: 0.50, M: 256, rain: 14000, treeGrid: 28, msaa: 0, splashes: true, shafts: 32, steps: 64, maxPixels: 2.6e6, maxCloudPixels: 1.4e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.9, stepScale: 1.0, minCloudScale: 0.62, M: 256, rain: 26000, treeGrid: 56, msaa: 2, splashes: true, shafts: 44, steps: 96, maxPixels: 4.2e6, maxCloudPixels: 2.2e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -96,9 +96,9 @@ export function detectQuality(): Quality {
     q.steps = Math.min(q.steps, 52);
     q.maxPixels = Math.min(q.maxPixels, 2.2e6);
     q.maxCloudPixels = Math.min(q.maxCloudPixels, 1.1e6);
-    q.rain = Math.min(q.rain, 5000);
+    q.rain = Math.min(q.rain, 8000);
     q.treeGrid = Math.min(q.treeGrid, 36);
-    q.shafts = Math.min(q.shafts, 20);
+    q.shafts = Math.min(q.shafts, 24);
     q.msaa = 0;
   }
   return q;
@@ -246,7 +246,7 @@ export class Engine {
     this.treeMesh.frustumCulled = false; this.treeMesh.renderOrder = 1; this.scene.add(this.treeMesh);
 
     // ---- precipitation shafts (one billboard per column, from the ground into the cloud base)
-    this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(8, Math.min(q.shafts, nx >> 1))), mk(S.shaftVert, S.shaftFrag, {
+    this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(12, Math.min(q.shafts, nx))), mk(S.shaftVert, S.shaftFrag, {
       uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 }, uNoise: { value: this.noiseTex },
     }, { transparent: true, depthWrite: false }));
     this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
@@ -327,7 +327,6 @@ export class Engine {
     g.setAttribute('aCol', new THREE.BufferAttribute(col, 4));
     g.setAttribute('aCorner', new THREE.BufferAttribute(corner, 2));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
-    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(DOMAIN / 2, 4000, DOMAIN / 2), DOMAIN);
     return g;
   }
 
@@ -448,7 +447,14 @@ export class Engine {
     (this.cloudTex.image.data as Uint8Array).set(s.cloud); this.cloudTex.needsUpdate = true;
     (this.surfTex.image.data as Uint8Array).set(s.surf); this.surfTex.needsUpdate = true;
     const dtr = Math.max(0.03, realNow - this.offT);
-    for (let i = 0; i < 32; i++) { this.offVel[i] = (s.windOff[i] - this.offCur[i]) / dtr; this.offCur[i] = s.windOff[i]; }
+    for (let i = 0; i < 32; i++) {
+      const target = s.windOff[i];
+      let d = target - this.offCur[i];
+      if (d > DOMAIN * 0.5) d -= DOMAIN;
+      else if (d < -DOMAIN * 0.5) d += DOMAIN;
+      this.offVel[i] = d / dtr;
+      this.offCur[i] = target;
+    }
     this.offT = realNow;
     this.lastSimTime = s.time;
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
@@ -461,7 +467,7 @@ export class Engine {
     const cf = typeof s.stats?.cloudFrac === 'number' ? s.stats.cloudFrac : 0;
     const cores = typeof s.mode?.cores === 'number' ? s.mode.cores : 0;
     const rain = typeof s.stats?.maxRain === 'number' ? s.stats.maxRain : 0;
-    this.heavyRain = typeof s.heavyRain === 'number' ? s.heavyRain : Math.min(1, rain / 95);
+    this.heavyRain = Math.min(1, (typeof s.heavyRain === 'number' ? s.heavyRain : Math.min(1, rain / 55)) * 1.35);
     const load = Math.min(1, 0.45 * Math.min(1, cf / 0.5) + 0.4 * Math.min(1, cores / 8) + 0.15 * Math.min(1, rain / 80));
     this.stormLoad += (load - this.stormLoad) * 0.45;
   }
@@ -656,7 +662,7 @@ export class Engine {
     const mixK = Math.min(1, rawDt * 6);
     U.uCheapShadows.value += (cheap - U.uCheapShadows.value) * mixK;
     // Heavy rain must get denser, not thinner: storm load only trims in the emergency cheap path.
-    const density = Math.max(0.65, (1 - 0.15 * this.stormLoad + 0.25 * this.heavyRain) * (this.cheapMode ? 0.85 : 1));
+    const density = Math.max(1.0, (1.0 + 0.7 * this.heavyRain - 0.04 * this.stormLoad) * (this.cheapMode ? 0.96 : 1));
     U.uPrecipDensity.value += (density - U.uPrecipDensity.value) * Math.min(1, rawDt * 4);
     this.cloudMat.uniforms.uDetail.value = this.cheapMode ? 0 : 1;
     this.cloudMat.uniforms.uCheapLight.value = cheap;
@@ -700,9 +706,9 @@ export class Engine {
     U.uSkyAmb.value.set(lt.skyAmb[0], lt.skyAmb[1], lt.skyAmb[2]).multiplyScalar(0.55 + 0.45 * dim);
     U.uHorizon.value.set(...lt.horizon); U.uGroundAmb.value.set(...lt.groundAmb); U.uTwilight.value = lt.twilight;
     U.uTime.value = this.time;
-    U.uVis.value = Math.max(2400, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.075 * this.rainAtCam + 0.8 * this.heavyRain));
+    U.uVis.value = Math.max(2400, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.11 * this.rainAtCam + 1.15 * this.heavyRain));
     // Local rain drives how many near-camera drops survive and how bright the veils are.
-    U.uRainIntensity.value = Math.max(0, Math.min(1, this.rainAtCam / 45));
+    U.uRainIntensity.value = Math.max(0, Math.min(1, 1 - Math.exp(-this.rainAtCam / 18)));
     U.uCamXZ.value.set(cam.x, cam.z);
     // camera engulfed by condensate: lets the surface shaders skip their cloud-shadow stack
     U.uCamCloud.value = this.camCloudAt(cam.x, cam.y, cam.z);
@@ -749,9 +755,13 @@ export class Engine {
     this.compMat.uniforms.uTime.value = this.time;
 
     // ---- cloud noise advection offsets (extrapolated between snapshots)
-    const dts = Math.min(0.4, (nowMs / 1000 - this.offT));
+    const dts = Math.min(0.4, Math.max(0, nowMs / 1000 - this.offT));
     const wo = this.cloudMat.uniforms.uWindOff.value as THREE.Vector2[];
-    for (let b = 0; b < 16; b++) wo[b].set(this.offCur[b * 2] + this.offVel[b * 2] * dts, this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts);
+    const wrap = (v: number) => ((v % DOMAIN) + DOMAIN) % DOMAIN;
+    for (let b = 0; b < 16; b++) {
+      wo[b].set(wrap(this.offCur[b * 2] + this.offVel[b * 2] * dts),
+                wrap(this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts));
+    }
 
     this.pollTimer(0, 'scene'); this.pollTimer(1, 'cloud'); this.pollTimer(2, 'comp');
     // ---- pass 1: scene
@@ -765,7 +775,8 @@ export class Engine {
     const cm = this.cloudMat.uniforms;
     const ang = Math.hypot(cam.yaw - this.lastAng[0], cam.pitch - this.lastAng[1]) / rawDt;
     this.lastAng = [cam.yaw, cam.pitch];
-    let blend = 0.955 * Math.exp(-ang * 1.2);
+    // Lower history weight: stale cloud formations should not ghost or reappear.
+    let blend = 0.92 * Math.exp(-ang * 1.2);
     if (this.cheapMode) blend = Math.min(0.975, blend * 1.02);   // lean on temporal history
     if (this.flashLevel > 0.05) blend *= 0.35;
     cm.uBlend.value = this.frame < 3 ? 0 : blend;
@@ -861,5 +872,11 @@ export class Engine {
     this.makeCloudRT(Math.floor(sz.x * pr), Math.floor(sz.y * pr));
   }
 
+  reset(){
+    this.frame = 0; this.denoise = 0;
+    for (let i = 0; i < 32; i++) { this.offCur[i] = 0; this.offVel[i] = 0; }
+    if (this.cloudTex) { (this.cloudTex.image.data as Uint8Array).fill(0); this.cloudTex.needsUpdate = true; }
+    if (this.surfTex) { (this.surfTex.image.data as Uint8Array).fill(0); this.surfTex.needsUpdate = true; }
+  }
   dispose() { this.renderer.dispose(); }
 }
