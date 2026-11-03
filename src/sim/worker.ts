@@ -12,14 +12,29 @@ const NZR = 48; // layers of the uniform-height cloud texture sent to the render
 let atm: Atmosphere | null = null;
 let paused = false, speed = 30;
 let cam = { x: DOMAIN / 2, z: DOMAIN / 2 };
-let diag: { field: DiagField; mode: 'h' | 'v'; level: number } = { field: 'w', mode: 'h', level: 6 };
-let budget = 0, lastT = 0, lastSnap = 0, simAdv = 0, realAcc = 0, actualSpeed = 0, stepMs = 0;
+let diag: { field: DiagField; mode: 'h' | 'v'; level: number; enabled: boolean } = { field: 'w', mode: 'h', level: 6, enabled: false };
+let budget = 0, lastT = 0, lastSnap = 0, simAdv = 0, realAcc = 0, actualSpeed = 0, stepMs = 0, lastStepMs = 0;
 let capeM: ReturnType<typeof capeMap> | null = null;
-let lastCape = -1;
+let lastCape = -1, lastCapeReal = 0, capeStride = 4;
+let lastFlashPost = 0;
 let windOff = new Float32Array(32);
 let lastSnapSimTime = 0;
 let emptyTex = false;
+let cloudBytes = 0, surfBytes = 0;
 let layerK0 = new Int32Array(NZR), layerW = new Float32Array(NZR);
+
+// Snapshot buffers are recycled by the main thread after the GPU copy. A storm used to allocate
+// and transfer ~800 kB of cloud texture plus diagnostics four times a second, causing GC hitches.
+const cloudPool: ArrayBuffer[] = [], surfPool: ArrayBuffer[] = [];
+const windW = new Float64Array(16), windU = new Float64Array(16), windV = new Float64Array(16);
+
+function takeBuffer(pool: ArrayBuffer[], bytes: number): ArrayBuffer {
+  while (pool.length) {
+    const b = pool.pop()!;
+    if (b.byteLength === bytes) return b;
+  }
+  return new ArrayBuffer(bytes);
+}
 
 /** Height of the user's precipitation-type threshold (below it, precipitation falls frozen). */
 function precipTypeHeight(a: Atmosphere): number {
@@ -45,44 +60,49 @@ function setupLayers(a: Atmosphere) {
   }
 }
 
-function buildClouds(a: Atmosphere): Uint8Array {
-  const { nx, ny, nxy } = a;
-  const out = new Uint8Array(nx * ny * NZR * 4);
+/** Build the renderer's RGBA cloud volume. Clamped arrays remove four clamp+round calls per texel. */
+function buildClouds(a: Atmosphere): Uint8ClampedArray {
+  const { nxy } = a;
+  const out = new Uint8ClampedArray(takeBuffer(cloudPool, cloudBytes));
+  out.fill(0);
   if (!a.anyHydro) { emptyTex = true; return out; }
   emptyTex = false;
-  const cl = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const qc = a.qc, qi = a.qi, qs = a.qs, qr = a.qr, qg = a.qg, w = a.w, col = a.colHydro;
   for (let ij = 0; ij < nxy; ij++) {
-    if (!a.colHydro[ij]) continue;
+    if (!col[ij]) continue;
     for (let m = 0; m < NZR; m++) {
-      const k0 = layerK0[m], f = layerW[m];
+      const k0 = layerK0[m], f = layerW[m], inv = 1 - f;
       const c0 = k0 * nxy + ij, c1 = c0 + nxy;
-      const g = (arr: Float32Array) => arr[c0] * (1 - f) + arr[c1] * f;
-      const qc = g(a.qc), qi = g(a.qi), qs = g(a.qs), qr = g(a.qr), qg = g(a.qg);
-      const cond = qc + qi + 0.25 * qs;
-      const pr = qr + 0.6 * qg + 0.15 * qs;
+      const vqc = qc[c0] * inv + qc[c1] * f;
+      const vqi = qi[c0] * inv + qi[c1] * f;
+      const vqs = qs[c0] * inv + qs[c1] * f;
+      const vqr = qr[c0] * inv + qr[c1] * f;
+      const vqg = qg[c0] * inv + qg[c1] * f;
+      const cond = vqc + vqi + 0.25 * vqs;
+      const pr = vqr + 0.6 * vqg + 0.15 * vqs;
       if (cond < 1e-7 && pr < 1e-7) continue;
-      const w = 0.25 * (a.w[c0] + a.w[c0 + nxy]) * (1 - f) + 0.25 * (a.w[c1] + a.w[c1 + nxy]) * f + 0;
+      const vw = 0.25 * (w[c0] + w[c0 + nxy]) * inv + 0.25 * (w[c1] + w[c1 + nxy]) * f;
       const o = (m * nxy + ij) * 4;
-      out[o] = Math.round(255 * cl(cond / 0.0035));
-      out[o + 1] = Math.round(255 * cl(pr / 0.004));
-      out[o + 2] = Math.round(255 * cl((qi + qs + qg) / (qc + qi + qs + qg + 1e-9)));
-      out[o + 3] = Math.round(255 * cl(0.5 + (2 * w) / 30));
+      out[o] = 255 * (cond / 0.0035);
+      out[o + 1] = 255 * (pr / 0.004);
+      out[o + 2] = 255 * ((vqi + vqs + vqg) / (vqc + vqi + vqs + vqg + 1e-9));
+      out[o + 3] = 255 * (0.5 + (2 * vw) / 30);
     }
   }
   return out;
 }
 
-function buildSurf(a: Atmosphere): Uint8Array {
+function buildSurf(a: Atmosphere): Uint8ClampedArray {
   const { nxy } = a;
-  const out = new Uint8Array(nxy * 4);
+  const out = new Uint8ClampedArray(takeBuffer(surfPool, surfBytes));
   let mean = 0;
   for (let ij = 0; ij < nxy; ij++) mean += a.th[ij];
   mean /= nxy;
   for (let ij = 0; ij < nxy; ij++) {
-    out[ij * 4] = Math.round(255 * Math.min(1, a.soilM[ij]));
-    out[ij * 4 + 1] = Math.min(255, Math.round(a.rainRate[ij] * 5));
-    out[ij * 4 + 2] = Math.min(255, Math.round((a.surfW[ij] / 3) * 255));
-    out[ij * 4 + 3] = Math.round(255 * Math.min(1, Math.max(0, (mean - a.th[ij]) / 4)));
+    out[ij * 4] = 255 * a.soilM[ij];
+    out[ij * 4 + 1] = a.rainRate[ij] * 5;
+    out[ij * 4 + 2] = (a.surfW[ij] / 3) * 255;
+    out[ij * 4 + 3] = 255 * ((mean - a.th[ij]) / 4);
   }
   return out;
 }
@@ -90,7 +110,7 @@ function buildSurf(a: Atmosphere): Uint8Array {
 function updateWindOffsets(a: Atmosphere, dtSim: number) {
   const { nxy } = a;
   const B = 16;
-  const sw = new Float64Array(B), su = new Float64Array(B), sv = new Float64Array(B);
+  windW.fill(0); windU.fill(0); windV.fill(0);
   if (a.anyHydro) {
     for (let k = 0; k < a.nz; k++) {
       const b = Math.min(B - 1, Math.floor((a.g.zc[k] / ZTOP) * B));
@@ -98,39 +118,66 @@ function updateWindOffsets(a: Atmosphere, dtSim: number) {
         if (!a.colHydro[ij]) continue;
         const c = k * nxy + ij;
         const w = a.qc[c] + a.qi[c] + 0.25 * a.qs[c];
-        if (w > 1e-6) { sw[b] += w; su[b] += w * a.uc0[c]; sv[b] += w * a.vc0[c]; }
+        if (w > 1e-6) { windW[b] += w; windU[b] += w * a.uc0[c]; windV[b] += w * a.vc0[c]; }
       }
     }
   }
   for (let b = 0; b < B; b++) {
     const k = Math.min(a.nz - 1, Math.floor((b + 0.5) / B * a.nz));
-    const u = sw[b] > 1e-4 ? su[b] / sw[b] : a.prof.u[k];
-    const v = sw[b] > 1e-4 ? sv[b] / sw[b] : a.prof.v[k];
+    const u = windW[b] > 1e-4 ? windU[b] / windW[b] : a.prof.u[k];
+    const v = windW[b] > 1e-4 ? windV[b] / windW[b] : a.prof.v[k];
     windOff[b * 2] += u * dtSim; windOff[b * 2 + 1] += v * dtSim;
   }
 }
 
-function snapshot(forceDiag = false) {
+function snapshot() {
   const a = atm!;
   const ci = Math.min(a.nx - 1, Math.max(0, Math.floor(cam.x / a.g.dx))), cj = Math.min(a.ny - 1, Math.max(0, Math.floor(cam.z / a.g.dy)));
   updateWindOffsets(a, a.time - lastSnapSimTime); lastSnapSimTime = a.time;
   const cloud = buildClouds(a);
   const surf = buildSurf(a);
   const snd = localSounding(a, ci, cj);
-  if (a.step_n - lastCape >= 8 || !capeM) { capeM = capeMap(a); lastCape = a.step_n; }
+  // CAPE parcels are the most expensive per-column diagnostic. Four-times decimation and a
+  // real-time throttle keep a 64x64 storm from running ~600k saturation solves every few steps.
+  const nowReal = performance.now();
+  if (!capeM || (nowReal - lastCapeReal > 2500 && a.step_n - lastCape >= 8)) {
+    capeM = capeMap(a, capeStride); lastCape = a.step_n; lastCapeReal = nowReal;
+  }
   const mode = stormMode(a, snd);
   a.stats.maxCape = capeM.max;
-  const d = diagSlice(a, diag.field, diag.mode, diag.level, ci, cj, capeM);
-  void forceDiag;
+  const d = diag.enabled ? diagSlice(a, diag.field, diag.mode, diag.level, ci, cj, capeM) : null;
   const ij = cj * a.nx + ci;
   const sfcU = 0.5 * (a.u[ij] + a.u[cj * a.nx + (ci + 1) % a.nx]), sfcV = 0.5 * (a.v[ij] + a.v[((cj + 1) % a.ny) * a.nx + ci]);
-  const msg = {
+  const msg: any = {
     type: 'snap', time: a.time, speed: actualSpeed, stepMs, dt: a.dt, paused,
     cloud, surf, windOff: windOff.slice(), stats: { ...a.stats }, sounding: snd, mode, capeMean: capeM.mean, capeMax: capeM.max,
     diag: d, local: { u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn, wetness: a.soilM[ij], surfW: a.surfW[ij] },
     sunSin: a.sunSin, empty: emptyTex, snowLevel: precipTypeHeight(a), params: a.params, envCape: a.env.cape,
   };
-  ctx.postMessage(msg, [cloud.buffer, surf.buffer, d.data.buffer, d.ua.buffer, d.va.buffer]);
+  const transfer: Transferable[] = [cloud.buffer as ArrayBuffer, surf.buffer as ArrayBuffer];
+  if (d) transfer.push(d.data.buffer as ArrayBuffer, d.ua.buffer as ArrayBuffer, d.va.buffer as ArrayBuffer);
+  ctx.postMessage(msg, transfer);
+}
+
+/** Keep the nearest flash from a burst; the solver still handles every breakdown event. */
+function postFlashEvents() {
+  const events = atm!.flashEvents;
+  if (!events.length) return;
+  const nowReal = performance.now();
+  if (nowReal - lastFlashPost > 180) {
+    let pick = events[0], bestD2 = Infinity;
+    for (const e of events) {
+      const x = ((e.init[0] % DOMAIN) + DOMAIN) % DOMAIN;
+      const z = ((e.init[2] % DOMAIN) + DOMAIN) % DOMAIN;
+      let dx = Math.abs(x - cam.x), dz = Math.abs(z - cam.z);
+      dx = Math.min(dx, DOMAIN - dx); dz = Math.min(dz, DOMAIN - dz);
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; pick = e; }
+    }
+    ctx.postMessage({ type: 'flash', event: pick }, [pick.segs.buffer as ArrayBuffer]);
+    lastFlashPost = nowReal;
+  }
+  events.length = 0;
 }
 
 function loop() {
@@ -141,23 +188,22 @@ function loop() {
     if (!paused) {
       budget += realDt * speed;
       const t0 = performance.now();
-      let n = 0;
       while (budget >= atm.dt && performance.now() - t0 < 25) {
         const s0 = performance.now();
         atm.step();
-        stepMs = 0.9 * stepMs + 0.1 * (performance.now() - s0);
-        budget -= atm.dt; simAdv += atm.dt; n++;
-        if (atm.flashEvents.length) {
-          for (const e of atm.flashEvents) ctx.postMessage({ type: 'flash', event: e }, [e.segs.buffer]);
-          atm.flashEvents.length = 0;
-        }
+        lastStepMs = performance.now() - s0;
+        stepMs = 0.9 * stepMs + 0.1 * lastStepMs;
+        budget -= atm.dt; simAdv += atm.dt;
       }
       if (budget > atm.dt * 2) budget = atm.dt;
-      void n;
+      postFlashEvents();
       realAcc += realDt;
       if (realAcc > 1) { actualSpeed = simAdv / realAcc; simAdv = 0; realAcc = 0; }
     }
-    if (now - lastSnap > 250) { lastSnap = now; snapshot(); }
+    // Under a heavy storm each step can exceed the 25 ms work budget; coarsen snapshots so the
+    // worker still has time to answer controls and return recycled buffers.
+    const snapInterval = stepMs > 35 || lastStepMs > 50 ? 350 : 250;
+    if (now - lastSnap > snapInterval) { lastSnap = now; snapshot(); }
   }
   setTimeout(loop, 8);
 }
@@ -170,8 +216,10 @@ ctx.onmessage = (ev: MessageEvent) => {
       const params: SimParams = clampParams(m.params || DEFAULT_PARAMS);
       atm = new Atmosphere(m.n, m.nz, params, terr, m.seed || 7);
       setupLayers(atm);
+      cloudBytes = atm.nxy * NZR * 4; surfBytes = atm.nxy * 4;
+      cloudPool.length = 0; surfPool.length = 0;
       windOff = new Float32Array(32);
-      lastSnapSimTime = atm.time; capeM = null;
+      lastSnapSimTime = atm.time; capeM = null; lastCape = -1; lastCapeReal = 0; lastFlashPost = 0;
       ctx.postMessage({
         type: 'ready',
         info: { n: atm.nx, nz: atm.nz, zf: Array.from(atm.g.zf), zc: Array.from(atm.g.zc), NZR, domain: DOMAIN, ztop: ZTOP, params: atm.params, envCape: atm.env.cape },
@@ -190,11 +238,23 @@ ctx.onmessage = (ev: MessageEvent) => {
     }
     case 'cfg': if (m.paused !== undefined) paused = m.paused; if (m.speed !== undefined) speed = m.speed; break;
     case 'cam': cam = { x: m.x, z: m.z }; break;
-    case 'diag': diag = { field: m.field, mode: m.mode, level: m.level }; break;
+    case 'diag': {
+      const nextStride = m.field === 'cape' ? 2 : 4;
+      if (nextStride !== capeStride) { capeStride = nextStride; capeM = null; lastCape = -1; }
+      diag = { field: m.field, mode: m.mode, level: m.level, enabled: m.enabled !== false };
+      break;
+    }
+    case 'recycle': {
+      if (m.cloud?.byteLength === cloudBytes && cloudPool.length < 3) cloudPool.push(m.cloud as ArrayBuffer);
+      if (m.surf?.byteLength === surfBytes && surfPool.length < 3) surfPool.push(m.surf as ArrayBuffer);
+      break;
+    }
     case 'reset': {
       if (!atm) break;
       atm.reset(m.params ? clampParams(m.params) : atm.params);
-      windOff = new Float32Array(32); lastSnapSimTime = atm.time; capeM = null; budget = 0;
+      atm.flashEvents.length = 0;
+      windOff = new Float32Array(32); lastSnapSimTime = atm.time; capeM = null; lastCape = -1; lastCapeReal = 0;
+      lastFlashPost = 0; budget = 0; stepMs = 0; lastStepMs = 0;
       ctx.postMessage({ type: 'reset', params: atm.params, envCape: atm.env.cape });
       break;
     }

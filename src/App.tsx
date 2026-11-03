@@ -4,7 +4,7 @@ import SimWorker from './sim/worker?worker&inline';
 import { Terrain } from './sim/terrain';
 import { DEFAULT_PARAMS, PARAM_SPECS, SimParams } from './sim/params';
 import { clockString } from './sim/sun';
-import { Engine, detectQuality, detectGpuTier, gpuLabel, readTierPref } from './render/engine';
+import { Engine, detectQuality, detectGpuTier, gpuLabel, readTierPref, solverGrid } from './render/engine';
 import { Player } from './controls';
 import { AudioEngine } from './audio';
 import { drawSkewT, drawSlice } from './ui/draw';
@@ -58,9 +58,11 @@ export default function App() {
         const q = detectQuality();
         const terrain = new Terrain(q.M);
         const spawn = terrain.findSpawn();
-        // The cloud texture is only as sharp as the solver grid. mid/high use 64x64 (500 m cells);
-        // the old 32x32 fallback put 1 km cells into the texture, which no render setting can hide.
-        const n = q.tier === 'low' ? 32 : 64, nz = q.tier === 'low' ? 28 : 48, NZR = 48;
+        // Solver resolution follows CPU headroom, not just the GPU tier. Touch devices and
+        // low-core CPUs stay on 32x32, while multi-core desktops can afford 64x64 cells. The
+        // renderer's cloud texture still uses 48 vertical slices in every case.
+        const grid = solverGrid(q);
+        const n = grid.n, nz = grid.nz, NZR = 48;
         const canvas = canvasRef.current!;
         const engine = new Engine(canvas, q, terrain, n, NZR);
         const player = new Player(canvas, terrain, spawn);
@@ -70,13 +72,24 @@ export default function App() {
         const worker = new SimWorker();
         const rt: Rt = { engine, player, audio, worker, terrain, raf: 0, info: null };
         rtRef.current = rt; (window as any).__rt = rt;
+        let lastFlashMsg = -Infinity;
         worker.onmessage = (ev: MessageEvent) => {
           const m = ev.data;
           if (m.type === 'ready') { rt.info = m.info; checksRef.current = m.checks; setPhase('run'); }
           else if (m.type === 'snap') {
             snapRef.current = m;
             engine.applySnapshot(m, performance.now() / 1000);
+            // The GPU copy is done: return the cloud/surface ArrayBuffers to the worker pool.
+            if (m.cloud?.buffer && m.surf?.buffer) {
+              const cloudBuf = m.cloud.buffer as ArrayBuffer, surfBuf = m.surf.buffer as ArrayBuffer;
+              worker.postMessage({ type: 'recycle', cloud: cloudBuf, surf: surfBuf }, [cloudBuf, surfBuf]);
+            }
           } else if (m.type === 'flash') {
+            // A lightning burst must not allocate bolt geometry, thunder and React state updates
+            // for every breakdown. The worker already keeps the nearest flash of each burst.
+            const nowFlash = performance.now();
+            if (nowFlash - lastFlashMsg < 260) return;
+            lastFlashMsg = nowFlash;
             const fv = engine.addFlash(m.event, new THREE.Vector3(player.x, player.y, player.z));
             if (fv) {
               audio.thunder(m.event.segs, [fv.off.x, fv.off.z], [player.x, player.y, player.z]);
@@ -133,7 +146,7 @@ export default function App() {
     const id = setTimeout(() => send({ type: 'params', params }), 140);
     return () => clearTimeout(id);
   }, [params, send]);
-  useEffect(() => { send({ type: 'diag', field, mode, level }); }, [field, mode, level, send, phase]);
+  useEffect(() => { send({ type: 'diag', field, mode, level, enabled: diagOn }); }, [field, mode, level, diagOn, send, phase]);
   useEffect(() => { rtRef.current?.audio.setEnabled(sound); }, [sound]);
 
   const s = snapRef.current;
@@ -148,7 +161,13 @@ export default function App() {
     if (skewRef.current && s.sounding) drawSkewT(skewRef.current, s.sounding);
   });
 
-  const reset = () => { send({ type: 'reset', params }); rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f)); setLastFlash(null); };
+  const reset = () => {
+    send({ type: 'reset', params });
+    const eng = rtRef.current?.engine;
+    if (eng) { eng.stormLoad = 0; eng.cheapMode = false; eng.U.uPrecipDensity.value = 1; eng.U.uCheapShadows.value = 0; }
+    rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f));
+    setLastFlash(null);
+  };
 
   const player = rtRef.current?.player;
   const sd = s?.sounding;

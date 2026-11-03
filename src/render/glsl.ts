@@ -5,6 +5,8 @@ uniform float uTime;
 uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uSkyAmb; uniform vec3 uHorizon; uniform vec3 uGroundAmb;
 uniform float uTwilight; uniform float uDomain; uniform float uVis; uniform float uSkyScale;
 uniform float uCamCloud;   // 0 = clear air at the camera, 1 = camera inside condensate
+// Storm-load controls: thin precipitation instances and simplify shadow/visibility taps.
+uniform float uPrecipDensity; uniform float uCheapShadows;
 uniform sampler3D uCloud;
 uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
@@ -55,6 +57,10 @@ float cloudSunTrans(vec3 p){
   vec4 q = sampleCloud(p + uSunDir * (2600.0 / max(uSunDir.y, 0.2)));
   return exp(-(q.r * 2.6 + q.g * 1.1));
 #else
+  if (uCheapShadows > 0.5) {
+    vec4 q = sampleCloud(p + uSunDir * (2600.0 / max(uSunDir.y, 0.2)));
+    return exp(-(q.r * 2.6 + q.g * 1.1));
+  }
   float tau = 0.0;
   for (int i = 0; i < 5; i++){
     float alt = 600.0 + float(i) * 1900.0;
@@ -72,6 +78,10 @@ float skyVisibility(vec3 p){
   vec4 s = sampleCloud(vec3(p.x, 4500.0, p.z));
   return mix(0.2, 1.0, exp(-(s.r * 1.9 + s.g * 0.9)));
 #else
+  if (uCheapShadows > 0.5) {
+    vec4 s = sampleCloud(vec3(p.x, 4500.0, p.z));
+    return mix(0.2, 1.0, exp(-(s.r * 1.9 + s.g * 0.9)));
+  }
   float tau = 0.0;
   for (int i = 0; i < 3; i++){
     float alt = 1000.0 + float(i) * 3600.0;
@@ -161,6 +171,7 @@ void main(){
 const heightShadowFn = /* glsl */ `
 float heightShadow(vec3 p){
   if (uSunDir.y <= 0.0) return 0.0;
+  if (uCheapShadows > 0.5) return 0.8;
   float s = 1.0;
   vec2 dxz = uSunDir.xz / max(length(uSunDir.xz), 1e-4);
   float slope = uSunDir.y / max(length(uSunDir.xz), 1e-3);
@@ -227,10 +238,10 @@ void main(){
   alb *= 1.0 - 0.45 * wet;
   vec3 Nw = N;
 #ifndef LOWQ
-  if (rain > 0.02 && dist < 80.0){
+  if (uCheapShadows < 0.5 && rain > 0.02 && dist < 60.0){
     float rp = ripple(P * 2.6, uTime) + ripple(P * 3.7 + 11.0, uTime * 1.2);
     vec2 g = vec2(ripple(P * 2.6 + vec2(0.02, 0.0), uTime) - ripple(P * 2.6 - vec2(0.02, 0.0), uTime), ripple(P * 2.6 + vec2(0.0, 0.02), uTime) - ripple(P * 2.6 - vec2(0.0, 0.02), uTime));
-    Nw = normalize(mix(N, normalize(N + vec3(g.x, 0.0, g.y) * 1.5), pm * clamp(rain * 3.0, 0.0, 1.0) * (1.0 - dist / 80.0)));
+    Nw = normalize(mix(N, normalize(N + vec3(g.x, 0.0, g.y) * 1.5), pm * clamp(rain * 3.0, 0.0, 1.0) * (1.0 - dist / 60.0)));
     alb *= 1.0 + rp * 0.05 * pm;
   }
 #endif
@@ -306,9 +317,9 @@ void main(){
   float amp = clamp(0.012 + ws * 0.012 + sf.g * 0.03, 0.01, 0.2) * (1.0 - smoothstep(300.0, 3000.0, dist) * 0.7);
   vec2 g = waveGrad(vWorld.xz, wd, uTime) * amp;
 #ifndef LOWQ
-  if (sf.g > 0.02 && dist < 120.0){
+  if (uCheapShadows < 0.5 && sf.g > 0.02 && dist < 70.0){
     vec2 P = vWorld.xz * 2.2;
-    g += vec2(ripple(P + vec2(0.02, 0.0), uTime) - ripple(P - vec2(0.02, 0.0), uTime), ripple(P + vec2(0.0, 0.02), uTime) - ripple(P - vec2(0.0, 0.02), uTime)) * 1.3 * clamp(sf.g * 3.0, 0.0, 1.0) * (1.0 - dist / 120.0);
+    g += vec2(ripple(P + vec2(0.02, 0.0), uTime) - ripple(P - vec2(0.02, 0.0), uTime), ripple(P + vec2(0.0, 0.02), uTime) - ripple(P - vec2(0.0, 0.02), uTime)) * 1.3 * clamp(sf.g * 3.0, 0.0, 1.0) * (1.0 - dist / 70.0);
   }
 #endif
   vec3 N = normalize(vec3(-g.x, 1.0, -g.y));
@@ -383,11 +394,15 @@ void main(){
   // the 11-tap full version and saves millions of vertex fetches per frame.
   float cs = 0.15, sv = 0.2;
   if (uCamCloud < 0.5){
-    vec3 tp = vec3(c.x, gh + 8.0, c.y);
-    vec4 ts = sampleCloud(tp + uSunDir * (2400.0 / max(uSunDir.y, 0.2)));
-    cs = exp(-(ts.r * 2.6 + ts.g * 1.1));
-    vec4 vs = sampleCloud(vec3(c.x, 4200.0, c.y));
-    sv = mix(0.2, 1.0, exp(-(vs.r * 1.9 + vs.g * 0.9)));
+    if (uCheapShadows > 0.5) {
+      cs = 0.45; sv = 0.65;
+    } else {
+      vec3 tp = vec3(c.x, gh + 8.0, c.y);
+      vec4 ts = sampleCloud(tp + uSunDir * (2400.0 / max(uSunDir.y, 0.2)));
+      cs = exp(-(ts.r * 2.6 + ts.g * 1.1));
+      vec4 vs = sampleCloud(vec3(c.x, 4200.0, c.y));
+      sv = mix(0.2, 1.0, exp(-(vs.r * 1.9 + vs.g * 0.9)));
+    }
   }
   vSun = uSunCol * cs;
   vSV = sv;
@@ -421,6 +436,7 @@ attribute vec3 aSeed;
 uniform float uSnowLevel;
 varying float vAlpha; varying vec2 vQ; varying vec3 vCol; varying float vDist; varying float vFlake;
 void main(){
+  if (aSeed.z > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 size = vec3(86.0, 48.0, 86.0);
   vec3 seed = aSeed * size;
   float rnd = fract(aSeed.x * 91.7 + aSeed.y * 37.3 + aSeed.z * 13.1);
@@ -477,6 +493,7 @@ ${TERRAIN_FN}
 attribute vec3 aSeed;
 varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol; varying float vDist;
 void main(){
+  if (aSeed.z > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 size = vec2(70.0);
   vec2 rel = mod(aSeed.xy * size - cameraPosition.xz + size * 0.5, size) - size * 0.5;
   float rdist = length(rel);
@@ -528,7 +545,7 @@ void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
   vRain = 0.0; vU = 0.0; vV = 0.5; vSeed = aCol.z; vSnow = 0.0; vCol = vec3(0.0); vDist = 0.0; vWorld = vec2(0.0);
-  if (rain <= 0.02) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  if (rain <= 0.02 || aCol.z > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   float seed = aCol.z;
   // cloud base: walk up the column until the precipitation field appears
   float top = 3800.0;
@@ -647,6 +664,7 @@ ${COMMON}
 uniform sampler3D uNoise; uniform sampler2D uDepth; uniform sampler2D uHist; uniform sampler2D uHistAux;
 uniform mat4 uInvProj; uniform mat4 uCamWorld; uniform mat4 uPrevVP; uniform vec3 uCamPos;
 uniform float uFrame; uniform float uBlend; uniform float uStepScale; uniform float uMaxSteps;
+uniform float uDetail; uniform float uCheapLight;   // fast storm-load path
 uniform vec2 uWindOff[16];
 varying vec2 vUv;
 // MRT: location 0 = premultiplied cloud radiance + transmittance, location 1 = scattering depth
@@ -700,6 +718,11 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, bool detail
 }
 
 float sunTau(vec3 p){
+#ifdef LOWQ
+  // Low tier / cheap path: one tap instead of four 3-D fetches per lighting update.
+  vec4 s = sampleCloud(p + uSunDir * (2200.0 / max(uSunDir.y, 0.2)));
+  return (s.r * 1.05 + s.g * 0.28) * 0.058 * 2200.0;
+#else
   float tau = 0.0; float st = 150.0; vec3 q = p;
   for (int j = 0; j < 4; j++){
     q += uSunDir * st;
@@ -709,6 +732,7 @@ float sunTau(vec3 p){
     st *= 2.5;
   }
   return tau;
+#endif
 }
 
 void main(){
@@ -741,7 +765,7 @@ void main(){
       t += cstep;
     }
   }
-  float tauC = 0.0;
+  float tauC = 0.0; bool lightDirty = true;
   // Engulfed by cloud: the beam is extinguished within a few hundred metres, so the
   // remaining step budget is wasted work. Halve it.
   float maxSteps = uMaxSteps * (1.0 - 0.5 * uCamCloud);
@@ -754,7 +778,8 @@ void main(){
     // optically thick cloud does not need fine steps: grow them as the beam is extinguished
     stepLen *= mix(1.0, 2.6, 1.0 - T);
     float rainD, iceF;
-    float d = cloudDensity(p, t, rainD, iceF, DETAIL_ON);
+    bool detail = DETAIL_ON && uDetail > 0.5;
+    float d = cloudDensity(p, t, rainD, iceF, detail);
     float rainFade = smoothstep(120.0, 700.0, t);
     float sc = d * 0.085;
 #ifdef LOWQ
@@ -764,7 +789,9 @@ void main(){
 #endif
     float sig = sc + sr;
     if (sig > 1e-5){
-      if (i % 4 == 0) tauC = sunTau(p);
+      // Sun transmittance is the most expensive part of a dense march. Recompute it on the first
+      // hit, then every 4 steps normally or every 8 in the cheap storm path.
+      if (lightDirty || ((i & 3) == 0 && (uCheapLight < 0.5 || (i & 7) == 0))) { tauC = sunTau(p); lightDirty = false; }
       float tau = tauC;
       // 4 octaves of a Henyey-Greenstein phase function: a cheap multiple-scattering
       // approximation. Without it thick cloud cores go black instead of glowing grey.
@@ -779,7 +806,7 @@ void main(){
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
       // one-tap vertical occlusion: how much cloud sits above this sample
       float aoU = 1.0;
-      if (d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
+      if (uCheapLight < 0.5 && d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
       float hDark = mix(0.52, 1.0, smoothstep(0.03, 0.38, hF));
       vec3 amb = mix(uGroundAmb * 0.6, uSkyAmb, smoothstep(0.0, 0.75, hF));
       amb *= (0.16 + 0.84 * aoU) * (0.72 + 0.48 * d) * hDark;
@@ -826,6 +853,7 @@ void main(){
 export const compFrag = /* glsl */ `
 uniform sampler2D uScene; uniform sampler2D uCloudRT; uniform sampler2D uCloudAux;
 uniform float uExposure; uniform float uTime; uniform vec2 uRes; uniform vec2 uCloudRes;
+uniform float uCheapUpsample;
 varying vec2 vUv;
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
 
@@ -844,6 +872,7 @@ vec4 cloudSample(vec2 uv){
   vec4 acc = c0 * 2.0;
   float wsum = 2.0;
   for (int i = 0; i < 8; i++){
+    if (uCheapUpsample > 0.5 && i >= 4) break;   // 4 neighbours instead of 8 during a stall
     vec4 c = texture(uCloudRT, uv + CLOUD_OFF[i] * tx);
     float d = texture(uCloudAux, uv + CLOUD_OFF[i] * tx).r;
     // depth similarity keeps the silhouette crisp; transmittance jump rejects cloud/sky bleed

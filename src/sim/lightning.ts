@@ -63,10 +63,12 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
   tips.push({ x, y, z, s: -1, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0 });
   const EPROP = 1.2e4, ETA = 1.5;
   let grounded = false, strikeNode = -1, strikeSign = 0, attachGen = 0;
-  const MAXSEG = 1200;
+  // Hard bounds keep a busy electrified field from turning one solution step into a long
+  // stochastic search (and from sending thousands of bolt quads to the renderer).
+  const MAXSEG = 700;
   let gen = 0;
   const NC = 16;
-  for (gen = 1; gen <= 240 && nodesX.length < MAXSEG; gen++) {
+  for (gen = 1; gen <= 200 && nodesX.length < MAXSEG; gen++) {
     let any = false;
     const nt = tips.length;
     for (let ti = 0; ti < nt; ti++) {
@@ -116,7 +118,7 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
       }
       // branching: main channels fork repeatedly; forks themselves fork more rarely
       const pBranch = 0.075 * Math.pow(0.62, tp.order) * (tp.order === 0 ? 1 : 1.25);
-      if (tips.length < 52 && rnd() < pBranch) {
+      if (tips.length < 36 && rnd() < pBranch) {
         // forked leaders leave the parent at a shallow angle, in the direction of the ambient field
         const d = rdir();
         const k = 0.35 + 0.45 * rnd();
@@ -191,7 +193,8 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
 export function tryLightning(a: Atmosphere): FlashEvent[] {
   const out: FlashEvent[] = [];
   if (a.stats.maxEratio < 1) return out;
-  const p = 1 - Math.exp(-a.dt / 3);
+  // electrostatics/lightning is evaluated every 4 steps, so each call covers two intervals
+  const p = 1 - Math.exp(-(a.dt * 2) / 3);
   const { nx, ny, nz, nxy } = a;
   const used: [number, number, number][] = [];
   for (let f = 0; f < 2; f++) {

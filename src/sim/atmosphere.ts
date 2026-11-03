@@ -666,7 +666,10 @@ export class Atmosphere {
     this.terrainBC();
     this.project(dt);
     this.time += dt; this.step_n++;
-    if (this.step_n % 2 === 0 && this.chargeMax > 1e-14) { this.electricField(); for (const e of tryLightning(this)) this.flashEvents.push(e); }
+    // Solving electrostatics is a second full FFT/tridiagonal pass. During a multicell outbreak
+    // it was run every other step, doubling the solver's most expensive pass. Every fourth step
+    // is enough at the model's 2-10 s timestep and also halves lightning-burst bookkeeping.
+    if (this.step_n % 4 === 0 && this.chargeMax > 1e-14) { this.electricField(); for (const e of tryLightning(this)) this.flashEvents.push(e); }
     else if (this.chargeMax <= 1e-14) { this.stats.maxE = 0; this.stats.maxEratio = 0; }
     if (this.step_n % 3 === 0) this.computeStats();
     this.dt = Math.max(2, Math.min(10, 0.6 / Math.max(1e-6, this.cflRate)));

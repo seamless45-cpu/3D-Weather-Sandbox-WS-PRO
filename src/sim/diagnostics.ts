@@ -41,25 +41,28 @@ export function localSounding(a: Atmosphere, ci: number, cj: number): LocalSound
   return { z, T, Td, p, u, v, tpar, sb, ml, mu, shear06, meanWind: mw / cnt, surfRH: rh * 100, surfT: T[0], tauColumn: tau };
 }
 
-/** Surface-based CAPE / CIN for every second column (decimated, cheap). */
-export function capeMap(a: Atmosphere): { cape: Float32Array; cin: Float32Array; n: number; mean: number; max: number } {
+/** Surface-based CAPE / CIN on a decimated horizontal grid (stride 2 or 4, power of two). */
+export function capeMap(a: Atmosphere, stride = 4): { cape: Float32Array; cin: Float32Array; n: number; stride: number; mean: number; max: number } {
   const { nx, ny, nz, nxy } = a;
-  const n = nx / 2;
+  const n = nx / stride;
   const cape = new Float32Array(n * n), cin = new Float32Array(n * n);
   const T = new Float64Array(nz), q = new Float64Array(nz);
   let sum = 0, mx = 0;
   for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
-    const ij = (j * 2) * nx + i * 2;
+    const ij = (j * stride) * nx + i * stride;
     for (let k = 0; k < nz; k++) { T[k] = a.th[k * nxy + ij] * a.prof.pi[k]; q[k] = a.qv[k * nxy + ij]; }
     const r = parcelAscent(a.prof.z, a.prof.p, T, q, 'SB');
     cape[j * n + i] = r.cape; cin[j * n + i] = r.cin;
     sum += r.cape; if (r.cape > mx) mx = r.cape;
   }
   void ny;
-  return { cape, cin, n, mean: sum / (n * n), max: mx };
+  return { cape, cin, n, stride, mean: sum / (n * n), max: mx };
 }
 
 export interface StormMode { label: string; cores: number; linearity: number; uh: number; cold: number; }
+// Static neighbour offsets: the old `for (const [a,b] of [[1,0],...])` allocated five arrays per
+// visited cell, which is exactly what a broad multicell updraft field has a lot of.
+const NB = [1, 0, -1, 0, 0, 1, 0, -1];
 
 export function stormMode(a: Atmosphere, snd: LocalSounding): StormMode {
   const { nx, ny, nz, nxy } = a;
@@ -80,7 +83,8 @@ export function stormMode(a: Atmosphere, snd: LocalSounding): StormMode {
       let di = i - i0; if (di > nx / 2) di -= nx; if (di < -nx / 2) di += nx;
       let dj = j - j0; if (dj > ny / 2) dj -= ny; if (dj < -ny / 2) dj += ny;
       cx += di; cy += dj; c++;
-      for (const [a1, b1] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      for (let d = 0; d < 4; d++) {
+        const a1 = NB[d * 2], b1 = NB[d * 2 + 1];
         const qq = ((j + b1 + ny) % ny) * nx + ((i + a1 + nx) % nx);
         if (!seen[qq] && wmax[qq] >= 5) { seen[qq] = 1; st.push(qq); }
       }
@@ -116,7 +120,7 @@ export function stormMode(a: Atmosphere, snd: LocalSounding): StormMode {
 export type DiagField = 'w' | 'T' | 'RH' | 'cloud' | 'precip' | 'E' | 'thp' | 'zeta' | 'p' | 'cape';
 export interface DiagSlice { field: DiagField; mode: 'h' | 'v'; w: number; h: number; data: Float32Array; ua: Float32Array; va: Float32Array; min: number; max: number; unit: string; }
 
-export function diagSlice(a: Atmosphere, field: DiagField, mode: 'h' | 'v', level: number, ci: number, cj: number, cm: { cape: Float32Array; cin: Float32Array; n: number } | null): DiagSlice {
+export function diagSlice(a: Atmosphere, field: DiagField, mode: 'h' | 'v', level: number, ci: number, cj: number, cm: { cape: Float32Array; cin: Float32Array; n: number; stride: number } | null): DiagSlice {
   const { nx, ny, nz, nxy } = a;
   const w = nx, h = mode === 'h' ? ny : nz;
   const data = new Float32Array(w * h), ua = new Float32Array(w * h), va = new Float32Array(w * h);
@@ -139,7 +143,8 @@ export function diagSlice(a: Atmosphere, field: DiagField, mode: 'h' | 'v', leve
     }
   };
   if (field === 'cape' && cm) {
-    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) data[j * nx + i] = cm.cape[((j >> 1) % cm.n) * cm.n + ((i >> 1) % cm.n)];
+    const s = cm.stride;
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) data[j * nx + i] = cm.cape[(((j / s) | 0) % cm.n) * cm.n + (((i / s) | 0) % cm.n)];
     for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { ua[j * nx + i] = a.uc0[j * nx + i]; va[j * nx + i] = a.vc0[j * nx + i]; }
   } else if (mode === 'h') {
     const k = Math.min(nz - 1, Math.max(0, level));

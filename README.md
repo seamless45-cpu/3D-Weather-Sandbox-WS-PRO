@@ -46,11 +46,12 @@ override it with **auto / low / mid / high**; the choice is stored in `localStor
 
 On the `low` tier every shader compiles a cut-down variant (`#ifdef LOWQ`): a 26-step cloud march
 with one-tap sun transmittance and one-octave detail, single-tap cloud shading on terrain, water
-and trees, no splash crowns, a quarter of the trees and particles, no MSAA and a 0.62× pixel
-ratio. Whatever the tier, the renderer also degrades at runtime — first it coarsens the cloud
-march, then the cloud buffer, then the pixel ratio, then the step budget — and recovers when
-frames are comfortable again. The `ⓘ` panel reports tier, measured fps, pixel ratio and cloud
-scale, which is the quickest way to see what the device settled on.
+and trees, no splash crowns, fewer trees and particles, no MSAA and a reduced pixel ratio.
+Whatever the tier, the renderer also degrades at runtime — first to a cheap dense-march path,
+then by coarsening steps, cloud buffer and finally screen resolution — and recovers when frames
+are comfortable again. Recovery works on 60 Hz displays as well as high-refresh ones. The `ⓘ`
+panel reports tier, measured fps, pixel ratio and cloud scale, which is the quickest way to see
+what the device settled on.
 
 The cloud pass writes a second (MRT) attachment holding the scattering depth of every pixel.
 That buffer does two jobs: it reprojects the temporal history at the distance the cloud actually
@@ -61,16 +62,35 @@ when a cloud base engulfs the viewer it skips the entry search, halves the march
 the history blend and switches terrain/water/vegetation to a cheap shadow path — the case that
 used to cost the most frames.
 
-The solver grid is what sets cloud sharpness: `mid` and `high` run 64×64 horizontally and
-48 levels, so the cloud texture carries 500 m structure instead of the 1 km cells the old
-fallback produced. Hard pixel budgets (`maxPixels` / `maxCloudPixels`) stop a 4K or retina
-window from multiplying the cost by four, and when `EXT_disjoint_timer_query_webgl2` is
-available the HUD reports the GPU time of the scene, cloud and composite passes. Runtime
-degradation reads those numbers and cuts whichever pass is actually slow — the march first
-when the cloud pass dominates, screen resolution first when the scene pass does.
+The solver grid is chosen from CPU headroom, not the GPU tier alone: touch devices and machines
+with fewer than six logical cores run 32×32×36, desktop `mid` runs 64×64×36, and desktop `high`
+runs 64×64×48. All of them feed the same 48-layer cloud texture. Auto-detected phones also get
+capped pixel/cloud buffers, march length and precipitation counts; an explicit `?perf=high`
+override can still request the full render shader. Hard pixel budgets (`maxPixels` /
+`maxCloudPixels`) stop a 4K or retina window from multiplying the cost by four. When
+`EXT_disjoint_timer_query_webgl2` is available the HUD reports GPU time per pass; without timer
+data the adaptive path assumes the volumetric cloud pass is the bottleneck rather than shrinking
+the whole screen first.
 
-Diagnostics: append `?perf=low|mid|high` to force a tier and `&noadapt=1` to freeze the runtime
-degradation (useful when profiling).
+### Multicell / MCS stage
+
+The storm transition used to add several costs at once: the solver starts advecting seven extra
+condensate/charge fields, electrified columns add a second FFT solve, rain shafts and particles
+appear over much of the screen, and a lightning burst can fire several times per second. The
+worker now solves electrostatics every fourth step, caps channel growth, keeps only the nearest
+flash from each burst, returns snapshot buffers to a small pool and decimates/time-throttles the
+CAPE diagnostic. The renderer estimates storm load from cloud fraction, core count and rain:
+it thins rain/shaft instances, reduces dense-march steps and step length, and can switch to
+one-tap cloud shadows, a single-tap sun-transmittance estimate and four-neighbour cloud
+upsampling during a stall.
+
+Thunder synthesis was the largest main-thread stall: each flash generated up to a 40-second
+waveform with per-sample `exp()` and `Math.random()` calls. It now uses at most 48 bounded grains,
+reused noise, recurrence-based filters/envelopes, a 10-second maximum buffer and a 180 ms rate
+limit, so a lightning burst no longer freezes the render loop.
+
+Diagnostics: append `?perf=low|mid|high` to force a tier, `&noadapt=1` to freeze runtime
+degradation and `&profile=1` to enable GPU timer queries (useful when profiling).
 
 ### "I just get a white / blank screen"
 
