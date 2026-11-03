@@ -1,7 +1,7 @@
-// Lightning: bidirectional leader initiation at the grid cell where E / E_break is largest, then stochastic
-// dielectric-breakdown (DBM, eta=1.5) growth of branching channels in the solved electric potential.
-// A negative-polarity tip climbs toward higher ambient potential, a positive tip toward lower potential; the channel
-// (a floating conductor) sits at the mean of the ambient potential along it; contact with the ground (phi=0) grounds it.
+// Lightning: bidirectional leader initiation at the grid cell where E / E_break is largest, then
+// stochastic dielectric-breakdown (DBM, eta=1.35) growth of branching channels in the solved
+// electric potential. One leader descends toward the ground, the other climbs into the cloud;
+// the channel is a floating conductor at the mean ambient potential until a tip attaches.
 import type { Atmosphere } from './atmosphere';
 
 export interface FlashEvent {
@@ -53,83 +53,120 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
     const hag = pz - Math.max(0, ground(px, py));
     return phiAt(a, px, py, pz) * Math.min(1, Math.max(0.02, hag / 900));
   };
-  const nodesX: number[] = [x], nodesY: number[] = [y], nodesZ: number[] = [z], nodeGen: number[] = [0], nodeParent: number[] = [-1], nodeOrder: number[] = [0];
-  let phiSum = gfun(x, y, z), phiCnt = 1;
-  let phiCh = phiSum;
+  const nodesX: number[] = [x], nodesY: number[] = [y], nodesZ: number[] = [z];
+  const nodeGen: number[] = [0], nodeParent: number[] = [-1], nodeOrder: number[] = [0];
+  let phiSum = gfun(x, y, z), phiCnt = 1, phiCh = phiSum;
   const tips: Tip[] = [];
   const rdir = () => { const u = 2 * rnd() - 1, t = 2 * Math.PI * rnd(), r = Math.sqrt(1 - u * u); return [r * Math.cos(t), u, r * Math.sin(t)]; };
-  const d0 = rdir();
-  tips.push({ x, y, z, s: 1, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0 });
-  tips.push({ x, y, z, s: -1, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0 });
-  const EPROP = 1.2e4, ETA = 1.5;
+  // Start with a descending negative leader and an ascending positive leader. A purely random
+  // bidirectional pair often wandered sideways and produced a horizontal "spider" instead of a bolt.
+  const az = 2 * Math.PI * rnd(), horiz = 0.35 + 0.35 * rnd(), down = Math.sqrt(1 - horiz * horiz);
+  const d0 = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
+  tips.push({ x, y, z, s: -1, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0 });
+  tips.push({ x, y, z, s: 1, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0 });
+
+  const EPROP = 1.1e4, ETA = 1.35, NC = 12;
+  const smooth = (a: number, b: number, x: number) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const MAXSEG = 620, MAXGEN = 180, MAXTIPS = 28;
   let grounded = false, strikeNode = -1, strikeSign = 0, attachGen = 0;
-  // Hard bounds keep a busy electrified field from turning one solution step into a long
-  // stochastic search (and from sending thousands of bolt quads to the renderer).
-  const MAXSEG = 700;
   let gen = 0;
-  const NC = 16;
-  for (gen = 1; gen <= 200 && nodesX.length < MAXSEG; gen++) {
+  for (gen = 1; gen <= MAXGEN && nodesX.length < MAXSEG; gen++) {
     let any = false;
     const nt = tips.length;
     for (let ti = 0; ti < nt; ti++) {
       const tp = tips[ti];
       if (!tp.alive) continue;
       any = true;
-      // stepped leader: short steps near the tip of a fresh branch, longer as it matures
-      const len = (38 + 62 * rnd()) * (1 - Math.min(0.45, tp.order * 0.12));
+      // Longer, smoother leader steps with gentle kinks; branches get shorter steps.
+      const len = (55 + 75 * rnd()) * (1 - Math.min(0.35, tp.order * 0.1));
       const dV = EPROP * len;
       let best = -1, tot = 0;
-      const cw: number[] = [], cx: number[] = [], cy: number[] = [], cz: number[] = [], cdx: number[] = [], cdy: number[] = [], cdz: number[] = [];
+      const cw: number[] = [], cg: number[] = [], cx: number[] = [], cy: number[] = [], cz: number[] = [], cdx: number[] = [], cdy: number[] = [], cdz: number[] = [];
       const phiTip = gfun(tp.x, tp.y, tp.z);
       for (let c = 0; c < NC; c++) {
-        const d = rdir();
-        const px = tp.x + d[0] * len, py = tp.y + d[1] * len, pz = tp.z + d[2] * len;
-        cx.push(px); cy.push(py); cz.push(pz); cdx.push(d[0]); cdy.push(d[1]); cdz.push(d[2]);
-        if (pz < 20) { cw.push(0); continue; }
+        const r = rdir();
+        // Most candidates stay in a narrow forward cone; a few explore sideways. This keeps
+        // the field-driven growth but removes the "random walk on a lattice" look.
+        const blend = c < 7 ? 0.18 + 0.34 * rnd() : 0.48 + 0.40 * rnd();
+        let dx = tp.dx * (1 - blend) + r[0] * blend;
+        let dy = tp.dy * (1 - blend) + r[1] * blend;
+        let dz = tp.dz * (1 - blend) + r[2] * blend;
+        const vBias = (c < 8 ? 0.10 : 0.20) * rnd();
+        dz += tp.s < 0 ? -vBias : vBias;   // descending / ascending field bias
+        const nl = Math.hypot(dx, dy, dz) || 1; dx /= nl; dy /= nl; dz /= nl;
+        const px = tp.x + dx * len, py = tp.y + dy * len, pz = tp.z + dz * len;
+        cx.push(px); cy.push(py); cz.push(pz); cdx.push(dx); cdy.push(dy); cdz.push(dz);
+        if (pz < 20) { cw.push(0); cg.push(0); continue; }
         const pc = gfun(px, py, pz);
-        const drive = tp.s * (pc - phiCh);                   // potential difference between channel and candidate site
-        const grad = (tp.s * (pc - phiTip)) / len;           // local field component along the step (DBM growth probability ~ E^eta)
-        const fwd = Math.max(0, d[0] * tp.dx + d[1] * tp.dy + d[2] * tp.dz);
-        const wgt = drive > dV && grad > 0 ? Math.pow(grad / 8000, ETA) * (0.4 + 0.6 * fwd) * (0.6 + 0.8 * rnd()) : 0;
-        cw.push(wgt);
-        tot += wgt;
+        const drive = tp.s * (pc - phiCh);
+        const grad = (tp.s * (pc - phiTip)) / len;
+        const fwd = Math.max(0, dx * tp.dx + dy * tp.dy + dz * tp.dz);
+        const vertical = tp.s < 0 ? Math.max(0, -dz) : Math.max(0, dz);
+        // A soft drive threshold keeps marginal cells from producing empty flashes while still
+        // strongly favouring sites that exceed the propagation field.
+        const driveF = smooth(dV * 0.25, dV * 1.15, drive);
+        const wgt = grad > 0
+          ? Math.pow(grad / 8000, ETA) * (0.35 + 0.65 * fwd) * (0.6 + 0.8 * rnd()) * (1 + 0.45 * vertical) * (0.12 + 0.88 * driveF)
+          : 0;
+        cw.push(wgt); cg.push(grad); tot += wgt;
       }
-      if (tot <= 0) { tp.alive = false; continue; }
-      let r = rnd() * tot;
-      for (let c = 0; c < NC; c++) { r -= cw[c]; if (r <= 0) { best = c; break; } }
-      if (best < 0) best = cw.lastIndexOf(Math.max(...cw));
+      if (tot <= 0) {
+        // Fall back to the strongest local field component so a weak cell still forms a short channel.
+        let bv = 0;
+        for (let c = 0; c < NC; c++) if (cg[c] > bv) { bv = cg[c]; best = c; }
+        if (best < 0 || bv <= 0) { tp.alive = false; continue; }
+      } else {
+        let pick = rnd() * tot;
+        for (let c = 0; c < NC; c++) { pick -= cw[c]; if (pick <= 0) { best = c; break; } }
+        if (best < 0) best = cw.lastIndexOf(Math.max(...cw));
+      }
       const parent = tp.node;
-      // tortuosity: a real channel never runs straight, so kink every step a little
-      const jit = 0.3 * len;
+      const jit = 0.14 * len;
       tp.x = cx[best] + (rnd() - 0.5) * jit;
-      tp.y = cy[best] + (rnd() - 0.5) * jit * 0.7;
-      tp.z = cz[best] + (rnd() - 0.5) * jit;
-      if (tp.y < 25) tp.y = 25;
-      tp.dx = 0.5 * tp.dx + 0.5 * cdx[best]; tp.dy = 0.5 * tp.dy + 0.5 * cdy[best]; tp.dz = 0.5 * tp.dz + 0.5 * cdz[best];
+      tp.y = cy[best] + (rnd() - 0.5) * jit;
+      tp.z = Math.max(25, cz[best] + (rnd() - 0.5) * jit);
+      tp.dx = 0.68 * tp.dx + 0.32 * cdx[best]; tp.dy = 0.68 * tp.dy + 0.32 * cdy[best]; tp.dz = 0.68 * tp.dz + 0.32 * cdz[best];
       const nl = Math.hypot(tp.dx, tp.dy, tp.dz) || 1; tp.dx /= nl; tp.dy /= nl; tp.dz /= nl;
       nodesX.push(tp.x); nodesY.push(tp.y); nodesZ.push(tp.z); nodeGen.push(gen); nodeParent.push(parent); nodeOrder.push(tp.order);
       tp.node = nodesX.length - 1;
       phiSum += gfun(tp.x, tp.y, tp.z); phiCnt++;
       if (!grounded) phiCh = phiSum / phiCnt;
-      // ground contact (connecting leader, ~60 m above local terrain)
-      if (!grounded && tp.z - Math.max(0, ground(tp.x, tp.y)) < 70) {
+      // Ground attachment: only the descending leader can connect (~60 m above terrain).
+      if (!grounded && tp.s < 0 && tp.z - Math.max(0, ground(tp.x, tp.y)) < 70) {
         grounded = true; strikeNode = tp.node; strikeSign = tp.s; attachGen = gen; phiCh = 0; tp.alive = false;
         continue;
       }
-      // branching: main channels fork repeatedly; forks themselves fork more rarely
-      const pBranch = 0.075 * Math.pow(0.62, tp.order) * (tp.order === 0 ? 1 : 1.25);
-      if (tips.length < 36 && rnd() < pBranch) {
-        // forked leaders leave the parent at a shallow angle, in the direction of the ambient field
-        const d = rdir();
-        const k = 0.35 + 0.45 * rnd();
-        let bx = tp.dx * (1 - k) + d[0] * k, by = tp.dy * (1 - k) + d[1] * k, bz = tp.dz * (1 - k) + d[2] * k;
+      // Shallow forks, rarer with each generation; high-order branches stop subdividing.
+      const pBranch = tp.order < 3 && tp.z > 550 ? 0.10 * Math.pow(0.52, tp.order) : 0;
+      if (tips.length < MAXTIPS && rnd() < pBranch) {
+        const r = rdir(), bk = 0.22 + 0.28 * rnd();
+        let bx = tp.dx * (1 - bk) + r[0] * bk, by = tp.dy * (1 - bk) + r[1] * bk, bz = tp.dz * (1 - bk) + r[2] * bk;
+        bz += tp.s < 0 ? -0.08 : 0.08;
         const bl = Math.hypot(bx, by, bz) || 1; bx /= bl; by /= bl; bz /= bl;
         tips.push({ x: tp.x, y: tp.y, z: tp.z, s: tp.s, dx: bx, dy: by, dz: bz, order: tp.order + 1, alive: true, node: tp.node });
       }
     }
     if (!any) break;
   }
-  // graph distance from strike (or initiation) for return-stroke / K-process propagation, plus the dilated neutralisation mask
+
+  // A marginal electrified cell can still register a breakdown. Give it a short stepped leader
+  // so every flash has a visible channel instead of a one-segment dash or an empty event.
+  if (nodesX.length < 4) {
+    const need = 4 - nodesX.length;
+    const t0 = tips[0];
+    let px = nodesX[0], py = nodesY[0], pz = nodesZ[0];
+    for (let f = 0; f < need; f++) {
+      const parent = nodesX.length - 1;
+      px = ((px + t0.dx * 90) % L + L) % L;
+      py = ((py + t0.dy * 90) % L + L) % L;
+      pz = Math.max(Math.max(0, ground(px, py)) + 80, pz + t0.dz * 90);
+      nodesX.push(px); nodesY.push(py); nodesZ.push(pz);
+      nodeGen.push(gen + f + 1); nodeParent.push(parent); nodeOrder.push(0);
+    }
+    gen += need;
+  }
+
+  // Graph distance from the strike (or initiation) drives return-stroke propagation and width taper.
   const n = nodesX.length;
   const root = grounded ? strikeNode : 0;
   const adj: number[][] = Array.from({ length: n }, () => []);
@@ -147,11 +184,14 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
   const cells = new Set<number>();
   const nz = a.nz;
   for (let q = 1; q < n; q++) {
-    const p = nodeParent[q];
-    const ord = nodeOrder[q];
+    const p = nodeParent[q], ord = nodeOrder[q];
+    const tipD = Math.max(dist[p], dist[q]);
+    // Main channel is widest at the attachment point; branches and tips taper to a filament.
+    const branch = Math.pow(0.62, ord), taper = 1 / (1 + tipD / 9000);
+    const width = Math.max(0.12, Math.min(1.25, 0.18 + 1.05 * branch * taper));
     segs[o++] = nodesX[p]; segs[o++] = nodesZ[p]; segs[o++] = ((nodesY[p] % L) + L) % L;
     segs[o++] = nodesX[q]; segs[o++] = nodesZ[q]; segs[o++] = ((nodesY[q] % L) + L) % L;
-    segs[o++] = nodeGen[q]; segs[o++] = Math.max(dist[p], dist[q]); segs[o++] = ord; segs[o++] = Math.max(0.25, 1 - 0.28 * ord);
+    segs[o++] = nodeGen[q]; segs[o++] = tipD; segs[o++] = ord; segs[o++] = width;
     const mx = (nodesX[q] + nodesX[p]) / 2, my = (nodesY[q] + nodesY[p]) / 2, mz = (nodesZ[q] + nodesZ[p]) / 2;
     const ii = Math.floor((((mx % L) + L) % L) / g.dx), jj = Math.floor((((my % L) + L) % L) / g.dy);
     let kk = 0; while (kk < nz - 1 && g.zf[kk + 1] < mz) kk++;
@@ -161,30 +201,32 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number): FlashEvent 
     }
   }
   const charge = a.neutralize(cells, 0.55);
-  // timing / strokes
-  const STEP = 0.0016;
-  const leaderEnd = gen * STEP;
+
+  // Timing: a slightly slower stepped leader, then return strokes / K-changes travelling up
+  // the channel. Multiple strokes and continuing current make the flicker read as one flash.
+  const STEP = 0.0022;
+  const leaderEnd = gen * STEP + 0.006;
   const strokes: { t: number; amp: number }[] = [];
   let ccEnd = 0, ccAmp = 0, type: FlashEvent['type'] = 'IC';
   let strike: [number, number, number] | null = null;
   if (grounded) {
     type = strikeSign > 0 ? 'CG-' : 'CG+';
     strike = [nodesX[strikeNode], nodesZ[strikeNode], ((nodesY[strikeNode] % L) + L) % L];
-    let t = attachGen * STEP + 0.002;
+    let t = attachGen * STEP + 0.004;
     const positive = type === 'CG+';
-    const ns = positive ? (rnd() < 0.75 ? 1 : 2) : Math.min(10, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.4));
-    strokes.push({ t, amp: positive ? 1.35 : 1 });
-    for (let s = 1; s < ns; s++) { t += 0.03 + 0.075 * rnd(); strokes.push({ t, amp: (0.26 + 0.52 * rnd()) * (1 - 0.06 * s) }); }
-    ccEnd = strokes[0].t + (positive ? 0.09 + 0.2 * rnd() : 0.01 + 0.04 * rnd());
-    ccAmp = positive ? 0.2 : 0.12;
+    const ns = positive ? (rnd() < 0.8 ? 1 : 2) : Math.min(8, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.0));
+    strokes.push({ t, amp: positive ? 1.25 : 1 });
+    for (let s = 1; s < ns; s++) { t += 0.018 + 0.065 * rnd(); strokes.push({ t, amp: (0.22 + 0.52 * rnd()) * (1 - 0.05 * s) }); }
+    ccEnd = strokes[0].t + (positive ? 0.10 + 0.20 * rnd() : 0.012 + 0.045 * rnd());
+    ccAmp = positive ? 0.18 : 0.10;
   } else {
-    const np = 3 + Math.floor(rnd() * 6);
-    let t = leaderEnd + 0.01;
-    for (let s = 0; s < np; s++) { strokes.push({ t, amp: 0.1 + 0.3 * rnd() }); t += 0.02 + 0.06 * rnd(); }
+    const np = 2 + Math.floor(rnd() * 5);
+    let t = leaderEnd + 0.008;
+    for (let s = 0; s < np; s++) { strokes.push({ t, amp: 0.08 + 0.26 * rnd() }); t += 0.015 + 0.05 * rnd(); }
     ccEnd = strokes[0].t + 0.05; ccAmp = 0.06;
   }
   return {
-    id: nextId++, type, simTime: a.time, init: [nodesX[0], nodesZ[0], nodesY[0]], strike, segs, strokes, ccEnd, ccAmp, leaderEnd,
+    id: nextId++, type, simTime: a.time, init: [nodesX[0], nodesZ[0], ((nodesY[0] % L) + L) % L], strike, segs, strokes, ccEnd, ccAmp, leaderEnd,
     chargeC: charge, ratio,
   };
 }

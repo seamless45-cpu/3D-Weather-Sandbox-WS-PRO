@@ -72,6 +72,30 @@ override can still request the full render shader. Hard pixel budgets (`maxPixel
 data the adaptive path assumes the volumetric cloud pass is the bottleneck rather than shrinking
 the whole screen first.
 
+### Cloud, precipitation and lightning visuals
+
+Cloud shape is no longer a direct copy of the 500 m solver cells. The renderer combines the simulated
+condensate, ice fraction, rain and updraft with an advected tileable Perlin-Worley volume: broad
+cellular billows, domain-warped edges, softer density cutoffs and a height/ice profile that keeps
+convective towers upright while flattening anvils. Lighting adds rim-lit silver edges, darker rainy
+bases, warmer low-sun tones and a broad flash glow through the whole cloud body.
+
+Precipitation is split into individually sized drops and crystals near the camera and two
+overlapping, wind-sheared veils farther away. Drops follow a skewed size distribution (many small,
+a few large), fall at size-dependent speeds, drift differently with wind, and render as tapered
+teardrops with a refracted highlight rather than uniform white lines. Frozen particles become
+six-arm crystals; splashes get irregular crowns and secondary droplets. The distant veils use
+advected 3-D noise plus anisotropic falling filaments and soft multi-lobe edges, so the billboard
+outline does not read as a grey card.
+
+Lightning uses a bidirectional DBM leader with a descending/ascending bias, smoother forward-cone
+growth and shallow, order-limited forks. Each rendered channel is a continuous camera-facing ribbon
+with mitered joints, width taper, leader beads, multiple return strokes, continuing current and
+per-segment flicker. Cloud/ground point lights are joined by a broad, decaying sky and cloud glow,
+so a flash lights the storm instead of only the bolt itself. These are visual refinements: the
+solver still produces the channel geometry and the thunder is still synthesised from it.
+
+
 ### Multicell / MCS stage
 
 The storm transition used to add several costs at once: the solver starts advecting seven extra
@@ -157,8 +181,9 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   roughness drag, terrain lifting at the lower boundary, bulk microphysics (Kessler warm rain,
   Bergeron/WBF, riming, graupel, melting/freezing, evaporation, sedimentation), Saunders-type
   non-inductive charging and dielectric-breakdown-model lightning with branched channels.
-* **Rendering** — volumetric ray-marched clouds with light shafts, terrain, water, vegetation,
-  rain streaks, lightning channel geometry and synthesised thunder.
+* **Rendering** — ray-marched clouds with advected Perlin-Worley billows, ice/updraft-aware towers
+  and anvils, soft cloud illumination, size-distributed raindrops and snow crystals, wind-sheared
+  precipitation veils, mitered/tapered lightning ribbons, terrain, water and synthesised thunder.
 
 ## Notes
 

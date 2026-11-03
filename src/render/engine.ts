@@ -193,12 +193,13 @@ export class Engine {
       uTime: { value: 0 }, uSunDir: { value: new V3(0, 1, 0) }, uSunCol: { value: new V3(1, 1, 1) }, uSkyAmb: { value: new V3(0.2, 0.3, 0.5) },
       uHorizon: { value: new V3(0.5, 0.6, 0.8) }, uGroundAmb: { value: new V3(0.2, 0.2, 0.2) }, uTwilight: { value: 0 },
       uDomain: { value: DOMAIN }, uVis: { value: 30000 }, uSkyScale: { value: 14 }, uCloud: { value: this.cloudTex },
-      uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.75, 0.85, 1.0) },
+      uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.82, 0.88, 1.0) },
       uFlashOn: { value: 0 },
       uWind: { value: this.localWind },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
       uCamCloud: { value: 0 }, uPrecipDensity: { value: 1 }, uCheapShadows: { value: 0 },
+      uRainIntensity: { value: 0 }, uFlashGlow: { value: 0 },
     };
     const U = this.U;
     // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
@@ -241,7 +242,7 @@ export class Engine {
 
     // ---- precipitation shafts (one billboard per column, from the ground into the cloud base)
     this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(8, Math.min(q.shafts, nx >> 1))), mk(S.shaftVert, S.shaftFrag, {
-      uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 },
+      uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 }, uNoise: { value: this.noiseTex },
     }, { transparent: true, depthWrite: false }));
     this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
 
@@ -273,10 +274,11 @@ export class Engine {
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
   }
 
-  /** Grid of cylindrical billboards, one per precipitation column, driven by the surface rain texture. */
+  /** Two soft, independently seeded veils per precipitation column. The overlap hides the
+   *  single-billboard outline that made distant rain read as a flat grey card. */
   private buildShafts(n: number): THREE.BufferGeometry {
     const g = new THREE.BufferGeometry();
-    const quads = n * n;
+    const quads = n * n * 2;
     const col = new Float32Array(quads * 4 * 4);
     const corner = new Float32Array(quads * 4 * 2);
     const pos = new Float32Array(quads * 4 * 3);
@@ -285,15 +287,18 @@ export class Engine {
     let q = 0;
     for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
       const x = (i + 0.5) * cell, z = (j + 0.5) * cell;
-      const seed = ((((i * 73856093) ^ (j * 19349663)) >>> 0) % 997) / 997;
-      for (let v = 0; v < 4; v++) {
-        const vi = q * 4 + v;
-        corner[vi * 2] = v === 1 || v === 3 ? 1 : 0;
-        corner[vi * 2 + 1] = v >= 2 ? 1 : 0;
-        col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = seed; col[vi * 4 + 3] = 0;
+      const base = ((((i * 73856093) ^ (j * 19349663)) >>> 0) % 997) / 997;
+      for (let layer = 0; layer < 2; layer++) {
+        const seed = (base + layer * 0.371) % 1;
+        for (let v = 0; v < 4; v++) {
+          const vi = q * 4 + v;
+          corner[vi * 2] = v === 1 || v === 3 ? 1 : 0;
+          corner[vi * 2 + 1] = v >= 2 ? 1 : 0;
+          col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = seed; col[vi * 4 + 3] = layer;
+        }
+        idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4 + 2, q * 4 + 1, q * 4 + 3], q * 6);
+        q++;
       }
-      idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4 + 2, q * 4 + 1, q * 4 + 3], q * 6);
-      q++;
     }
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('aCol', new THREE.BufferAttribute(col, 4));
@@ -338,9 +343,17 @@ export class Engine {
     const g = new THREE.InstancedBufferGeometry();
     const base = new THREE.PlaneGeometry(1, 1);
     g.index = base.index; g.setAttribute('position', base.getAttribute('position'));
-    const seeds = new Float32Array(n * 3);
-    for (let i = 0; i < n * 3; i++) seeds[i] = Math.random();
+    const seeds = new Float32Array(n * 3), drops = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 3; k++) seeds[i * 3 + k] = Math.random();
+      // Skewed toward small drops: a few large, bright, fast ones among many fine ones.
+      drops[i * 4] = 0.18 + 1.35 * Math.pow(Math.random(), 2.2);
+      drops[i * 4 + 1] = 0.25 + 0.75 * Math.random();
+      drops[i * 4 + 2] = Math.random();
+      drops[i * 4 + 3] = Math.random();
+    }
     g.setAttribute('aSeed', new THREE.InstancedBufferAttribute(seeds, 3));
+    g.setAttribute('aDrop', new THREE.InstancedBufferAttribute(drops, 4));
     g.instanceCount = n;
     return g;
   }
@@ -417,59 +430,104 @@ export class Engine {
     return Math.min(1, Math.max(0, (m - 0.08) / 0.32));
   }
 
+  /**
+   * Build a continuous ribbon from the DBM graph. Neighbour endpoints are attached to each
+   * segment so the vertex shader can miter joints, taper branches and hide quad seams.
+   */
   addFlash(ev: FlashEvent, cam: THREE.Vector3) {
     const n = ev.segs.length / 10;
     if (n < 1) return;
-    const aA = new Float32Array(n * 12), aB = new Float32Array(n * 12), aS = new Float32Array(n * 16), aC = new Float32Array(n * 8), ind = new Uint32Array(n * 6);
-    let cx = 0, cy = 0, cz = 0, lowY = 1e9, hiSum = [0, 0, 0], hiN = 0, loSum = [0, 0, 0], loN = 0;
+    type Endpoint = [number, number, number];
+    const A: Endpoint[] = [], B: Endpoint[] = [];
+    const meta: { gen: number; dist: number; order: number; width: number }[] = [];
+    let maxGen = 0;
     for (let i = 0; i < n; i++) {
-      const o = i * 10;
-      const s = ev.segs;
+      const o = i * 10, s = ev.segs;
+      A.push([s[o], s[o + 1], s[o + 2]]);
+      B.push([s[o + 3], s[o + 4], s[o + 5]]);
+      const gen = s[o + 6]; maxGen = Math.max(maxGen, gen);
+      meta.push({ gen, dist: s[o + 7], order: s[o + 8], width: s[o + 9] });
+    }
+    const key = (p: Endpoint) => `${Math.round(p[0] * 100)},${Math.round(p[1] * 100)},${Math.round(p[2] * 100)}`;
+    const adj = new Map<string, { seg: number; other: Endpoint }[]>();
+    const add = (k: string, seg: number, other: Endpoint) => {
+      const list = adj.get(k) || []; list.push({ seg, other }); adj.set(k, list);
+    };
+    for (let i = 0; i < n; i++) { add(key(A[i]), i, B[i]); add(key(B[i]), i, A[i]); }
+    const avgOther = (k: string, exclude: number): Endpoint | null => {
+      const list = adj.get(k); if (!list) return null;
+      let x = 0, y = 0, z = 0, c = 0;
+      for (const e of list) if (e.seg !== exclude) { x += e.other[0]; y += e.other[1]; z += e.other[2]; c++; }
+      return c ? [x / c, y / c, z / c] : null;
+    };
+
+    const aA = new Float32Array(n * 12), aB = new Float32Array(n * 12);
+    const aPrev = new Float32Array(n * 12), aNext = new Float32Array(n * 12);
+    const aS = new Float32Array(n * 16), aC = new Float32Array(n * 8), aSeed = new Float32Array(n * 8);
+    const ind = new Uint32Array(n * 6);
+    for (let i = 0; i < n; i++) {
+      const prev = avgOther(key(A[i]), i) || A[i];
+      const next = avgOther(key(B[i]), i) || B[i];
+      const m = meta[i];
+      const h0 = ((Math.imul(i, 1664525) + 1013904223) >>> 0) / 4294967296;
+      const h1 = ((Math.imul(i, 22695477) + 1) >>> 0) / 4294967296;
       for (let v = 0; v < 4; v++) {
-        const av = (i * 4 + v) * 3, sv = (i * 4 + v) * 4, cv = (i * 4 + v) * 2;
-        aA[av] = s[o]; aA[av + 1] = s[o + 1]; aA[av + 2] = s[o + 2];
-        aB[av] = s[o + 3]; aB[av + 1] = s[o + 4]; aB[av + 2] = s[o + 5];
-        aS[sv] = s[o + 6]; aS[sv + 1] = s[o + 7]; aS[sv + 2] = s[o + 8]; aS[sv + 3] = s[o + 9];
+        const vi = i * 4 + v, av = vi * 3, sv = vi * 4, cv = vi * 2;
+        aA[av] = A[i][0]; aA[av + 1] = A[i][1]; aA[av + 2] = A[i][2];
+        aB[av] = B[i][0]; aB[av + 1] = B[i][1]; aB[av + 2] = B[i][2];
+        aPrev[av] = prev[0]; aPrev[av + 1] = prev[1]; aPrev[av + 2] = prev[2];
+        aNext[av] = next[0]; aNext[av + 1] = next[1]; aNext[av + 2] = next[2];
+        aS[sv] = m.gen; aS[sv + 1] = m.dist; aS[sv + 2] = m.order; aS[sv + 3] = m.width;
         aC[cv] = v >= 2 ? 1 : 0; aC[cv + 1] = v % 2 === 0 ? -1 : 1;
+        aSeed[cv] = h0; aSeed[cv + 1] = h1;
       }
       const io = i * 6, iv = i * 4;
       ind[io] = iv; ind[io + 1] = iv + 1; ind[io + 2] = iv + 2;
       ind[io + 3] = iv + 2; ind[io + 4] = iv + 1; ind[io + 5] = iv + 3;
-      const mx = (s[o] + s[o + 3]) / 2, my = (s[o + 1] + s[o + 4]) / 2, mz = (s[o + 2] + s[o + 5]) / 2;
-      cx += mx; cy += my; cz += mz;
-      if (my < lowY) lowY = my;
     }
-    cx /= n; cy /= n; cz /= n;
+
+    // Width-weighted centroids give the point lights a more representative position on the
+    // actual channel than the old unweighted average over every tiny branch segment.
+    let cx = 0, cy = 0, cz = 0, sumW = 0, lowY = 1e9;
+    const hi = [0, 0, 0, 0], lo = [0, 0, 0, 0];
     for (let i = 0; i < n; i++) {
-      const o = i * 10; const my = (ev.segs[o + 1] + ev.segs[o + 4]) / 2;
-      const mx = (ev.segs[o] + ev.segs[o + 3]) / 2, mz = (ev.segs[o + 2] + ev.segs[o + 5]) / 2;
-      if (my > cy) { hiSum[0] += mx; hiSum[1] += my; hiSum[2] += mz; hiN++; }
-      else { loSum[0] += mx; loSum[1] += my; loSum[2] += mz; loN++; }
+      const mx = (A[i][0] + B[i][0]) / 2, my = (A[i][1] + B[i][1]) / 2, mz = (A[i][2] + B[i][2]) / 2;
+      const w = Math.max(0.12, meta[i].width);
+      cx += mx * w; cy += my * w; cz += mz * w; sumW += w; lowY = Math.min(lowY, my);
+    }
+    cx /= sumW; cy /= sumW; cz /= sumW;
+    for (let i = 0; i < n; i++) {
+      const mx = (A[i][0] + B[i][0]) / 2, my = (A[i][1] + B[i][1]) / 2, mz = (A[i][2] + B[i][2]) / 2;
+      const w = Math.max(0.12, meta[i].width), acc = my > cy ? hi : lo;
+      acc[0] += mx * w; acc[1] += my * w; acc[2] += mz * w; acc[3] += w;
     }
     const off = new THREE.Vector3(Math.round((cam.x - cx) / L) * L, 0, Math.round((cam.z - cz) / L) * L);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(aA, 3));
     geo.setAttribute('aA', new THREE.BufferAttribute(aA, 3)); geo.setAttribute('aB', new THREE.BufferAttribute(aB, 3));
+    geo.setAttribute('aPrev', new THREE.BufferAttribute(aPrev, 3)); geo.setAttribute('aNext', new THREE.BufferAttribute(aNext, 3));
     geo.setAttribute('aS', new THREE.BufferAttribute(aS, 4)); geo.setAttribute('aCorner', new THREE.BufferAttribute(aC, 2));
+    geo.setAttribute('aSeed', new THREE.BufferAttribute(aSeed, 2));
     geo.setIndex(new THREE.BufferAttribute(ind, 1));
     const st = new Array(8).fill(0), sa = new Array(8).fill(0);
     ev.strokes.slice(0, 8).forEach((k, i) => { st[i] = k.t; sa[i] = k.amp; });
+    const leaderStep = ev.leaderEnd / Math.max(1, maxGen);
     const mat = new THREE.ShaderMaterial({
-      vertexShader: S.boltVert.replace('vec3 p = mix(aA, aB, aCorner.x);', 'vec3 p = mix(aA, aB, aCorner.x) + uOff;').replace('uniform float uT;', 'uniform vec3 uOff; uniform float uT;'),
-      fragmentShader: S.boltFrag, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: S.boltVert, fragmentShader: S.boltFrag, transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
       uniforms: {
-        uOff: { value: off }, uT: { value: 0 }, uStep: { value: 0.0016 }, uRS: { value: 1 / 2.0e6 }, uN: { value: Math.min(8, ev.strokes.length) },
+        uOff: { value: off }, uT: { value: 0 }, uStep: { value: leaderStep }, uRS: { value: 1 / 1.5e6 }, uN: { value: Math.min(8, ev.strokes.length) },
         uStrokeT: { value: st }, uStrokeA: { value: sa }, uCCEnd: { value: ev.ccEnd }, uCCAmp: { value: ev.ccAmp }, uLeaderEnd: { value: ev.leaderEnd },
       },
     });
     const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false; mesh.renderOrder = 5;
     this.scene.add(mesh);
-    const cloudPos = new THREE.Vector3(hiN ? hiSum[0] / hiN : cx, hiN ? hiSum[1] / hiN : cy, hiN ? hiSum[2] / hiN : cz).add(off);
+    const cloudPos = new THREE.Vector3(hi[3] ? hi[0] / hi[3] : cx, hi[3] ? hi[1] / hi[3] : cy, hi[3] ? hi[2] / hi[3] : cz).add(off);
     const groundPos = ev.strike ? new THREE.Vector3(ev.strike[0], ev.strike[1] + 30, ev.strike[2]).add(off)
-      : new THREE.Vector3(loN ? loSum[0] / loN : cx, loN ? loSum[1] / loN : lowY, loN ? loSum[2] / loN : cz).add(off);
+      : new THREE.Vector3(lo[3] ? lo[0] / lo[3] : cx, lo[3] ? lo[1] / lo[3] : lowY, lo[3] ? lo[2] / lo[3] : cz).add(off);
     const last = ev.strokes.length ? ev.strokes[ev.strokes.length - 1].t : 0;
     const centre = new THREE.Vector3(cx, cy, cz).add(off);
-    const fv: FlashVis = { ev, t0: performance.now(), mesh, mat, off, cloudPos, groundPos, end: Math.max(ev.ccEnd, last) + 1.4, dist: centre.distanceTo(cam) };
+    const fv: FlashVis = { ev, t0: performance.now(), mesh, mat, off, cloudPos, groundPos, end: Math.max(ev.ccEnd, last) + 1.6, dist: centre.distanceTo(cam) };
     // Only three channels are exposed to uFlash[6]; more simultaneous bolt meshes just add
     // overdraw and per-frame luminance work during a lightning burst.
     while (this.flashes.length >= 3) this.removeFlash(this.flashes[0]);
@@ -484,9 +542,9 @@ export class Engine {
   static flashLum(ev: FlashEvent, t: number): number {
     let l = 0;
     for (const s of ev.strokes) if (t > s.t) { const a = t - s.t; l += s.amp * (Math.exp(-a / 0.012) + 0.25 * Math.exp(-a / 0.07)); }
-    if (t < ev.leaderEnd) l += 0.18 * (t / ev.leaderEnd);
+    if (t < ev.leaderEnd) l += 0.12 * (t / ev.leaderEnd);
     if (ev.strokes.length && t > ev.strokes[0].t && t < ev.ccEnd) l += ev.ccAmp;
-    if (t > ev.leaderEnd) l += 0.03 * Math.exp(-(t - ev.leaderEnd) / 0.35);
+    if (t > ev.leaderEnd) l += 0.03 * Math.exp(-(t - ev.leaderEnd) / 0.42);
     return l;
   }
 
@@ -550,6 +608,8 @@ export class Engine {
     U.uHorizon.value.set(...lt.horizon); U.uGroundAmb.value.set(...lt.groundAmb); U.uTwilight.value = lt.twilight;
     U.uTime.value = this.time;
     U.uVis.value = Math.max(3000, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.05 * this.rainAtCam));
+    // Local rain drives how many near-camera drops survive and how bright the veils are.
+    U.uRainIntensity.value = Math.max(0, Math.min(1, this.rainAtCam / 25));
     U.uCamXZ.value.set(cam.x, cam.z);
     // camera engulfed by condensate: lets the surface shaders skip their cloud-shadow stack
     U.uCamCloud.value = this.camCloudAt(cam.x, cam.y, cam.z);
@@ -575,21 +635,23 @@ export class Engine {
       f.mat.uniforms.uT.value = t;
       const lum = Engine.flashLum(f.ev, t);
       if (i < 3) {
-        fl[i * 2].set(f.cloudPos.x, f.cloudPos.y, f.cloudPos.z, 14 * lum);
-        fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 18 * lum);
+        fl[i * 2].set(f.cloudPos.x, f.cloudPos.y, f.cloudPos.z, 11 * lum);
+        fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 15 * lum);
       }
-      flashSum += (lum * 8) / (1 + (f.dist * f.dist) / (3500 * 3500));
+      flashSum += (lum * 7) / (1 + (f.dist * f.dist) / (3500 * 3500));
       if (t > f.end) this.removeFlash(f);
     });
     this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dt / 0.15));
     U.uFlashOn.value = act.length > 0 ? 1 : 0;
+    // Broad, decaying sky/cloud illumination outlives the individual point lights by a few frames.
+    U.uFlashGlow.value = Math.min(1.25, this.flashLevel * 0.34);
 
     // ---- exposure: physically-motivated from sun elevation and overhead cloud optical depth, with flash compression
     const bright = lt.dayness * (0.3 + 0.7 * tc);
     let target = Math.pow(1 / (0.25 + 0.75 * bright), 0.7) * (1 + 7 * Math.pow(1 - lt.dayness, 2));
     this.expoTarget = target;
     this.exposure += (this.expoTarget - this.exposure) * Math.min(1, dt / 2.2);
-    const expFinal = this.exposure / (1 + 0.5 * this.flashLevel);
+    const expFinal = this.exposure / (1 + 0.42 * this.flashLevel);
     this.compMat.uniforms.uExposure.value = expFinal;
     this.compMat.uniforms.uTime.value = this.time;
 

@@ -164,7 +164,11 @@ export default function App() {
   const reset = () => {
     send({ type: 'reset', params });
     const eng = rtRef.current?.engine;
-    if (eng) { eng.stormLoad = 0; eng.cheapMode = false; eng.U.uPrecipDensity.value = 1; eng.U.uCheapShadows.value = 0; }
+    if (eng) {
+      eng.stormLoad = 0; eng.cheapMode = false;
+      eng.U.uPrecipDensity.value = 1; eng.U.uCheapShadows.value = 0;
+      eng.U.uRainIntensity.value = 0; eng.U.uFlashGlow.value = 0; eng.U.uFlashOn.value = 0;
+    }
     rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f));
     setLastFlash(null);
   };
@@ -347,7 +351,7 @@ export default function App() {
             )}
             <p><b>Resolved:</b> 3-D anelastic Navier–Stokes (∇·ρ₀u=0) on a 64×64×36 MAC grid (Δx=500 m, Δz 146→689 m, 32 km periodic box, 15 km lid), momentum + θ + water vapour + 5 hydrometeor species + 2 charge species advected with a mass-weighted TVD (van Leer) flux scheme, buoyancy from virtual potential temperature and condensate loading, exact FFT/tridiagonal pressure projection (div → round-off). Cold pools, gust fronts, updraft tilt and rotation are emergent. Nothing smaller than ~1.5 km is resolved.</p>
             <p className="mt-1"><b>Parameterised:</b> Deardorff 1.5-order TKE sub-grid closure (entrainment/mixing at cloud edges); surface energy balance (SW with slope/cloud shading, LW, sensible & latent flux, soil moisture, runoff); drag by land-cover roughness; kinematic terrain lifting at the lower boundary; bulk microphysics (Kessler warm rain, Bergeron/WBF deposition, riming, graupel, melting, freezing, evaporation, sedimentation); non-inductive charging (Saunders-type sign reversal at −12 °C, lumped coefficient); effective grid-scale breakdown field = 0.45·E_k(ρ); DBM leader growth on the solved potential; large-scale forcing as weak relaxation of domain-mean wind/θ/moisture and −1.5 K/day radiative cooling.</p>
-            <p className="mt-1"><b>Visual only:</b> sub-grid cloud erosion noise (advected with cloud-weighted winds), rain streaks (placed where the simulated precipitation exists), splashes/ripples, vegetation sway, thunder synthesis from channel geometry (arrival time r/c, absorption, terrain obstruction).</p>
+            <p className="mt-1"><b>Visual only:</b> advected Perlin-Worley cloud billows with ice/updraft-aware towers and anvils, size-distributed raindrops and snow crystals, crown splashes, overlapping wind-sheared precipitation veils, mitered/tapered lightning ribbons with return strokes and broad cloud illumination, vegetation sway, and thunder synthesis from channel geometry (arrival time r/c, absorption, terrain obstruction).</p>
             <p className="mt-1"><b>Diagnostics:</b> CAPE/CIN/LCL/LFC/EL from parcel ascent (virtual-temperature buoyancy, pseudo-adiabat) over the live column; validated against Bolton e<sub>s</sub>, Espy LCL and the Weisman–Klemp sounding. Water budget uses surface evaporation, precipitation and nudging fluxes; the energy residual excludes frictional heating and is approximate.</p>
             <p className="mt-1 lbl">Limitations: periodic box, flat solver levels (terrain via lower-boundary w), single-moment microphysics, no aerosol, no Coriolis. Time-lapse (×N) compresses simulated time, including lightning rate.</p>
           </div>
