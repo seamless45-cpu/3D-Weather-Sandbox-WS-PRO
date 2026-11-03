@@ -6,6 +6,7 @@ import { computeLighting } from './skyModel';
 import { makeNoiseData } from './noise';
 import * as S from './glsl';
 import * as T from './tornadoGlsl';
+import { FluidSim } from './fluid';
 
 export type Tier = 'low' | 'mid' | 'high';
 export interface Quality {
@@ -74,6 +75,18 @@ export function readTierPref(): Tier | null {
   } catch { return null; }
 }
 
+/** User-selected device-pixel-ratio target (null = tier default). Persisted across sessions. */
+export function readPRPref(): number | null {
+  try {
+    const v = localStorage.getItem('atmos.pr');
+    const n = v === null ? NaN : Number(v);
+    return isFinite(n) && n >= 0.4 && n <= 2.5 ? n : null;
+  } catch { return null; }
+}
+export function writePRPref(v: number | null) {
+  try { if (v === null) localStorage.removeItem('atmos.pr'); else localStorage.setItem('atmos.pr', String(v)); } catch { /* ignore */ }
+}
+
 function isCoarsePointer(): boolean {
   try { return typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches; } catch { return false; }
 }
@@ -138,6 +151,12 @@ export class Engine {
   cloudMat: THREE.ShaderMaterial; compMat: THREE.ShaderMaterial;
   terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh; shaftMesh: THREE.Mesh;
   funnelMesh: THREE.Mesh; debrisPoints: THREE.Points; vehicleGroup: THREE.Group;
+  /** GPU stable-fluids flow field; clouds/shafts/rain sample its velocity texture. */
+  fluid: FluidSim;
+  /** Charge-particle cloud (+/− glyphs) for the show-charges toggle. */
+  chargePoints!: THREE.Points;
+  private chargeCount = 0; chargeVisible = false;
+  private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
@@ -145,6 +164,8 @@ export class Engine {
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
   lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0; lastSoftSpike = 0;
+  /** User pixel-ratio target (device pixels per CSS pixel); initialised from the tier preset. */
+  userPR: number;
   cloudW = 0; cloudH = 0; stormLoad = 0; cheapMode = false;
   // GPU time per pass in ms (EXT_disjoint_timer_query_webgl2); null when unavailable.
   timerExt: any = null;
@@ -159,8 +180,11 @@ export class Engine {
     try { this.adaptive = !new URLSearchParams(location.search).has('noadapt'); } catch { /* keep default */ }
     this.q = q; this.terrain = terrain; this.nx = nx; this.nz = nzr; this.cloudScale = q.cloudScale;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', alpha: false });
+    this.userPR = q.pr;
     this.renderer.setPixelRatio(q.pr);
     this.renderer.autoClear = false;
+    // The fluid field is domain-wide but cheap (a few dozen 128-256² passes); tier picks N.
+    this.fluid = new FluidSim(this.renderer, q.tier === 'low' ? 128 : q.tier === 'mid' ? 192 : 256, DOMAIN);
     // Opt-in only: reading query results every frame is a pipeline sync and can itself
     // perturb the frame times we are trying to measure. ?profile=1 enables it.
     try {
@@ -205,8 +229,11 @@ export class Engine {
       uRainIntensity: { value: 0 }, uFlashGlow: { value: 0 },
       uTornado: { value: new THREE.Vector4(DOMAIN / 2, DOMAIN / 2, 220, 0) }, uTornadoTop: { value: 1200 },
       uHeavyRain: { value: 0 }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uDenoise: { value: 1 },
+      uFluid: { value: this.fluid.texture },
     };
     const U = this.U;
+    // The fluid force pass reads the surface rain and the lowest cloud layer directly.
+    this.fluid.bindUniforms(this.surfTex, this.cloudTex, 0.09);
     // Low tier compiles a cut-down variant of every shader (see #ifdef LOWQ in glsl.ts)
     this.defs = q.tier === 'low' ? { LOWQ: 1 } : undefined;
     const mk = (vs: string, fs: string, extra: Record<string, { value: any }> = {}, opts: Partial<THREE.ShaderMaterialParameters> = {}) =>
@@ -273,8 +300,18 @@ export class Engine {
     debrisGeo.setAttribute('aSeed', new THREE.BufferAttribute(debrisSeed, 3));
     this.debrisPoints = new THREE.Points(debrisGeo, mk(T.debrisVert, T.debrisFrag, { uDebris: { value: 0 }, uTop: { value: 1200 } }, { transparent: true, depthWrite: false }));
     this.debrisPoints.frustumCulled = false; this.debrisPoints.renderOrder = 3.6; this.debrisPoints.visible = false; this.scene.add(this.debrisPoints);
-    this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag));
+    this.lampM = mk(T.vehicleVert, T.lampFrag, { uHead: { value: 0 }, uTail: { value: 0 }, uPulse: { value: 0 } });
+    this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag), this.lampM);
     this.vehicleGroup.visible = false; this.vehicleGroup.renderOrder = 4; this.scene.add(this.vehicleGroup);
+    // ---- charge particles: + (red) and − (blue) glyphs over the simulated charge pockets
+    const MAXCH = 6000;
+    const chGeo = new THREE.BufferGeometry();
+    chGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAXCH * 3), 3));
+    chGeo.setAttribute('aQ', new THREE.BufferAttribute(new Float32Array(MAXCH * 2), 2));
+    chGeo.setDrawRange(0, 0);
+    this.chargePoints = new THREE.Points(chGeo, mk(S.chargeVert, S.chargeFrag, {}, { transparent: true, depthWrite: false }));
+    this.chargePoints.frustumCulled = false; this.chargePoints.renderOrder = 4.6;
+    this.chargePoints.visible = false; this.scene.add(this.chargePoints);
 
     // ---- cloud + composite passes
     this.cloudMat = new THREE.ShaderMaterial({
@@ -297,30 +334,37 @@ export class Engine {
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
   }
 
-  /** Six fixed-azimuth, independently seeded planes per precipitation column. The overlap
-   *  forms a cylindrical rainshaft that reads as a volume from every camera angle. */
+  /** Six fixed-azimuth, independently seeded planes per precipitation column, each
+   *  subdivided vertically so the vertex shader can tear the silhouette and bow the planes
+   *  into cylinders. The overlap forms a rainshaft that reads as a volume from every angle. */
   private buildShafts(n: number): THREE.BufferGeometry {
     const g = new THREE.BufferGeometry();
     const SHAFT_PLANES = 6;
-    const quads = n * n * SHAFT_PLANES;
-    const col = new Float32Array(quads * 4 * 4);
-    const corner = new Float32Array(quads * 4 * 2);
-    const pos = new Float32Array(quads * 4 * 3);
-    const idx = new Uint32Array(quads * 6);
+    const SEG = 6;   // vertical rows: ragged edges need vertices to bend
+    const vertsPerPlane = (SEG + 1) * 2;
+    const planes = n * n * SHAFT_PLANES;
+    const verts = planes * vertsPerPlane;
+    const col = new Float32Array(verts * 4);
+    const corner = new Float32Array(verts * 2);
+    const pos = new Float32Array(verts * 3);
+    const idx = new Uint32Array(planes * SEG * 6);
     const cell = DOMAIN / n;
-    let q = 0;
+    let vp = 0, ip = 0;
     for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
       const x = (i + 0.5) * cell, z = (j + 0.5) * cell;
       const base = ((((i * 73856093) ^ (j * 19349663)) >>> 0) % 997) / 997;
       for (let layer = 0; layer < SHAFT_PLANES; layer++) {
-        for (let v = 0; v < 4; v++) {
-          const vi = q * 4 + v;
-          corner[vi * 2] = v === 1 || v === 3 ? 1 : 0;
-          corner[vi * 2 + 1] = v >= 2 ? 1 : 0;
-          col[vi * 4] = x; col[vi * 4 + 1] = z; col[vi * 4 + 2] = base; col[vi * 4 + 3] = layer;
+        const p0 = vp;
+        for (let r = 0; r <= SEG; r++) for (let c = 0; c < 2; c++) {
+          col[vp * 4] = x; col[vp * 4 + 1] = z; col[vp * 4 + 2] = base; col[vp * 4 + 3] = layer;
+          corner[vp * 2] = c; corner[vp * 2 + 1] = r / SEG;
+          vp++;
         }
-        idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4 + 2, q * 4 + 1, q * 4 + 3], q * 6);
-        q++;
+        for (let r = 0; r < SEG; r++) {
+          const a = p0 + r * 2;
+          idx.set([a, a + 1, a + 2, a + 2, a + 1, a + 3], ip);
+          ip += 6;
+        }
       }
     }
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -361,35 +405,164 @@ export class Engine {
     return g;
   }
 
-  /** Low-poly mesonet-style intercept truck: chassis, cabin, roof rack, probe mast and wheels. */
-  private buildVehicle(material: THREE.ShaderMaterial): THREE.Group {
+  /**
+   * Mesonet/DOW-style intercept truck, long axis along local ±Z (the truck drives *forward*,
+   * which the old X-long model did not). Cab, shelter box, light bar, rear beacons, spinning
+   * cup anemometer, rotating radome, deployable front probe, brake/head lamps and steered,
+   * spinning wheels are all separate nodes so `render()` can animate them from the pose.
+   */
+  private buildVehicle(material: THREE.ShaderMaterial, lamp: THREE.ShaderMaterial): THREE.Group {
     const group = new THREE.Group();
-    const part = (geom: THREE.BufferGeometry, color: [number, number, number], x: number, y: number, z: number, rx = 0, ry = 0, rz = 0) => {
+    const part = (geom: THREE.BufferGeometry, color: [number, number, number], x: number, y: number, z: number, rx = 0, ry = 0, rz = 0, mat: THREE.ShaderMaterial = material) => {
       const g = geom.clone();
       const n = g.getAttribute('position').count;
       const cols = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) { cols[i * 3] = color[0]; cols[i * 3 + 1] = color[1]; cols[i * 3 + 2] = color[2]; }
       g.setAttribute('aColor', new THREE.BufferAttribute(cols, 3));
-      const m = new THREE.Mesh(g, material);
+      const m = new THREE.Mesh(g, mat);
       m.position.set(x, y, z); m.rotation.set(rx, ry, rz); group.add(m);
+      return m;
     };
-    const armored: [number, number, number] = [0.16, 0.19, 0.20];
-    const glass: [number, number, number] = [0.12, 0.20, 0.26];
-    const trim: [number, number, number] = [0.42, 0.40, 0.34];
-    part(new THREE.BoxGeometry(4.6, 1.05, 2.15), armored, 0, 0.95, 0);
-    part(new THREE.BoxGeometry(2.35, 1.15, 2.0), armored, -0.45, 1.95, 0);
-    part(new THREE.BoxGeometry(2.30, 0.65, 2.03), glass, -0.45, 2.18, 0);
-    part(new THREE.BoxGeometry(4.75, 0.16, 2.25), trim, 0, 1.52, 0);
-    part(new THREE.BoxGeometry(1.55, 0.10, 2.15), trim, 1.35, 1.55, 0);
-    part(new THREE.BoxGeometry(0.10, 1.95, 0.10), trim, 0.45, 2.85, 0.85);
-    part(new THREE.BoxGeometry(0.10, 1.95, 0.10), trim, 0.45, 2.85, -0.85);
-    part(new THREE.BoxGeometry(1.45, 0.09, 0.09), trim, 0.45, 3.82, 0);
-    part(new THREE.BoxGeometry(0.09, 1.65, 0.09), trim, -0.25, 3.0, 0);
-    part(new THREE.BoxGeometry(0.55, 0.55, 0.55), [0.55, 0.12, 0.08], -0.25, 3.95, 0);
-    const wheel = new THREE.CylinderGeometry(0.56, 0.56, 0.38, 16);
-    for (const x of [-1.55, 1.55]) for (const z of [-1.16, 1.16]) {
-      part(wheel, [0.045, 0.045, 0.05], x, 0.56, z, Math.PI / 2, 0, 0);
+    const body: [number, number, number] = [0.68, 0.70, 0.70];     // white chase-truck body
+    const dark: [number, number, number] = [0.09, 0.095, 0.10];    // frame, trim, tyres
+    const glass: [number, number, number] = [0.10, 0.16, 0.22];
+    const accent: [number, number, number] = [0.85, 0.32, 0.06];   // safety orange
+    const steel: [number, number, number] = [0.35, 0.37, 0.38];
+
+    // frame rails + hull (front = local −Z)
+    part(new THREE.BoxGeometry(0.14, 0.2, 4.7), dark, -0.55, 0.62, 0);
+    part(new THREE.BoxGeometry(0.14, 0.2, 4.7), dark, 0.55, 0.62, 0);
+    part(new THREE.BoxGeometry(2.1, 0.8, 4.55), body, 0, 1.1, 0);
+    part(new THREE.BoxGeometry(2.14, 0.16, 4.6), accent, 0, 1.32, 0);          // side stripe
+    // hood, grille, bumper, winch
+    part(new THREE.BoxGeometry(1.95, 0.5, 1.35), body, 0, 1.7, -1.6, -0.05);
+    part(new THREE.BoxGeometry(1.5, 0.42, 0.08), dark, 0, 1.35, -2.32);
+    part(new THREE.BoxGeometry(2.2, 0.3, 0.32), steel, 0, 0.95, -2.45);
+    part(new THREE.CylinderGeometry(0.12, 0.12, 0.6, 10), dark, 0, 1.22, -2.48, 0, 0, Math.PI / 2);
+    // cab + sloped windshield + side glass + roof rack
+    part(new THREE.BoxGeometry(2.0, 1.05, 1.5), body, 0, 2.1, -0.35);
+    part(new THREE.BoxGeometry(1.85, 0.75, 0.08), glass, 0, 2.2, -1.14, -0.38);
+    part(new THREE.BoxGeometry(0.07, 0.55, 1.1), glass, -1.0, 2.2, -0.3);
+    part(new THREE.BoxGeometry(0.07, 0.55, 1.1), glass, 1.0, 2.2, -0.3);
+    part(new THREE.BoxGeometry(1.9, 0.08, 1.45), steel, 0, 2.66, -0.35);
+    // instrument shelter over the bed
+    part(new THREE.BoxGeometry(2.0, 1.1, 1.95), body, 0, 2.1, 1.3);
+    part(new THREE.BoxGeometry(2.06, 0.2, 0.1), accent, 0, 2.45, 1.3);
+    // light bar (lens is a lamp part: amber, pulses)
+    part(new THREE.BoxGeometry(1.5, 0.1, 0.3), dark, 0, 2.74, -0.35);
+    part(new THREE.BoxGeometry(1.42, 0.13, 0.24), [1.0, 0.55, 0.1], 0, 2.84, -0.35, 0, 0, 0, lamp);
+    part(new THREE.CylinderGeometry(0.12, 0.12, 0.16, 10), [1.0, 0.55, 0.1], -0.8, 2.72, 2.2, 0, 0, 0, lamp);
+    part(new THREE.CylinderGeometry(0.12, 0.12, 0.16, 10), [1.0, 0.55, 0.1], 0.8, 2.72, 2.2, 0, 0, 0, lamp);
+    // head lamps (white, uHead) and tail lamps (red, uTail)
+    part(new THREE.BoxGeometry(0.36, 0.18, 0.07), [1, 1, 1], -0.66, 1.62, -2.36, 0, 0, 0, lamp);
+    part(new THREE.BoxGeometry(0.36, 0.18, 0.07), [1, 1, 1], 0.66, 1.62, -2.36, 0, 0, 0, lamp);
+    part(new THREE.BoxGeometry(0.3, 0.16, 0.07), [0.9, 0.08, 0.06], -0.72, 1.5, 2.3, 0, 0, 0, lamp);
+    part(new THREE.BoxGeometry(0.3, 0.16, 0.07), [0.9, 0.08, 0.06], 0.72, 1.5, 2.3, 0, 0, 0, lamp);
+    // mirrors, exhaust stacks, whip antenna, mud flaps
+    part(new THREE.BoxGeometry(0.05, 0.05, 0.35), dark, -1.15, 2.35, -1.0);
+    part(new THREE.BoxGeometry(0.05, 0.32, 0.22), dark, -1.3, 2.3, -1.12);
+    part(new THREE.BoxGeometry(0.05, 0.05, 0.35), dark, 1.15, 2.35, -1.0);
+    part(new THREE.BoxGeometry(0.05, 0.32, 0.22), dark, 1.3, 2.3, -1.12);
+    part(new THREE.CylinderGeometry(0.07, 0.07, 1.3, 8), steel, -0.95, 2.4, 0.55);
+    part(new THREE.CylinderGeometry(0.07, 0.07, 1.3, 8), steel, 0.95, 2.4, 0.55);
+    part(new THREE.BoxGeometry(0.03, 1.4, 0.03), dark, -0.9, 3.4, 2.15);
+    part(new THREE.BoxGeometry(0.5, 0.35, 0.03), dark, -1.0, 0.5, 1.6);
+    part(new THREE.BoxGeometry(0.5, 0.35, 0.03), dark, 1.0, 0.5, 1.6);
+
+    // sensor mast: cross arm, spinning cup anemometer, wind vane, slow-sweep radome
+    part(new THREE.BoxGeometry(0.09, 2.3, 0.09), steel, 0.55, 3.4, 1.95);
+    part(new THREE.BoxGeometry(1.0, 0.07, 0.07), steel, 0.55, 4.5, 1.95);
+    const rotor = new THREE.Group();
+    rotor.position.set(0.55, 4.66, 1.95);
+    const cupGeo = new THREE.BoxGeometry(0.17, 0.1, 0.06);
+    for (let k = 0; k < 3; k++) {
+      const a = (k / 3) * Math.PI * 2;
+      const arm = new THREE.Mesh((() => { const g = new THREE.BoxGeometry(0.3, 0.03, 0.03); return g; })(), material);
+      arm.position.set(Math.cos(a) * 0.16, 0, Math.sin(a) * 0.16);
+      arm.rotation.y = -a;
+      const cup = new THREE.Mesh(cupGeo, material);
+      const n = cupGeo.getAttribute('position').count;
+      const cc = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cc[i * 3] = steel[0]; cc[i * 3 + 1] = steel[1]; cc[i * 3 + 2] = steel[2]; }
+      cup.geometry = cupGeo.clone();
+      cup.geometry.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+      cup.position.set(Math.cos(a) * 0.32, 0, Math.sin(a) * 0.32);
+      cup.rotation.y = -a;
+      rotor.add(arm, cup);
     }
+    // arm meshes need aColor too
+    rotor.children.forEach((ch) => {
+      const m = ch as THREE.Mesh;
+      if (!m.geometry.getAttribute('aColor')) {
+        const g = m.geometry.clone();
+        const n = g.getAttribute('position').count;
+        const cc = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) { cc[i * 3] = steel[0]; cc[i * 3 + 1] = steel[1]; cc[i * 3 + 2] = steel[2]; }
+        g.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+        m.geometry = g;
+      }
+    });
+    group.add(rotor);
+    const dish = new THREE.Group();
+    dish.position.set(0.55, 3.9, 1.95);
+    const dishMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 0.07, 14), material);
+    {
+      const g = dishMesh.geometry;
+      const n = g.getAttribute('position').count;
+      const cc = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cc[i * 3] = 0.82; cc[i * 3 + 1] = 0.84; cc[i * 3 + 2] = 0.86; }
+      g.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+    }
+    dishMesh.rotation.x = -0.55;
+    dish.add(dishMesh);
+    group.add(dish);
+
+    // deployable probe boom off the front bumper: stowed folded up, deployed level
+    const probe = new THREE.Group();
+    probe.position.set(0.0, 1.3, -2.5);
+    const boom = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.09, 1.2), material);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.24), material);
+    for (const [m, col, pz] of [[boom, steel, -0.6] as const, [head, accent, -1.25] as const]) {
+      const g = m.geometry;
+      const n = g.getAttribute('position').count;
+      const cc = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cc[i * 3] = col[0]; cc[i * 3 + 1] = col[1]; cc[i * 3 + 2] = col[2]; }
+      g.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+      m.position.z = pz;
+      probe.add(m);
+    }
+    probe.rotation.x = 1.15;   // stowed (folded up against the grille)
+    group.add(probe);
+
+    // wheels: steer pivot > spin node > tyre mesh (axle along local X)
+    const steerGroups: THREE.Group[] = [];
+    const spinGroups: THREE.Group[] = [];
+    const tyreGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.44, 18);
+    for (const [x, z] of [[-1.02, -1.55], [1.02, -1.55], [-1.02, 1.55], [1.02, 1.55]] as const) {
+      const steer = new THREE.Group(); steer.position.set(x, 0.6, z);
+      const spin = new THREE.Group();
+      const tyre = new THREE.Mesh(tyreGeo.clone(), material);
+      const n = tyreGeo.getAttribute('position').count;
+      const cc = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cc[i * 3] = 0.05; cc[i * 3 + 1] = 0.05; cc[i * 3 + 2] = 0.055; }
+      tyre.geometry.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+      tyre.rotation.z = Math.PI / 2;
+      const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.46, 12), material);
+      {
+        const g = hub.geometry;
+        const m = g.getAttribute('position').count;
+        const hc = new Float32Array(m * 3);
+        for (let i = 0; i < m; i++) { hc[i * 3] = steel[0]; hc[i * 3 + 1] = steel[1]; hc[i * 3 + 2] = steel[2]; }
+        g.setAttribute('aColor', new THREE.BufferAttribute(hc, 3));
+      }
+      hub.rotation.z = Math.PI / 2;
+      spin.add(tyre, hub);
+      steer.add(spin);
+      group.add(steer);
+      if (z < 0) steerGroups.push(steer);
+      spinGroups.push(spin);
+    }
+    group.userData = { rotor, dish, probe, steerGroups, spinGroups };
     return group;
   }
 
@@ -414,7 +587,13 @@ export class Engine {
 
   /** Largest pixel ratio that keeps the scene pass inside this tier's pixel budget. */
   private maxPixelRatio(): number {
-    return Math.min(this.q.pr, Math.sqrt(this.q.maxPixels / Math.max(1, this.cssW * this.cssH)));
+    return Math.min(this.userPR, Math.sqrt(this.q.maxPixels / Math.max(1, this.cssW * this.cssH)));
+  }
+
+  /** Explicit pixel-ratio target from the UI slider (device pixels per CSS pixel). */
+  setUserPR(v: number) {
+    this.userPR = Math.max(0.4, Math.min(2.5, v));
+    this.resize(this.cssW, this.cssH);
   }
 
   resize(w: number, h: number) {
@@ -461,6 +640,7 @@ export class Engine {
     if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
     this.localWind.set(s.local.u, s.local.v);
     this.tornado = s.tornado || null;
+    if (this.chargeVisible) this.setCharges(s.charges || null);
     this.chargeTripole = typeof s.charge?.tripole === 'number' ? s.charge.tripole : 0;
     // Pre-empt the multicell transition: cloud coverage, core count and rain all predict the
     // coming dense-march/precipitation cost, so quality starts easing before frames are lost.
@@ -472,15 +652,40 @@ export class Engine {
     this.stormLoad += (load - this.stormLoad) * 0.45;
   }
 
-  /** Place the player-driven intercept vehicle from the controller's pose. */
+  /** Place the player-driven intercept vehicle from the controller's pose (yaw/pitch/roll). */
   setVehiclePose(pose: any) {
     this.vehiclePose = pose;
     const v = this.vehicleGroup;
     if (!pose || !pose.active) { v.visible = false; return; }
     const gh = this.terrain.groundHeight(pose.x, pose.z);
     v.visible = true;
-    v.position.set(pose.x, gh + 0.05, pose.z);
-    v.rotation.set(0, pose.heading || 0, pose.roll || 0);
+    v.position.set(pose.x, gh + 0.05 + (pose.bounce || 0), pose.z);
+    v.rotation.order = 'YXZ';
+    v.rotation.set(pose.pitch || 0, pose.heading || 0, pose.roll || 0);
+  }
+
+  /** Update the charge-particle buffer (5 floats per point: x, y, z, signed magnitude, phase). */
+  setCharges(data: Float32Array | null) {
+    const n = data ? Math.floor(data.length / 5) : 0;
+    const geo = this.chargePoints.geometry;
+    const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+    const aq = geo.getAttribute('aQ') as THREE.BufferAttribute;
+    const pa = pos.array as Float32Array, qa = aq.array as Float32Array;
+    const cap = pa.length / 3;
+    const m = Math.min(n, cap);
+    for (let i = 0; i < m; i++) {
+      pa[i * 3] = data![i * 5]; pa[i * 3 + 1] = data![i * 5 + 1]; pa[i * 3 + 2] = data![i * 5 + 2];
+      qa[i * 2] = data![i * 5 + 3]; qa[i * 2 + 1] = data![i * 5 + 4];
+    }
+    pos.needsUpdate = true; aq.needsUpdate = true;
+    geo.setDrawRange(0, m);
+    this.chargeCount = m;
+    this.chargePoints.visible = this.chargeVisible && m > 0;
+  }
+  showCharges(on: boolean) {
+    this.chargeVisible = on;
+    this.chargePoints.visible = on && this.chargeCount > 0;
+    if (!on) this.setCharges(null);
   }
 
   /** How much condensate sits *at the camera* (0..1). Drives the cheap surface shaders and
@@ -593,6 +798,7 @@ export class Engine {
       uniforms: {
         uOff: { value: off }, uT: { value: 0 }, uStep: { value: leaderStep }, uRS: { value: 1 / 1.5e6 }, uN: { value: Math.min(8, ev.strokes.length) },
         uStrokeT: { value: st }, uStrokeA: { value: sa }, uCCEnd: { value: ev.ccEnd }, uCCAmp: { value: ev.ccAmp }, uLeaderEnd: { value: ev.leaderEnd },
+        uPol: { value: ev.type === 'CG+' ? 1 : ev.type === 'CG-' ? -1 : 0 },
       },
     });
     const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false; mesh.renderOrder = 5;
@@ -694,6 +900,22 @@ export class Engine {
     (this.debrisPoints.material as THREE.ShaderMaterial).uniforms.uDebris.value = tor && tor.active ? tor.debris : 0;
     this.debrisPoints.visible = this.funnelMesh.visible && tor && tor.debris > 0.08 && tor.distance < 9000;
     this.setVehiclePose(this.vehiclePose);
+    // ---- animate the intercept vehicle: rotor, radome, probe boom, lamps, wheels
+    if (this.vehiclePose && this.vehiclePose.active && this.vehicleGroup.visible) {
+      const pose = this.vehiclePose;
+      const ud = this.vehicleGroup.userData as any;
+      ud.rotor.rotation.y += dt * (3.0 + Math.min(30, pose.wind || 0) * 0.6);
+      ud.dish.rotation.y += dt * 0.7;
+      this.probeT += ((pose.probe ? 1 : 0) - this.probeT) * Math.min(1, dt * 2.4);
+      ud.probe.rotation.x = 1.15 * (1 - this.probeT);
+      this.wheelSpin += ((pose.speed || 0) / 0.6) * dt;
+      for (const s of ud.spinGroups) s.rotation.x = this.wheelSpin;
+      const steerA = (pose.steer || 0) * 0.38;
+      for (const s of ud.steerGroups) s.rotation.y = steerA;
+      this.lampM.uniforms.uPulse.value = 0.2 + 0.8 * Math.max(0, Math.sin(this.time * 7.0));
+      this.lampM.uniforms.uHead.value = pose.lights ? 1 : 0.05;
+      this.lampM.uniforms.uTail.value = pose.brake ? 1 : (pose.lights ? 0.35 : 0.07);
+    }
 
     // ---- lighting from the sun and the simulated sky state
     const sun = sunState(this.lastSimTime);
@@ -762,6 +984,10 @@ export class Engine {
       wo[b].set(wrap(this.offCur[b * 2] + this.offVel[b * 2] * dts),
                 wrap(this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts));
     }
+
+    // ---- fluid dynamics: advance the shared flow field, then hand its texture to every material
+    this.fluid.step(dt, { wind: this.localWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
+    U.uFluid.value = this.fluid.texture;
 
     this.pollTimer(0, 'scene'); this.pollTimer(1, 'cloud'); this.pollTimer(2, 'comp');
     // ---- pass 1: scene
@@ -878,5 +1104,5 @@ export class Engine {
     if (this.cloudTex) { (this.cloudTex.image.data as Uint8Array).fill(0); this.cloudTex.needsUpdate = true; }
     if (this.surfTex) { (this.surfTex.image.data as Uint8Array).fill(0); this.surfTex.needsUpdate = true; }
   }
-  dispose() { this.renderer.dispose(); }
+  dispose() { this.fluid.dispose(); this.renderer.dispose(); }
 }

@@ -112,3 +112,25 @@ void main(){
   col = applyFog(col, vW);
   gl_FragColor = vec4(col, 1.0);
 }`;
+
+// Vehicle lamps: one shader for head lamps (white → uHead), tail/brake lamps (red → uTail)
+// and the amber beacon bar (pulses with uPulse). The part colour selects the channel.
+export const lampFrag = /* glsl */ `
+${COMMON}
+varying vec3 vN; varying vec3 vW; varying vec3 vCol;
+uniform float uHead; uniform float uTail; uniform float uPulse;
+void main(){
+  // white≈ neutral (r≈g≈b), amber (beacon) has g well above b but far below r,
+  // red tail has g tiny. Order matters: amber before red.
+  bool white = abs(vCol.r - vCol.b) < 0.15;
+  bool amber = !white && vCol.g > 0.30 * vCol.r;
+  float k = white ? uHead : (amber ? (0.25 + 0.75 * uPulse) : uTail);
+  vec3 emis = vCol * k * (1.4 + 0.9 * k);
+  // A little surface shading keeps the lens housings attached to the truck at night.
+  vec3 n = normalize(vN);
+  float dif = max(dot(n, uSunDir), 0.0);
+  vec3 col = vCol * (uSkyAmb * 0.3 + uSunCol * dif * 0.15) + emis;
+  if (uFlashOn > 0.5) col += flashLight(vW, n) * 0.2;
+  col = applyFog(col, vW);
+  gl_FragColor = vec4(col, 1.0);
+}`;
