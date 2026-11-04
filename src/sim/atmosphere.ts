@@ -18,7 +18,7 @@ import { tryLightning } from './lightning';
 
 export interface Stats {
   maxW: number; minW: number; maxQc: number; maxQi: number; maxQr: number; maxQg: number; maxRain: number;
-  maxE: number; maxEratio: number; KE: number; waterRes: number; energyRes: number; maxDiv: number; cfl: number;
+  maxE: number; maxEratio: number; maxEz0: number; KE: number; waterRes: number; energyRes: number; maxDiv: number; cfl: number;
   cloudFrac: number; coldPool: number; coldPoolMin: number; meanTs: number; maxUH: number; precipCum: number; flashes: number;
   waterTotal: number; chargePos: number; chargeNeg: number; maxCape: number;
   tornadoActive: number; tornadoIntensity: number; tornadoPotential: number; tornadoEF: number;
@@ -35,6 +35,15 @@ export class Atmosphere {
   Km!: Float32Array; Kh!: Float32Array; tmp!: Float32Array; rhs!: Float32Array;
   M0!: Float32Array; M1!: Float32Array; M2!: Float32Array; M3!: Float32Array;
   phi!: Float32Array; emag!: Float32Array; ez!: Float32Array;
+  /** Surface charge density on the ground [C/m²]: charge rained out of the cloud and charge
+   *  induced on the surface by the overhead dipole. Feeds the Poisson rhs so the field just
+   *  above the ground reflects it — this is what makes nearby cloud-to-ground lightning
+   *  possible (real CGs overwhelmingly strike where surface charge has accumulated). */
+  qGround!: Float32Array;
+  /** max |qGround| over the domain, maintained by sedimentation and the electric solve. */
+  qgMax = 0;
+  /** Ground-flash trigger diagnostics (cells/field seen by the ground block in tryLightning). */
+  gd = { call: 0, cand: 0, maxR: 0, pass: 0, blk: 0, sel: 0, roll: 0 };
   Ts!: Float32Array; soilM!: Float32Array; surfW!: Float32Array; rainRate!: Float32Array; surfPrec!: Float32Array;
   Hf!: Float32Array; LEf!: Float32Array; Tdeep!: Float32Array; tauCol!: Float32Array; ustar!: Float32Array; swd!: Float32Array;
   colHydro!: Uint8Array; act!: Uint8Array; rowAct!: Uint8Array; colAct!: Uint8Array;
@@ -77,6 +86,7 @@ export class Atmosphere {
     this.Km = F(n3); this.Kh = F(n3); this.tmp = F(n3); this.rhs = F(n3);
     this.M0 = F(n3); this.M1 = F(n3); this.M2 = F(n3); this.M3 = F(n3);
     this.phi = F(n3); this.emag = F(n3); this.ez = F(n3);
+    this.qGround = F(nxy);
     this.Ts = F(nxy); this.soilM = F(nxy); this.surfW = F(nxy); this.rainRate = F(nxy); this.surfPrec = F(nxy);
     this.Hf = F(nxy); this.LEf = F(nxy); this.Tdeep = F(nxy); this.tauCol = F(nxy); this.ustar = F(nxy); this.swd = F(nxy);
     this.colHydro = new Uint8Array(nxy); this.act = new Uint8Array(nxy); this.rowAct = new Uint8Array(n); this.colAct = new Uint8Array(n);
@@ -137,6 +147,7 @@ export class Atmosphere {
     this.time = 11 * 3600; this.step_n = 0; this.dt = 4;
     this.precipCum = 0; this.iceGroundCum = 0; this.evapCum = 0; this.nudgeWater = 0; this.srcEnergy = 0; this.flashCount = 0;
     this.anyHydro = false; this.chargeMax = 0; this.lastLightningT = -1e9;
+    this.qGround.fill(0); this.qgMax = 0;
     this.terrainBC();
     this.project(4);
     this.computeStats();
@@ -487,16 +498,24 @@ export class Atmosphere {
       for (let ij = 0; ij < nxy; ij++) { const c = k * nxy + ij; su += this.uc[c]; sv += this.vc[c]; st += this.th[c]; sq += this.qv[c]; }
       mu[k] = su / nxy; mv[k] = sv / nxy; mth[k] = st / nxy; mq[k] = sq / nxy;
     }
-    const drift = Math.min(1, (this.time - 9 * 3600) / 36000);
-    void drift;
+    const sinE = sunState(this.time).sinElev;
+    const dayH = Math.max(0, sinE), nightH = Math.max(0, -sinE);
     for (let k = 0; k < nz; k++) {
       const z = g.zc[k];
       const tau = z < 1500 ? 3600 : 2400;
       const du = ((pr.u[k] - mu[k]) * dt) / tau, dv = ((pr.v[k] - mv[k]) * dt) / tau;
       // radiative cooling (-1.5 K/day in troposphere), weak mean-theta relaxation (synoptic advection), mean-moisture advection from outside the periodic box
       const rad = z < 12000 ? (-1.5 / 86400) * dt / pr.pi[k] : 0;
-      const dth = rad + ((pr.th[k] - mth[k]) * dt) / (z > 12500 ? 1800 : 5 * 3600);
-      const dq = z < 3000 ? ((pr.qv[k] - mq[k]) * dt) / (3 * 3600) : 0;
+      // Diurnal boundary-layer cycle: solar heating deepens and moistens the mixed layer
+      // through the day (surface CAPE builds to its afternoon peak), nocturnal radiative
+      // cooling caps the lowest levels (CAPE collapses overnight). The CAPE slider sets the
+      // sounding; the sun makes the realised instability live instead of static.
+      const dthDiurnal = dt * (dayH * (0.85 / 3600) * Math.max(0, 1 - z / 1500)
+        - nightH * (0.6 / 3600) * Math.exp(-z / 240));
+      const dth = rad + ((pr.th[k] - mth[k]) * dt) / (z > 12500 ? 1800 : 5 * 3600) + dthDiurnal;
+      const dq = z < 3000
+        ? ((pr.qv[k] - mq[k]) * dt) / (3 * 3600) + dt * dayH * 9e-8 * (1 - z / 3000)
+        : 0;
       const sponge = z > 12500 ? 0.012 * Math.pow((z - 12500) / 2500, 2) : 0;
       const sf = 1 / (1 + sponge * dt);
       for (let ij = 0; ij < nxy; ij++) {
@@ -615,12 +634,38 @@ export class Atmosphere {
     const { nx, ny, nz, nxy, phi, emag } = this;
     const g = this.g;
     const rhs = this.rhs;
+    // Surface charge relaxes: a slow leak to ground (wet soil, vegetation contact) plus a
+    // fast corona bleed once induction has pushed the field just above the surface past the
+    // corona-onset level (~1/4 of breakdown) — the same feedback that limits real fields
+    // under thunderstorms to a few tens of kV/m. Electric field is solved every 4 steps, so
+    // this block covers 4·dt of decay each time it runs.
+    let qgMax = 0;
+    {
+      const dec = Math.exp((-4 * this.dt) / 900);
+      const cor = this.thresholdE(0) * 0.25;
+      for (let ij = 0; ij < nxy; ij++) {
+        let qg = this.qGround[ij];
+        if (qg === 0) continue;
+        qg *= dec;
+        const eg = Math.abs(this.ez[ij]);
+        if (eg > cor) qg *= Math.exp(((-4 * this.dt) / 180) * Math.min(4, (eg - cor) / cor));
+        if (Math.abs(qg) < 1e-15) qg = 0;
+        this.qGround[ij] = qg;
+        const m = Math.abs(qg); if (m > qgMax) qgMax = m;
+      }
+    }
+    this.qgMax = qgMax;
     for (let k = 0; k < nz; k++) {
       const r = this.rhoC[k] / EPS0;
       for (let ij = 0; ij < nxy; ij++) rhs[k * nxy + ij] = -r * (this.qh[k * nxy + ij] + this.ql[k * nxy + ij]);
     }
+    // Ground sheet: qGround is a surface density [C/m²]; over the lowest layer it acts as
+    // a volume charge qGround/dz0, so it enters the rhs with the same form as cloud charge.
+    for (let ij = 0; ij < nxy; ij++) {
+      if (this.qGround[ij] !== 0) rhs[ij] -= this.qGround[ij] / (g.dz[0] * EPS0);
+    }
     this.poisE.solve(rhs, phi);
-    let mx = 0, mr = 0;
+    let mx = 0, mr = 0, mxEz0 = 0;
     for (let k = 0; k < nz; k++) {
       const kp = Math.min(nz - 1, k + 1), km = Math.max(0, k - 1);
       const dzc = g.zc[kp] - g.zc[km];
@@ -641,10 +686,11 @@ export class Atmosphere {
           emag[c] = e; this.ez[c] = ez;
           if (e > mx) mx = e;
           if (e / eth > mr) mr = e / eth;
+          if (k === 0) { const m0 = Math.abs(ez); if (m0 > mxEz0) mxEz0 = m0; }
         }
       }
     }
-    this.stats.maxE = mx; this.stats.maxEratio = mr;
+    this.stats.maxE = mx; this.stats.maxEratio = mr; this.stats.maxEz0 = mxEz0;
   }
   /** Effective grid-scale breakdown field: conventional E_k(z)=2.16e5*rho/rho0 reduced by 0.45 for unresolved sub-grid charge pockets. */
   thresholdE(k: number): number { return 2.16e5 * 0.45 * (this.rhoC[k] / this.rhoC[0]); }
@@ -686,8 +732,8 @@ export class Atmosphere {
     // Solving electrostatics is a second full FFT/tridiagonal pass. During a multicell outbreak
     // it was run every other step, doubling the solver's most expensive pass. Every fourth step
     // is enough at the model's 2-10 s timestep and also halves lightning-burst bookkeeping.
-    if (this.step_n % 4 === 0 && this.chargeMax > 1e-14) { this.electricField(); for (const e of tryLightning(this)) this.flashEvents.push(e); }
-    else if (this.chargeMax <= 1e-14) { this.stats.maxE = 0; this.stats.maxEratio = 0; }
+    if (this.step_n % 4 === 0 && (this.chargeMax > 1e-14 || this.qgMax > 1e-9)) { this.electricField(); for (const e of tryLightning(this)) this.flashEvents.push(e); }
+    else if (this.chargeMax <= 1e-14) { this.stats.maxE = 0; this.stats.maxEratio = 0; this.stats.maxEz0 = 0; }
     if (this.step_n % 3 === 0) this.computeStats();
     this.dt = Math.max(2, Math.min(10, 0.6 / Math.max(1e-6, this.cflRate)));
   }
@@ -777,6 +823,7 @@ export class Atmosphere {
     const ref = Math.max(1, Math.abs(this.srcEnergy) + 1e-3 * Math.abs(this.mse0));
     S.energyRes = (dM - this.srcEnergy - this.iceGroundCum * LF * 0) / ref;
     if (S.maxE === undefined) { S.maxE = 0; S.maxEratio = 0; }
+    if (S.maxEz0 === undefined) S.maxEz0 = 0;
   }
 
   /** Remove charge near a lightning channel (called by the lightning module). */

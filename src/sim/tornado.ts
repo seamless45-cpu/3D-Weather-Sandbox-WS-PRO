@@ -24,10 +24,15 @@ export interface TornadoState {
   active: boolean;
   x: number; z: number;              // world horizontal coordinates (x, z), metres
   vx: number; vz: number;            // translation, m/s
+  /** Trochoidal wobble of the vortex center (metres, zero-mean, derived from age).
+   *  Real tornadoes never translate cleanly — the funnel snakes and loop-wobbles as the
+   *  downdrafts and surge cycles push the core around its mean track. */
+  wobX: number; wobZ: number;
   intensity: number;                 // 0..1
   target: number;
   confidence: number;
-  radius: number;                    // core radius, m
+  radius: number;                    // core radius, m — SHRINKS as intensity rises (angular
+                                     // momentum: violent tornadoes have tight ~60-120 m cores)
   maxWind: number;                   // m/s
   pressureDrop: number;              // hPa
   funnelTop: number; funnelBottom: number; lcl: number;
@@ -46,7 +51,7 @@ export interface TornadoSnapshot extends TornadoState {
 
 function initialState(): TornadoState {
   return {
-    active: false, x: DOMAIN / 2, z: DOMAIN / 2, vx: 0, vz: 0,
+    active: false, x: DOMAIN / 2, z: DOMAIN / 2, vx: 0, vz: 0, wobX: 0, wobZ: 0,
     intensity: 0, target: 0, confidence: 0, radius: 220, maxWind: 0, pressureDrop: 0,
     funnelTop: 0, funnelBottom: 0, lcl: 1200, debris: 0, stage: 'none', ef: 0, age: 0,
     potential: 0, uh: 0, zeta: 0, shear1: 0, srh1: 0, cape: 0, coldPool: 0,
@@ -83,8 +88,10 @@ export class TornadoSystem {
 
   snapshot(camX: number, camZ: number): TornadoSnapshot {
     const s = this.state;
-    const dx = wrapDelta(s.x - camX), dz = wrapDelta(s.z - camZ);
-    return { ...s, distance: Math.hypot(dx, dz), bearing: Math.atan2(dx, -dz) };
+    // Consumers (funnel mesh, shafts, vehicle gusts) see the wobbling center, not the mean track.
+    const bx = wrap(s.x + s.wobX), bz = wrap(s.z + s.wobZ);
+    const dx = wrapDelta(bx - camX), dz = wrapDelta(bz - camZ);
+    return { ...s, x: bx, z: bz, distance: Math.hypot(dx, dz), bearing: Math.atan2(dx, -dz) };
   }
 
   /** Called every solver step: cheap vortex feedback; full detection every 6th step. */
@@ -109,6 +116,11 @@ export class TornadoSystem {
     const tau = s.target > s.intensity ? grow : decay;
     s.intensity += (s.target - s.intensity) * Math.min(1, dt / tau);
     s.intensity = clamp(s.intensity, 0, 1);
+    // Trochoidal wobble: two incommensurate slow oscillations, amplitude scaled by
+    // intensity (weak tornadoes barely wander, mature ones snort along a looping path).
+    const wa = s.intensity * (s.active ? 1 : 0);
+    s.wobX = wa * (46 * Math.sin(s.age * 0.043) + 27 * Math.sin(s.age * 0.017 + 2.1));
+    s.wobZ = wa * (41 * Math.sin(s.age * 0.037 + 1.2) + 24 * Math.sin(s.age * 0.013 + 4.0));
 
     if (!s.active && s.target > 0.30 && this.candidateScore > 0.20) this.pending += dt;
     else this.pending = Math.max(0, this.pending - dt * 1.5);
@@ -116,12 +128,20 @@ export class TornadoSystem {
     if (!s.active && this.pending > 55) { s.active = true; s.age = 0; s.intensity = Math.max(s.intensity, 0.12); }
     if (s.active && (this.weak > 110 || s.intensity < 0.025)) { s.active = false; s.intensity = 0; s.target = 0; s.age = 0; }
 
-    s.radius = 120 + 340 * Math.pow(s.intensity, 0.7);
-    s.maxWind = 25 + 45 * Math.pow(s.intensity, 0.72);
+    // Conservation of angular momentum: the core TIGHTENS as the tornado strengthens
+    // (violent tornadoes have ~60-120 m condensation cores; broad, ragged ~400 m circulations
+    // are the weak/developing end). The old relation grew the core with intensity, which is
+    // backwards and made strong tornadoes look like blurry dust bowls.
+    s.radius = 60 + 380 * Math.pow(1 - s.intensity, 1.45);
+    // Suction spots (sub-vortices) add a high-end gust boost above ~EF1 intensity.
+    s.maxWind = 25 + 45 * Math.pow(s.intensity, 0.72) + 18 * smooth(0.5, 0.95, s.intensity);
     s.pressureDrop = (0.5 * a.prof.rho[0] * s.maxWind * s.maxWind) / 100;
-    s.funnelTop = clamp(s.lcl * 1.18 + 180, 600, 3200);
+    s.funnelTop = clamp(s.lcl * 1.18 + 180, 600, 3200) * (1 + 0.04 * Math.sin(s.age * 0.035) + 0.025 * Math.sin(s.age * 0.011 + 1.7));
     const reach = smooth(0.12, 0.82, s.intensity);
-    s.funnelBottom = clamp(s.funnelTop * (1 - 1.06 * reach), 0, s.funnelTop);
+    // Condensation cycles: the funnel breathes — the wall of condensation surges down and
+    // pulls back with the storm's surge rhythm instead of sitting at a fixed level.
+    const cond = reach * (0.90 + 0.08 * Math.sin(s.age * 0.052 + 0.6) + 0.05 * Math.sin(s.age * 0.021 + 2.3));
+    s.funnelBottom = clamp(s.funnelTop * (1 - 1.06 * Math.max(0, cond)), 0, s.funnelTop);
     s.debris = smooth(0.34, 0.9, s.intensity) * (0.55 + 0.45 * s.confidence);
     s.ef = efFromWind(s.maxWind);
     s.stage = !s.active ? (s.target > 0.18 ? 'wall-cloud' : 'none')
@@ -225,25 +245,61 @@ export class TornadoSystem {
     if (!s.active) { s.vx = cU; s.vz = cV; }
   }
 
-  /** Bounded Rankine vortex + frictional inflow, applied to face winds before projection. */
+  /**
+   * Bounded vortex + frictional inflow, applied to face winds before projection.
+   *  * Main wind field: Burgers–Rott profile f(x)=2x/(1+x²) — solid-body rotation in the
+   *    viscous core, smooth peak at r=R, 1/r decay outside (the Rankine kink at the core
+   *    edge was a visible wind discontinuity), with an exponential cutoff in the far field.
+   *  * Suction spots: above ~0.5 intensity, three sub-vortices orbit the core (the
+   *    multi-vortex state of mature violent tornadoes), each a tight Burgers core adding
+   *    ~50% to the local tangential wind — this is where the extreme gusts come from.
+   *  * The whole assembly is centered on the wobbling core (mean track + trochoidal wobble).
+   */
   private applyVortex(a: Atmosphere, dt: number) {
     const s = this.state;
     const { nx, ny, nz, nxy } = a, g = a.g, u = a.u, v = a.v;
-    const R = Math.max(80, s.radius), V = s.maxWind * (0.45 + 0.55 * s.intensity);
+    const R = Math.max(55, s.radius), V = s.maxWind * (0.45 + 0.55 * s.intensity);
+    const cx = wrap(s.x + s.wobX), cz = wrap(s.z + s.wobZ);
+    const subAmp = smooth(0.5, 0.95, s.intensity);
+    const nSub = subAmp > 0.02 ? 3 : 0;
+    // Orbit radius just outside the (now much tighter) core; orbit rate follows the parent
+    // flow at that radius so the spots ride the circulation instead of fighting it.
+    const orb = Math.max(90, 1.15 * R);
+    const omega = nSub > 0 ? (1.35 * V) / Math.max(orb, 80) : 0;
+    const subVs = 0.5 * V * subAmp;
+    const subRs = Math.max(38, 0.5 * R);
+    const reachR = Math.max(1500, 5.2 * R + orb + 3 * subRs);
     const kTop = Math.max(2, Math.min(nz, 5));
     for (let k = 0; k < kTop; k++) {
       const zDecay = Math.exp(-g.zc[k] / 1100);
       const blend = Math.min(1, dt / 55) * zDecay * (0.35 + 0.65 * s.intensity);
       if (blend < 1e-4) continue;
       for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-        const dx = wrapDelta((i + 0.5) * g.dx - s.x), dz = wrapDelta((j + 0.5) * g.dy - s.z);
+        const dx = wrapDelta((i + 0.5) * g.dx - cx), dz = wrapDelta((j + 0.5) * g.dy - cz);
         const r = Math.hypot(dx, dz);
-        const rr = Math.max(r, 30);
-        const core = r < R ? r / R : Math.pow(R / rr, 0.62) * Math.exp(-(r - R) / 4200);
-        const vt = V * core;
-        const inflow = -0.20 * V * Math.exp(-r / (1.8 * R)) * zDecay;
-        const tx = -(dz / rr) * vt + (dx / rr) * inflow + s.vx;
-        const tz = (dx / rr) * vt + (dz / rr) * inflow + s.vz;
+        let tx = s.vx, tz = s.vz;
+        if (r < reachR) {
+          const x = Math.max(r, 12) / R;
+          const prof = (2 * x) / (1 + x * x);
+          const cut = r > 1.6 * R ? Math.exp(-(r - 1.6 * R) / 5200) : 1;
+          const vt = V * prof * cut;
+          const rr = Math.max(r, 25);
+          const inflow = -(0.18 + 0.16 * s.intensity) * V * Math.exp(-r / (1.4 * R)) * zDecay;
+          tx += -(dz / rr) * vt + (dx / rr) * inflow;
+          tz += (dx / rr) * vt + (dz / rr) * inflow;
+          for (let m = 0; m < nSub; m++) {
+            const th = (m * 2 * Math.PI) / nSub + s.age * omega;
+            const sx = Math.cos(th) * orb, sz = Math.sin(th) * orb;
+            const ex = dx - sx, ez = dz - sz;
+            const er = Math.hypot(ex, ez);
+            if (er > 4 * subRs) continue;
+            const se = Math.max(er, 10) / subRs;
+            const svt = (subVs * 2 * se) / (1 + se * se);
+            const srr = Math.max(er, 15);
+            tx += -(ez / srr) * svt;
+            tz += (ex / srr) * svt;
+          }
+        }
         const c = k * nxy + j * nx + i;
         u[c] += (tx - u[c]) * blend;
         v[c] += (tz - v[c]) * blend;

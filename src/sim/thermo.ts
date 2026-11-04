@@ -36,20 +36,25 @@ export function soundingCape(g: Grid, env: Environment): number {
  * Build the environment that realises `capeTarget` J/kg of surface-based CAPE.
  * A cap is added when little instability is asked for (so low values really stay suppressed) and
  * the boundary layer is warmed/moistened when more is asked for; a short bisection nails the target.
+ * The knob range now spans extreme instability too: up to ~12 000 J/kg needs a genuinely
+ * hot, humid, deep mixed layer with drier mid-levels (entrainment-assisted), so the m-scan
+ * reaches 3.0 and mid-level dryness relaxes as the boundary layer gets more extreme.
  */
 export function envForCape(g: Grid, capeTarget: number): Environment {
-  const t = Math.max(0, Math.min(4000, isFinite(capeTarget) ? capeTarget : 2000));
+  const t = Math.max(0, Math.min(12000, isFinite(capeTarget) ? capeTarget : 2000));
   // a cap keeps low instability settings genuinely suppressed
   const capD = 0.6 + Math.max(0, (700 - t) / 110);
-  // one knob scales a physically sane boundary layer: 296..305.6 K, 10..21.7 g/kg
+  // one knob scales a physically sane boundary layer: 296..309.8 K, 10..31.6 g/kg,
+  // mid-level dryness easing off at the top of the range (dry air aloft erodes CAPE).
   const make = (m: number): Environment => ({
     ...BASE_ENV,
     cape: t,
     capD,
-    thSfc: 296 + m * 6,
+    thSfc: 296 + m * 4.6,
     qvMax: 0.010 + m * 0.0072,
+    midDry: 0.15 * Math.max(0.35, 1 - Math.max(0, m - 0.8) * 0.45),
   });
-  let lo = 0, hi = 1.6;
+  let lo = 0, hi = 3.0;
   let best = make(0.8), bestErr = Infinity, bestCape = 0;
   const cLo = soundingCape(g, make(lo)), cHi = soundingCape(g, make(hi));
   if (cHi < t) lo = hi;            // even the most unstable profile is not enough
@@ -71,16 +76,40 @@ export interface Profile {
   rhoF: Float64Array; pSfc: number;
 }
 
+/**
+ * Wind as a function of height: shear profile + Ekman veer + a log-law surface layer.
+ *  * The shear profile (uni/curved helicities) is unchanged — it sets storm-relative helicity.
+ *  * Ekman veer: in the northern hemisphere friction turns the wind clockwise with height
+ *    (~26° through the boundary layer into the free atmosphere).
+ *  * Log-law layer (z0 = 0.25 m, farmland roughness): wind vanishes at the surface and the
+ *    first model level (~70 m) still sits inside the layer where the profile is depressed —
+ *    without this the near-surface flow was far too calm and rain streaks too upright.
+ */
 function windAt(z: number, pr: Environment): [number, number] {
   const f = Math.min(1, z / pr.shearZ);
   const after = Math.max(0, z - pr.shearZ) / 9000;
+  let u: number, v: number;
   if (pr.shearType === 'uni') {
     const r = 0.5 * (1 - Math.cos(Math.PI * f));
-    return [pr.u0 + pr.shear * r + 0.25 * pr.shear * after, pr.v0 + 0.18 * pr.shear * r];
+    u = pr.u0 + pr.shear * r + 0.25 * pr.shear * after;
+    v = pr.v0 + 0.18 * pr.shear * r;
+  } else {
+    const a = (Math.PI / 2) * f;
+    const U = pr.shear / Math.SQRT2;
+    u = pr.u0 + U * (1 - Math.cos(a)) + 0.3 * U * after;
+    v = pr.v0 + U * Math.sin(a) + 0.15 * U * after;
   }
-  const a = (Math.PI / 2) * f;
-  const U = pr.shear / Math.SQRT2;
-  return [pr.u0 + U * (1 - Math.cos(a)) + 0.3 * U * after, pr.v0 + U * Math.sin(a) + 0.15 * U * after];
+  // Ekman veer: rotate the vector clockwise with height (northern-hemisphere frictional backing).
+  const veer = ((26 * Math.min(1, z / 7000)) * Math.PI) / 180;
+  const cv = Math.cos(veer), sv = Math.sin(veer);
+  let ru = u * cv - v * sv, rv = u * sv + v * cv;
+  // Log-law shape: factor 1 at the 10 m reference, ~1.5 at the first model level, relaxing
+  // back to the shear profile above the surface layer (fades over ~600 m).
+  const z0 = 0.25;
+  const lay = Math.log(Math.max(z, 1.0) / z0) / Math.log(10 / z0);
+  const fac = Math.max(0, 1 + (lay - 1) * Math.exp(-z / 600));
+  ru *= fac; rv *= fac;
+  return [ru, rv];
 }
 
 export function thetaProfile(z: number, pr: Environment, ztr = 12000, Ttr = 213): number {

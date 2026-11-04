@@ -509,9 +509,23 @@ export default function App() {
               </div>
             </div>
           )}
-          {!touch && !locked && <div className="hud absolute bottom-1.5 left-1/2 z-10 -translate-x-1/2 px-2 py-0.5 lbl">click view to look · WASD walk · wheel zoom</div>}
+          {!touch && !locked && <div className="hud absolute bottom-1.5 left-1/2 z-10 -translate-x-1/2 px-2 py-0.5 lbl">click view to look · WASD walk · Space jump · wheel zoom</div>}
           {touch && (
             <div className="absolute bottom-3 right-3 z-10 flex items-end gap-2">
+              <div className="flex flex-col gap-2">
+                <button
+                  className="hbtn !px-3 !py-3 !text-sm"
+                  title="Energy drink: ×10 speed/power for 30 s"
+                  onTouchStart={(e) => { e.stopPropagation(); player?.drink(); }}
+                >⚡ G</button>
+                {vehicleMode === 'foot' && (
+                  <button
+                    className="hbtn !px-3 !py-3 !text-sm"
+                    title="Jump"
+                    onTouchStart={(e) => { e.stopPropagation(); player?.jump(); }}
+                  >⬆ JUMP</button>
+                )}
+              </div>
               <div className="flex flex-col gap-2">
                 <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(1)}>▲</button>
                 <button className="hbtn !px-4 !py-3 !text-base" {...holdMove(-1)}>▼</button>

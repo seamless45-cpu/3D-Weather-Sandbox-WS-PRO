@@ -12,6 +12,7 @@
 //    the reservoir is large and the local field reaches ~80% of breakdown — rarer, straighter,
 //    usually a single very high-peak-current stroke with a long continuing current.
 import type { Atmosphere } from './atmosphere';
+import { EPS0 } from './consts';
 
 export type Polarity = 'neg' | 'pos';
 
@@ -21,6 +22,8 @@ export interface FlashEvent {
   segs: Float32Array; // per segment 10 floats: x0,y0,z0,x1,y1,z1, gen, dist, order, width  (world frame: X, up, Z)
   strokes: { t: number; amp: number }[]; ccEnd: number; ccAmp: number; leaderEnd: number;
   chargeC: number; ratio: number;
+  /** true when the flash was initiated from accumulated charge on the ground (upward leader). */
+  fromGround?: boolean;
 }
 
 let nextId = 1;
@@ -52,7 +55,15 @@ export function phiAt(a: Atmosphere, x: number, y: number, z: number): number {
 
 interface Tip { x: number; y: number; z: number; s: number; dx: number; dy: number; dz: number; order: number; alive: boolean; node: number; born: number; }
 
-export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Polarity): FlashEvent {
+/**
+ * @groundUp When set, the flash is ground-initiated: it starts from a point on the surface
+ *  that carries accumulated charge (qGround) with a single upward leader already attached to
+ *  earth (φ = 0 on the channel from the first node). `polarity` follows the surface charge
+ *  sign: negative sheet → upward positive leader → CG−; positive sheet → upward negative
+ *  leader → CG+. The bright stages begin only after the leader has climbed into the charge
+ *  (leaderEnd), not at t≈0 as for cloud-initiated flashes.
+ */
+export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Polarity, groundUp = false): FlashEvent {
   const { nx, ny, nxy } = a, g = a.g;
   const rnd = a.rng;
   const k = Math.floor(ci / nxy), ij = ci % nxy, j = Math.floor(ij / nx), i = ij % nx;
@@ -60,13 +71,14 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   let z = g.zf[k] + g.dz[k] * (0.2 + 0.6 * rnd());
   const L = g.dx * nx;
   const ground = (px: number, py: number) => a.terrain.groundHeight(((px % L) + L) % L, ((py % L) + L) % L);
+  if (groundUp) z = Math.max(30, Math.max(0, ground(x, y)) + 25);
   const gfun = (px: number, py: number, pz: number) => {
     const hag = pz - Math.max(0, ground(px, py));
     return phiAt(a, px, py, pz) * Math.min(1, Math.max(0.02, hag / 900));
   };
   const nodesX: number[] = [x], nodesY: number[] = [y], nodesZ: number[] = [z];
   const nodeGen: number[] = [0], nodeParent: number[] = [-1], nodeOrder: number[] = [0];
-  let phiSum = gfun(x, y, z), phiCnt = 1, phiCh = phiSum;
+  let phiSum = gfun(x, y, z), phiCnt = 1, phiCh = groundUp ? 0 : phiSum;
   const tips: Tip[] = [];
   const rdir = () => { const u = 2 * rnd() - 1, t = 2 * Math.PI * rnd(), r = Math.sqrt(1 - u * u); return [r * Math.cos(t), u, r * Math.sin(t)]; };
   // Leader sign convention: s = +1 grows toward higher potential (a NEGATIVE leader, toward
@@ -89,16 +101,28 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   else if (positive && z > 7000 && rFlav < 0.55) flavor = 'anvil';
   // Start with a descending polarity leader and an ascending counter-leader. A purely random
   // bidirectional pair often wandered sideways and produced a horizontal "spider" instead of a bolt.
+  // Ground-initiated flashes instead launch a single polarity leader already attached to the
+  // surface charge sheet: it climbs with s = −descS (negative sheet → upward positive leader
+  // into the negative charge → CG−; positive sheet → upward negative leader → CG+).
   const az = 2 * Math.PI * rnd(), horiz = 0.35 + 0.35 * rnd(), down = Math.sqrt(1 - horiz * horiz);
   let d0: [number, number, number] = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
   if (flavor === 'anvil') d0 = [Math.cos(az), Math.sin(az), -0.18 - 0.12 * rnd()];   // flat crawler start
-  tips.push({ x, y, z, s: descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0, born: 0 });
-  tips.push({ x, y, z, s: -descS, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0, born: 0 });
+  if (groundUp) {
+    flavor = 'norm';
+    d0 = [horiz * Math.cos(az) * 0.6, horiz * Math.sin(az) * 0.6, Math.sqrt(1 - horiz * horiz * 0.36)];
+    tips.push({ x, y, z, s: -descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0, born: 0 });
+  } else {
+    tips.push({ x, y, z, s: descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0, born: 0 });
+    tips.push({ x, y, z, s: -descS, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0, born: 0 });
+  }
 
   const EPROP = 1.1e4, ETA = 1.35, NC = 12;
   const smooth = (a: number, b: number, x: number) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
   const MAXSEG = 1400, MAXGEN = 180, MAXTIPS = 16;
-  let grounded = false, strikeNode = -1, attachGen = 0;
+  // Ground-initiated flashes are attached to the surface charge sheet from generation 0:
+  // the channel is earthed, so φ stays 0 on it and return strokes fire once the leader has
+  // climbed into the charge (timed at leaderEnd below).
+  let grounded = groundUp, strikeNode = groundUp ? 0 : -1, attachGen = 0;
   let gen = 0;
   for (gen = 1; gen <= MAXGEN && nodesX.length < MAXSEG; gen++) {
     let any = false;
@@ -158,6 +182,11 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
           // The descending tip does not climb back — ascending is the counter-leader's job;
           // letting it wander upward is what kept the channel from ever reaching the ground.
           wgt *= 0.18;
+        } else if (groundUp && dz > 0.15) {
+          // Ground-initiated upward leader: near the surface the ambient gradient is too
+          // weak to steer (both endpoints sit at ≈0 potential), so persistence carries the
+          // tip up until the cloud's field takes over the driving.
+          wgt = Math.max(wgt, (0.9 + 1.6 * rnd()) * (0.30 + 0.70 * fwd) * (0.45 + 0.55 * vertical));
         }
         cw.push(wgt); cg.push(grad); tot += wgt;
       }
@@ -190,10 +219,23 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
       phiSum += gfun(tp.x, tp.y, tp.z); phiCnt++;
       if (!grounded) phiCh = phiSum / phiCnt;
       // Ground attachment: only the descending polarity leader can connect (~60 m above
-      // terrain). Cloud-to-cloud flashes never attach by definition.
-      if (!grounded && flavor !== 'cc' && tp.s === descS && tp.z - Math.max(0, ground(tp.x, tp.y)) < 70) {
-        grounded = true; strikeNode = tp.node; attachGen = gen; phiCh = 0; tp.alive = false;
-        continue;
+      // terrain). Cloud-to-cloud flashes never attach by definition. When the surface field
+      // under the tip is already near breakdown (charge accumulated on the ground via
+      // precipitation and induction), an upward streamer meets the leader far above the
+      // surface — that is how real CGs close the last few hundred metres.
+      if (!grounded && flavor !== 'cc' && tp.s === descS) {
+        const tGround = Math.max(0, ground(tp.x, tp.y));
+        let attachDist = 70;
+        if (tp.z - tGround < 700) {
+          const ii = (((Math.floor(tp.x / g.dx) % nx) + nx) % nx);
+          const jj = (((Math.floor(tp.y / g.dy) % ny) + ny) % ny);
+          const surfR = a.emag[jj * nx + ii] / a.thresholdE(0);
+          if (surfR > 0.7) attachDist = 70 + 530 * Math.min(1, (surfR - 0.7) / 0.3);
+        }
+        if (tp.z - tGround < attachDist) {
+          grounded = true; strikeNode = tp.node; attachGen = gen; phiCh = 0; tp.alive = false;
+          continue;
+        }
       }
       // Stall (see stallP): a desc tip that dies here leaves the counter-leader finishing the
       // flash as an IC — exactly how most flashes in a real storm end.
@@ -282,7 +324,10 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   if (grounded) {
     if (flavor !== 'anvil') type = polarity === 'neg' ? 'CG-' : 'CG+';
     strike = [nodesX[strikeNode], nodesZ[strikeNode], ((nodesY[strikeNode] % L) + L) % L];
-    let t = attachGen * STEP + 0.004;
+    // Cloud-initiated: the return stroke fires when the leader attaches. Ground-initiated:
+    // nothing bright leaves the surface until the upward leader has connected aloft
+    // (leaderEnd) — before that only the faint climbing leader beads are visible.
+    let t = groundUp ? leaderEnd + 0.004 : attachGen * STEP + 0.004;
     const ns = positive ? (rnd() < 0.15 ? 2 : 1) : Math.min(8, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.0));
     strokes.push({ t, amp: positive ? 2.1 : 1 });
     // Subsequent strokes are dart leaders re-using the same channel: quick, tightly spaced.
@@ -299,7 +344,7 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   }
   return {
     id: nextId++, type, simTime: a.time, init: [nodesX[0], nodesZ[0], ((nodesY[0] % L) + L) % L], strike, segs, strokes, ccEnd, ccAmp, leaderEnd,
-    chargeC: charge, ratio,
+    chargeC: charge, ratio, ...(groundUp ? { fromGround: true } : {}),
   };
 }
 
@@ -310,21 +355,23 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
  *  inside a well-supplied positive charge region). */
 export function tryLightning(a: Atmosphere): FlashEvent[] {
   const out: FlashEvent[] = [];
+  const { nx, ny, nz, nxy } = a;
   // Breakdown gate: hydrometeor tips and channel space charge enhance the local field by
   // several-fold, so the effective ambient threshold sits below the ideal ~97 kV/m — flashes
   // start once the storm reaches ~62% of it and the cadence scales with severity above 0.75.
-  if (a.stats.maxEratio < 0.62) return out;
+  // Ground-initiated flashes are gated on their own criterion (the surface sheet), so they
+  // can still fire when the in-cloud field alone would not pass this bar.
+  const cloudGate = a.stats.maxEratio >= 0.62;
   // Electrostatics/lightning is evaluated every 4 steps, so each call covers two intervals.
   // The mean interval scales with how far past breakdown the storm is, and is re-jittered
   // every call: flashes arrive in irregular clumps rather than on a fixed metronome.
   const sev = Math.max(0, a.stats.maxEratio - 0.75);
   const meanT = (6.5 / (0.45 + Math.min(3.5, sev * 1.6))) * (0.45 + 1.3 * a.rng());
   const p = 1 - Math.exp(-(a.dt * 2) / Math.max(2.5, meanT));
-  const { nx, ny, nz, nxy } = a;
   const used: [number, number, number][] = [];
   const cd = a.chargeDiag;
   const posRes = Math.max(0, cd.upperPos), negRes = Math.max(0, cd.midNeg);
-  for (let f = 0; f < 2; f++) {
+  for (let f = 0; f < (cloudGate ? 2 : 0); f++) {
     // ---- polarity. Positive CGs need a healthy upper-positive (or lower-positive) reservoir
     // and stay rare either way; everything else defaults to the common negative flash.
     const pPos = Math.min(0.19, Math.max(0.03, 0.03 + 0.13 * posRes / (posRes + negRes + 1e-6)));
@@ -368,6 +415,58 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
     used.push([ij % nx, Math.floor(ij / nx), 0]);
     out.push(growFlash(a, best, bestR, polarity));
     a.flashCount++;
+  }
+  // ---- ground-initiated flashes: where precipitation/induction charge has accumulated on
+  // the surface, the field just above ground can exceed breakdown on its own and launch an
+  // upward leader. Polarity follows the sign of the surface sheet (negative sheet → upward
+  // positive leader closing as CG−, positive sheet → upward negative leader as CG+).
+  // Initiation uses the same logic as the cloud gate: the solved ez at the first level is
+  // diluted over ~300 m, and the sheet's own σ/ε0 plus roughness/vegetation/conductor tips
+  // enhance the surface field several-fold — so ~55% of the ideal 97 kV/m macroscopic field
+  // starts an upward leader, not 100%. The rate then scales with how far past that bar the
+  // total surface field has pushed, so flashes appear only where charge really piled up.
+  if (a.qgMax > 1.2e-7) {
+    a.gd.call++;
+    let gBest = -1, gR = 0.55, gI = -1, gJ = -1;
+    for (let ij = 0; ij < nxy; ij++) {
+      const qg = a.qGround[ij];
+      if (Math.abs(qg) < 1.4e-7) continue;
+      a.gd.cand++;
+      // Total surface field: solved field at the lowest level + the sheet's near-ground
+      // self-field σ/ε0 (an observer at the surface feels the full sheet, while ez averages
+      // over the first ~300 m and dilutes it).
+      const r = (Math.abs(a.ez[ij]) + (Math.abs(qg) / EPS0) * 0.9) / a.thresholdE(0);
+      if (r > a.gd.maxR) a.gd.maxR = r;
+      if (r <= gR) continue;
+      if (r > 0.55) a.gd.pass++;
+      const jj = Math.floor(ij / nx), ii = ij % nx;
+      let ok = true;
+      for (const u of used) {
+        let dx = Math.abs(ii - u[0]); dx = Math.min(dx, nx - dx);
+        let dy = Math.abs(jj - u[1]); dy = Math.min(dy, ny - dy);
+        if (dx < 6 && dy < 6) { ok = false; break; }
+      }
+      if (ok) { gR = r; gBest = ij; gI = ii; gJ = jj; }
+      else if (r > 0.55) a.gd.blk++;
+    }
+    if (gBest >= 0) a.gd.sel++;
+    // Probability has a modest floor once a cell clears the initiation bar (charged ground
+    // does flare at threshold) and grows with the field excess — a heavily charged surface
+    // fires readily, a marginal sheet only occasionally.
+    if (gBest >= 0 && (a.gd.roll++, a.rng() < Math.min(0.55, 0.06 + Math.max(0, gR - 0.55) * 2.5) * Math.min(1, p * 1.4))) {
+      used.push([gI, gJ, 0]);
+      out.push(growFlash(a, gBest, gR, a.qGround[gBest] < 0 ? 'neg' : 'pos', true));
+      a.flashCount++;
+      // The return stroke dumps the local surface sheet into the channel: drain it in a
+      // ~1 km patch around the strike so ground flashes self-limit — the sheet has to
+      // recharge through precipitation before the same spot can fire again.
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 6) continue;
+        const id = ((gJ + dy + ny) % ny) * nx + ((gI + dx + nx) % nx);
+        a.qGround[id] *= 0.30 + 0.55 * Math.min(1, d2 / 6);
+      }
+    }
   }
   return out;
 }

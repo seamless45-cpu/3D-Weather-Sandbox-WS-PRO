@@ -180,7 +180,19 @@ export function sedimentation(a: Atmosphere, dt: number) {
     sedCol(a, a.qi, ij, vti, dt);
     // Light ice crystals carry the opposite-sign charge and settle with their terminal speed.
     sedCol(a, a.ql, ij, vti, dt);
-    sedCol(a, a.qh, ij, vth, dt);
+    const ghQ = sedCol(a, a.qh, ij, vth, dt);
+    // Ground charge accumulation: graupel/hail reach the surface carrying the negative
+    // charge of the main charging zone, light crystals/positive rain carry the opposite
+    // sign — the surface keeps a net charge sheet (C/m²) instead of every strike being
+    // forced to originate aloft. Snow and rain are mostly neutralised on impact, so only
+    // a fraction survives to accumulate.
+    if (ghQ !== 0) {
+      const qg0 = a.qGround[ij] + ghQ * 0.85;
+      // Physically bounded sheet: ±2.5e-6 C/m² ≈ ±2.8e5 V/m of sheet field — enough to
+      // bridge the last gap to breakdown over the storm's own surface field, no more.
+      a.qGround[ij] = Math.max(-2.5e-6, Math.min(2.5e-6, qg0));
+      const m = Math.abs(a.qGround[ij]); if (m > a.qgMax) a.qgMax = m;
+    }
     const g = gr + gs + gg;
     a.surfPrec[ij] = g / dt;
     precipKg += g; iceKg += gs + gg;

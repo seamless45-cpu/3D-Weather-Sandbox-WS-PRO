@@ -490,11 +490,21 @@ void main(){
   vec2 fv = fluidVel(p.xz);
   p.xz += fv * (0.70 + 0.35 * sin(uTime * 1.1 + phase * 6.2831)) * 1.4;
   vec4 s = sampleCloud(p);
-  float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
-  float inten = clamp(pow(s.g, 0.40) * local, 0.0, 1.0);
+  // Spawn from the clouds: a drop may only exist where a cloud column actually rains on
+  // this parcel — check the local precip field AND condensate/precip aloft (two samples up
+  // to ~3.4 km overhead) so drops never appear in clear air with no cloud above them.
+  vec4 sUp = sampleCloud(vec3(p.x, p.y + 1500.0, p.z));
+  vec4 sUp2 = sampleCloud(vec3(p.x, p.y + 3300.0, p.z));
+  float column = max(s.g, max(sUp.r + sUp.g, sUp2.r + sUp2.g));
+  float local = clamp(0.70 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.70, 1.5);
+  float inten = clamp(pow(max(s.g, 1e-5), 0.30) * local, 0.0, 1.0);
   // Soft intensity gate: a hard step popped drops in and out every time the 250 ms cloud
-  // snapshot landed, which read as particle flicker.
-  float gate = 1.0 - smoothstep(inten - 0.16, inten + 0.04, mix(rnd, rnd2, flake));
+  // snapshot landed, which read as particle flicker. The curve used to starve moderate
+  // rain down to ~10-20% visible drops (inten^0.40 with a −0.16 offset); now visible
+  // fraction tracks the local rain rate smoothly from trace to heavy.
+  float thr = mix(rnd, rnd2, flake);
+  float gate = (1.0 - smoothstep(inten - 0.17, inten + 0.03, thr))
+    * smoothstep(0.006, 0.03, column);
   if (gate < 0.02) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   if (p.y < 1400.0 && p.y < groundH(p.xz) + 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // A drop is a motion-blurred teardrop: rounded bright head, tapering tail. Flakes are short.
@@ -565,8 +575,8 @@ void main(){
   vec2 xz = cameraPosition.xz + rel;
   float gh = groundH(xz);
   vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
-  float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
-  float inten = clamp(pow(s.g, 0.46) * local, 0.0, 1.0);
+  float local = clamp(0.70 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.70, 1.5);
+  float inten = clamp(pow(max(s.g, 1e-5), 0.34) * local, 0.0, 1.0);
   float ph = fract(uTime * (1.6 + 0.8 * aDrop.x) + aSeed.z * 13.0 + aDrop.z);
   // Soft gates: the old hard steps popped splashes in/out with every cloud snapshot.
   float gate = (1.0 - smoothstep(inten * 0.9 - 0.06, inten * 0.9 + 0.10, fract(aSeed.z * 37.7 + aDrop.z)))
@@ -617,8 +627,8 @@ void main(){
   float gh = groundH(xz);
   if (gh < -0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
-  float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
-  float inten = clamp(pow(s.g, 0.46) * local, 0.0, 1.0);
+  float local = clamp(0.70 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.70, 1.5);
+  float inten = clamp(pow(max(s.g, 1e-5), 0.34) * local, 0.0, 1.0);
   float gate = (1.0 - smoothstep(inten * 0.9 - 0.06, inten * 0.9 + 0.10, fract(aSeed.z * 41.3 + aDrop.z)))
     * smoothstep(0.004, 0.016, s.g) * step(0.0, gh);
   // Ballistic arc: launch at ph=0, apex mid-flight, lands at ph=1.
@@ -666,20 +676,26 @@ void main(){
   vec2 xz = cameraPosition.xz + rel;
   float gh = groundH(xz);
   float hf = aDrop.z;
-  float y = gh + 5.0 + hf * hf * 300.0;
-  // Only where rain is actually reaching the ground.
-  vec4 s = sampleCloud(vec3(xz.x, gh + 130.0, xz.y));
-  float rain = clamp(pow(max(s.g, 0.0), 0.5) * (0.55 + 0.75 * uRainIntensity + 0.85 * uHeavyRain), 0.0, 1.0);
+  // Rain mist is BOUNCE SPRAY: droplets shattering off the ground and being lofted, so the
+  // sheet hugs the surface (peaks at ground level, dies out well under 200 m) instead of
+  // drifting up to 300 m where it read as a low haze layer rather than rain spray.
+  float y = gh + 4.0 + hf * hf * 150.0;
+  // Only where rain is actually reaching the ground (sampled through the spray layer).
+  vec4 s = sampleCloud(vec3(xz.x, gh + 90.0, xz.y));
+  float rain = clamp(pow(max(s.g, 0.0), 0.42) * (0.85 + 0.85 * uRainIntensity + 0.95 * uHeavyRain), 0.0, 1.0);
   vec3 p = vec3(xz.x, y, xz.y);
-  // Bounded fluid sway (no uTime gain): a changing flow field shifts mist gently, never jumps.
+  // Bounded churn: turbulence jostles the spray in every axis (vertical bobbing included),
+  // but nothing integrates over uTime, so a changing flow field never pops the sheet.
   p.xz += fluidVel(p.xz) * (0.8 + 0.4 * sin(uTime * 0.4 + aDrop.y * 6.2831)) * 1.1;
+  p.y += sin(uTime * 0.55 + aDrop.y * 12.566) * 5.0 * (1.0 - hf);
   float dist = length(p - cameraPosition);
-  float size = mix(14.0, 52.0, aDrop.x) * (0.8 + 0.4 * hf);
-  // Edge fade before the 120 m wrap radius, overhead fade, no-rain fade.
+  // Near-ground spray billows are the largest; higher wisps shrink.
+  float size = mix(16.0, 54.0, aDrop.x) * (0.85 + 0.55 * (1.0 - hf));
+  // Edge fade before the wrap radius, overhead fade, no-rain fade.
   vec2 cell = abs(rel) / (box * 0.5);
   float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, cell.y));
   float near0 = smoothstep(4.0, 26.0, dist);
-  vA = rain * edge * near0 * (0.50 + 0.50 * aDrop.w) * (1.0 - smoothstep(0.55, 1.0, hf));
+  vA = rain * edge * near0 * (0.55 + 0.55 * aDrop.w) * (1.0 - smoothstep(0.30, 0.85, hf));
   vA *= 1.0 - smoothstep(130.0, 230.0, dist);
   if (vA < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 toCam = normalize(cameraPosition - p);
@@ -863,7 +879,7 @@ uniform vec3 uOff; uniform float uT; uniform float uStep; uniform float uRS; uni
 uniform float uStrokeT[8]; uniform float uStrokeA[8];
 uniform float uCCEnd; uniform float uCCAmp; uniform float uLeaderEnd;
 uniform float uPol;   // -1 = negative CG, +1 = positive CG, 0 = intracloud
-varying float vLum; varying float vSide; varying float vOrder; varying float vAlong;
+varying float vLum; varying float vHalo; varying float vSide; varying float vOrder; varying float vAlong;
 varying float vFlicker; varying float vBead;
 void main(){
   vec3 A = aA + uOff, B = aB + uOff;
@@ -884,17 +900,42 @@ void main(){
   vec3 side = normalize(mix(side0, side1, aCorner.x) + vec3(1e-5));
   float tGen = aS.x * uStep;
   float ord = pow(0.72, aS.z);
+  // Two luminance envelopes, as in real photographs of lightning:
+  //  * vLum  — the blinding return-stroke core (microsecond rise, ~10 ms strobe decay);
+  //  * vHalo — plasma-channel afterglow and air scattering (100-600 ms), which is what
+  //    makes a bolt look like a violet ribbon hanging in the air instead of a strobe.
+  // The old model used one envelope for both, so the glow died with the core and the only
+  // "realism" left was bloom inflating a width that pulsed with the strobe.
   float lum = 0.0;
-  // Stepped leader: faint, short-lived beads appear as the channel grows.
-  if (uT > tGen){ float age = uT - tGen; lum += 0.34 * exp(-age / 0.006) + 0.025 * exp(-age / 0.09); }
+  float halo = 0.0;
+  // Stepped leader: faint, short-lived beads appear as the channel grows, wrapped in a
+  // soft violet scatter glow that trails the stepping front.
+  if (uT > tGen){
+    float age = uT - tGen;
+    lum += 0.34 * exp(-age / 0.006) + 0.025 * exp(-age / 0.09);
+    halo += 0.055 * exp(-age / 0.13);
+  }
   for (int i = 0; i < 8; i++){
     if (float(i) >= uN) break;
     float tr = uStrokeT[i] + aS.y * uRS;
-    if (uT > tr){ float age = uT - tr; lum += uStrokeA[i] * ord * (exp(-age / 0.012) + 0.28 * exp(-age / 0.075)); }
+    if (uT > tr){
+      float age = uT - tr;
+      lum += uStrokeA[i] * ord * (exp(-age / 0.012) + 0.28 * exp(-age / 0.075));
+      // Channel afterglow: a real CG channel stays visibly lit for ~100-200 ms after the
+      // return stroke passes, cooling from white to violet.
+      halo += uStrokeA[i] * ord * 0.45 * exp(-age / 0.13);
+    }
   }
-  if (uT > uStrokeT[0] && uT < uCCEnd) lum += uCCAmp * ord * (0.65 + 0.35 * sin(uT * 90.0 + aSeed.x * 20.0));
-  if (uT > uLeaderEnd) lum += 0.03 * ord * exp(-(uT - uLeaderEnd) / 0.42);
+  if (uT > uStrokeT[0] && uT < uCCEnd) {
+    lum += uCCAmp * ord * (0.65 + 0.35 * sin(uT * 90.0 + aSeed.x * 20.0));
+    halo += uCCAmp * ord * 0.55;
+  }
+  if (uT > uLeaderEnd) {
+    lum += 0.03 * ord * exp(-(uT - uLeaderEnd) / 0.42);
+    halo += 0.05 * ord * exp(-(uT - uLeaderEnd) / 0.55);
+  }
   vLum = lum;
+  vHalo = halo;
   vOrder = aS.z;
   vAlong = aCorner.x * 2.0 - 1.0;
   vSide = aCorner.y;
@@ -906,7 +947,11 @@ void main(){
   vFlicker = clamp(0.86 + flickAmp * sin(uT * flickSpeed + aSeed.x * 37.0) + 0.06 * sin(uT * flick2 + aSeed.y * 19.0), 0.62, 1.08);
   vBead = 0.86 + 0.14 * sin(aS.y * 0.055 + aSeed.y * 31.0);
   float dist = length(cameraPosition - mix(A, B, aCorner.x));
-  float w = (0.42 + 2.25 * sqrt(max(lum, 0.0))) * aS.w * 1.05 + dist * 0.00085;
+  // Physical channel radius scales only weakly with peak current (~sqrt(I)); the broad
+  // scattering halo is carried by vHalo in the fragment stage, so ribbon width follows the
+  // slow afterglow envelope rather than the return-stroke strobe — no width-pulsing.
+  float w = (0.40 + 0.70 * sqrt(max(lum, 0.0)) + 0.95 * sqrt(max(halo, 0.0))) * aS.w * 1.05
+    + dist * 0.00085;
   w *= mix(1.0, 0.72, clamp(aS.z / 3.0, 0.0, 1.0));
   // Positive CG channels carry far higher peak current: a visibly thicker, steadier channel.
   w *= mix(1.0, 1.4, step(0.5, uPol));
@@ -916,7 +961,7 @@ void main(){
   gl_Position = (lum < 0.003) ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * viewMatrix * vec4(p, 1.0);
 }`;
 export const boltFrag = /* glsl */ `
-varying float vLum; varying float vSide; varying float vOrder; varying float vAlong;
+varying float vLum; varying float vHalo; varying float vSide; varying float vOrder; varying float vAlong;
 varying float vFlicker; varying float vBead;
 uniform float uPol;
 void main(){
@@ -932,7 +977,16 @@ void main(){
   // Negative CG: classic blue-white return stroke. IC: dimmer, violet.
   vec3 tint = uPol > 0.5 ? vec3(1.0, 0.96, 1.02) : (uPol < -0.5 ? vec3(0.86, 0.94, 1.06) : vec3(0.82, 0.84, 1.05));
   float gain = uPol > 0.5 ? 1.35 : (uPol < -0.5 ? 1.0 : 0.8);
-  vec3 c = (hot * core * 15.0 + mix(blue, hot, core) * glow * 3.0 + violet * halo * 0.55) * vLum * vFlicker * vBead * endFade;
+  // The core strobes with the return stroke (vFlicker); the scatter halo rides the slow
+  // afterglow envelope and does NOT strobe — light scattered by air and rain keeps lighting
+  // the ribbon for ~150 ms after the channel current dies. That persistence, not bloom, is
+  // what reads as realism on camera.
+  float strobe = vLum * vFlicker * vBead;
+  float after = vHalo * (0.85 + 0.15 * vBead);
+  vec3 c = hot * core * (15.0 * strobe + 1.6 * after)
+    + mix(blue, hot, core) * glow * (3.0 * strobe + 1.15 * after)
+    + violet * halo * (0.55 * strobe + 0.95 * after);
+  c *= endFade;
   c *= tint * gain;
   c *= mix(1.0, 0.58, clamp(vOrder / 3.0, 0.0, 1.0));   // thin branches are dimmer
   gl_FragColor = vec4(c, 1.0);
