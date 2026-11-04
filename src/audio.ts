@@ -60,6 +60,35 @@ export class AudioEngine {
 
   setEnabled(on: boolean) { this.enabled = on; if (this.ctx) this.master.gain.setTargetAtTime(on ? 0.8 : 0, this.ctx.currentTime, 0.1); }
 
+  /** Truck horn: classic dual-tone air horn (≈F4 + A4 saws) with an octave-down square for
+   *  body, through a lowpass — short, loud, unmistakable. Key H / the HORN button. */
+  horn() {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const t0 = ctx.currentTime;
+    const dur = 0.6;
+    const out = ctx.createGain();
+    out.gain.setValueAtTime(0, t0);
+    out.gain.linearRampToValueAtTime(0.55, t0 + 0.025);
+    out.gain.setValueAtTime(0.55, t0 + dur - 0.14);
+    out.gain.linearRampToValueAtTime(0, t0 + dur);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 2600; lp.Q.value = 0.5;
+    lp.connect(out);
+    out.connect(this.master);
+    const mk = (freq: number, type: OscillatorType, g: number, det = 0) => {
+      const o = ctx.createOscillator();
+      o.type = type; o.frequency.value = freq; o.detune.value = det;
+      const og = ctx.createGain(); og.gain.value = g;
+      o.connect(og); og.connect(lp);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+    };
+    mk(370, 'sawtooth', 0.34);        // ≈ F4
+    mk(440, 'sawtooth', 0.28, 7);     // ≈ A4 — the dual-tone pair
+    mk(185, 'square', 0.20);          // octave-down body
+  }
+
   update(dt: number, wind: number, rainRate: number, forest: number) {
     if (!this.ctx) return;
     this.t += dt;

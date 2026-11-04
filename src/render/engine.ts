@@ -7,6 +7,7 @@ import { makeNoiseData } from './noise';
 import * as S from './glsl';
 import * as T from './tornadoGlsl';
 import { FluidSim } from './fluid';
+import { LIGHT_TYPES } from '../controls';
 
 export type Tier = 'low' | 'mid' | 'high';
 export interface Quality {
@@ -162,10 +163,10 @@ export class Engine {
   chargePoints!: THREE.Points;
   private chargeCount = 0; chargeVisible = false;
   private chargeStage: Float32Array | null = null; private chargeCountT = 0;
-  private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial;
+  private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial; private beamM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
-  /** Thunder shock: positional shake on a fixed random axis, hash-gated at 720 Hz (see render). */
+  /** Thunder shock: positional shake on a fixed random axis, smooth ~11/17 Hz rattle (see render). */
   shake: { t0: number; amp: number; axis: THREE.Vector3; phaseSeed: number } | null = null;
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
@@ -173,6 +174,11 @@ export class Engine {
   localWind = new THREE.Vector2(); gustWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
   windTarget = new THREE.Vector2(); windDrift = new THREE.Vector2();
   lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0; lastSoftSpike = 0;
+  /** EMA of frame time (~0.4 s). Per-frame timers are useless on vsync displays: a GPU
+   *  needing ~25 ms produces alternating 16.7/33.3 ms frames, and every "fast" frame
+   *  reset the degrade timer — adaptation never fired and the display stayed in judder
+   *  (the "frame skip" that survived the dead-band fix). Decisions ride this average. */
+  avgDt = 0.016;
   /** Adaptive-quality dwell: timestamps of the last quality *action* and the last time
    *  quality was recovered upward. Degrades are rate-limited, upgrades need a long quiet
    *  window, and any action opens a cooldown — without this the controller oscillated with
@@ -329,8 +335,14 @@ export class Engine {
     debrisGeo.setAttribute('aSeed', new THREE.BufferAttribute(debrisSeed, 3));
     this.debrisPoints = new THREE.Points(debrisGeo, mk(T.debrisVert, T.debrisFrag, { uDebris: { value: 0 }, uTop: { value: 1200 } }, { transparent: true, depthWrite: false }));
     this.debrisPoints.frustumCulled = false; this.debrisPoints.renderOrder = 3.6; this.debrisPoints.visible = false; this.scene.add(this.debrisPoints);
-    this.lampM = mk(T.vehicleVert, T.lampFrag, { uHead: { value: 0 }, uTail: { value: 0 }, uPulse: { value: 0 } });
-    this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag), this.lampM);
+    this.lampM = mk(T.vehicleVert, T.lampFrag, {
+      uHead: { value: 0 }, uTail: { value: 0 }, uPulse: { value: 0 },
+      uHeadCol: { value: new V3(1, 0.84, 0.58) }, uHeadI: { value: 1 },
+    });
+    this.beamM = mk(T.beamVert, T.beamFrag, {
+      uBeamCol: { value: new V3(1, 0.84, 0.58) }, uBeamI: { value: 0 },
+    }, { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
+    this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag), this.lampM, this.beamM);
     this.vehicleGroup.visible = false; this.vehicleGroup.renderOrder = 4; this.scene.add(this.vehicleGroup);
     // ---- weather station: instrument mast deployed beside the truck
     this.stationGroup = this.buildStation(mk(T.vehicleVert, T.vehicleFrag));
@@ -491,7 +503,7 @@ export class Engine {
     return g;
   }
 
-  private buildVehicle(material: THREE.ShaderMaterial, lamp: THREE.ShaderMaterial): THREE.Group {
+  private buildVehicle(material: THREE.ShaderMaterial, lamp: THREE.ShaderMaterial, beam: THREE.ShaderMaterial): THREE.Group {
     const group = new THREE.Group();
     const part = (geom: THREE.BufferGeometry, color: [number, number, number], x: number, y: number, z: number, rx = 0, ry = 0, rz = 0, mat: THREE.ShaderMaterial = material) => {
       const g = geom.clone();
@@ -536,6 +548,18 @@ export class Engine {
     // head lamps (white, uHead) and tail lamps (red, uTail)
     part(new THREE.BoxGeometry(0.36, 0.18, 0.07), [1, 1, 1], -0.66, 1.62, -2.36, 0, 0, 0, lamp);
     part(new THREE.BoxGeometry(0.36, 0.18, 0.07), [1, 1, 1], 0.66, 1.62, -2.36, 0, 0, 0, lamp);
+    // Headlight beams: apex at each lamp, widening 11 m forward with a ~7° downward
+    // tilt (built in local space, then rotated so the tube runs along −Z and down).
+    const beamGeo = new THREE.ConeGeometry(0.95, 11, 16, 1, true);
+    beamGeo.translate(0, -5.5, 0);   // apex at the origin, tube extends toward −Y
+    for (const bx of [-0.66, 0.66]) {
+      const bm = new THREE.Mesh(beamGeo, beam);
+      bm.position.set(bx, 1.58, -2.42);
+      bm.rotation.x = Math.PI / 2 - 0.13;
+      bm.renderOrder = 4.2;
+      bm.frustumCulled = false;
+      group.add(bm);
+    }
     part(new THREE.BoxGeometry(0.3, 0.16, 0.07), [0.9, 0.08, 0.06], -0.72, 1.5, 2.3, 0, 0, 0, lamp);
     part(new THREE.BoxGeometry(0.3, 0.16, 0.07), [0.9, 0.08, 0.06], 0.72, 1.5, 2.3, 0, 0, 0, lamp);
     // mirrors, exhaust stacks, whip antenna, mud flaps
@@ -999,20 +1023,20 @@ export class Engine {
     this.cloudMat.uniforms.uDenoise.value = U.uDenoise.value;
     U.uHeavyRain.value += (this.heavyRain - U.uHeavyRain.value) * Math.min(1, rawDt * 2);
     this.camera.position.set(cam.x, cam.y, cam.z);
-    // Thunder shock offset: a fixed random axis per strike, gated at 720 Hz (see render).
+    // Thunder shock offset: a fixed random axis per strike, smooth ~11/17 Hz rattle (see render).
     if (this.shake) {
       const ss = (performance.now() - this.shake.t0) / 1000;
       if (ss > 1.3) this.shake = null;
       else {
         const env = Math.min(1, ss * 55) * Math.exp(-ss * 3.4);
-        // Hash-based sign flip on the 720 Hz tick index: sin() at 720 Hz aliased against a
-        // ~60 Hz frame grid samples a slowly drifting phase and freezes into a near-constant
-        // offset (the camera sticks, then jumps — perceived as a skip). Hashing the tick
-        // gives an uncorrelated ±1 every tick regardless of the frame-rate/cycle relation.
-        const tick = Math.floor(performance.now() * 0.72) + this.shake.phaseSeed;
-        let h = Math.imul(tick ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(tick + 0x165667b1, 0xc2b2ae35);
-        h ^= h >>> 15;
-        const osc = (h & 1) !== 0 ? 1 : -1;
+        // Smooth rattle: two incommensurate sines at ~11/17 Hz — comfortably below the
+        // Nyquist limit at any plausible frame rate, so the offset interpolates between
+        // frames. The previous per-frame hash produced an uncorrelated ±amp jump EVERY
+        // frame (white noise), which read as the camera skipping frame by frame during
+        // every thunder shake; the original 720 Hz sin() aliased to a frozen offset.
+        const p = this.shake.phaseSeed * 0.0157;
+        const osc = 0.62 * Math.sin(ss * 2 * Math.PI * 11.3 + p)
+          + 0.38 * Math.sin(ss * 2 * Math.PI * 16.9 + p * 1.7 + 2.1);
         const a = this.shake.amp * env * osc;
         this.camera.position.x += this.shake.axis.x * a;
         this.camera.position.y += this.shake.axis.y * a;
@@ -1073,6 +1097,9 @@ export class Engine {
       this.lampM.uniforms.uPulse.value = 0.2 + 0.8 * Math.max(0, Math.sin(this.time * 7.0));
       this.lampM.uniforms.uHead.value = pose.lights ? 1 : 0.05;
       this.lampM.uniforms.uTail.value = pose.brake ? 1 : (pose.lights ? 0.35 : 0.07);
+      const ltT = LIGHT_TYPES[Math.min(LIGHT_TYPES.length - 1, Math.max(0, pose.lightType | 0))];
+      this.lampM.uniforms.uHeadCol.value.set(ltT.col[0], ltT.col[1], ltT.col[2]);
+      this.lampM.uniforms.uHeadI.value = ltT.i;
     }
 
     // ---- lighting from the sun and the simulated sky state
@@ -1086,6 +1113,17 @@ export class Engine {
     U.uSkyAmb.value.set(lt.skyAmb[0], lt.skyAmb[1], lt.skyAmb[2]).multiplyScalar(0.55 + 0.45 * dim);
     U.uHorizon.value.set(...lt.horizon); U.uGroundAmb.value.set(...lt.groundAmb); U.uTwilight.value = lt.twilight;
     U.uTime.value = this.time;
+    // Headlight beams: type colour/intensity, modulated by darkness (in daylight a beam
+    // is barely visible; at night it is the whole show). uBeamI = 0 discards the cones.
+    if (this.vehiclePose && this.vehiclePose.active) {
+      const bp = this.vehiclePose;
+      const bt = LIGHT_TYPES[Math.min(LIGHT_TYPES.length - 1, Math.max(0, bp.lightType | 0))];
+      const night = 1 - Math.max(0, Math.min(1, lt.dayness));
+      this.beamM.uniforms.uBeamCol.value.set(bt.col[0], bt.col[1], bt.col[2]);
+      this.beamM.uniforms.uBeamI.value = bp.lights ? bt.i * (0.30 + 0.70 * night) : 0;
+    } else {
+      this.beamM.uniforms.uBeamI.value = 0;
+    }
     U.uVis.value = Math.max(2400, (62000 * (1 - 0.38 * this.rh)) / (1 + 0.11 * this.rainAtCam + 1.15 * this.heavyRain));
     // Local rain drives how many near-camera drops survive and how bright the veils are.
     U.uRainIntensity.value = Math.max(0, Math.min(1, 1 - Math.exp(-this.rainAtCam / 18)));
@@ -1120,7 +1158,7 @@ export class Engine {
         fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 15 * lum);
       }
       flashSum += (lum * 7) / (1 + (f.dist * f.dist) / (3500 * 3500));
-      // Thunder shock: the sound wave reaches the camera at dist / 340 s — start a 720 Hz
+      // Thunder shock: the sound wave reaches the camera at dist / 340 s — start a smooth
       // random-axis positional shake then (the bolt itself is already on screen).
       if (!f.shook && t >= f.dist / 340) {
         f.shook = true;
@@ -1234,10 +1272,15 @@ export class Engine {
     // ---- dynamic resolution for the cloud pass
     this.fps += (1 / rawDt - this.fps) * Math.min(1, rawDt * 0.15);
     const frameDt = rawDt * 1000;
-    // Recovery must be reachable on ordinary 60 Hz displays (16.7 ms), not just 120 Hz ones.
-    // Wider dead-band (18..30 ms) than before so a frame time parked near a threshold cannot
-    // toggle timers on alternate samples.
-    if (frameDt > 30) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 18) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
+    // Adapt on the ROLLING AVERAGE, never on a single frame. On a vsync display a GPU
+    // needing ~25 ms alternates 16.7 / 33.3 ms frames: the old per-frame logic was reset
+    // by every fast frame, lowTimer never reached its threshold, and the display stayed
+    // in permanent judder ("frame skip") no matter how long it ran. The EMA sees the true
+    // 25 ms cost; 21 ms avg degrades, 17.5 ms avg (near-solid 60 Hz) upgrades, and the
+    // 4.5/14 s action cooldowns keep the band from oscillating.
+    this.avgDt += (rawDt - this.avgDt) * Math.min(1, rawDt * 2.5);
+    const avgMs = this.avgDt * 1000;
+    if (avgMs > 21) { this.lowTimer += rawDt; this.highTimer = 0; } else if (avgMs < 17.5) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
     const stepCap = Math.max(24, Math.round(this.q.steps * (1 - 0.15 * this.stormLoad)));
