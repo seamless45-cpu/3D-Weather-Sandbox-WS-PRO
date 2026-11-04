@@ -50,14 +50,35 @@
         var shown = false;
         var failedUrl = null;
         var timer = null;
+        var mountIv = null;
         var tries = 0;
         var MAX_TRIES = 120; // 6 minutes of automatic retrying
 
+        // React has rendered anything at all (menu, loader, or App's own UNABLE-TO-START
+        // panel). Element-count based: a healthy app must always count as mounted, so this
+        // fallback never covers in-page UI, and a slow first compile never reads as dead.
         function mounted() {
-          return !!(document.querySelector('#root .hud') || document.querySelector('#root canvas'));
+          var r = document.getElementById('root');
+          return !!(r && r.childElementCount);
+        }
+        // Hide the panel the moment the app renders — it recovered, or it was fine all along
+        // and we raced a slow first load. Without this the panel sat over a healthy app.
+        function watchMount() {
+          if (mountIv) return;
+          mountIv = setInterval(function () {
+            if (!shown) return;
+            if (mounted()) {
+              var f = el('boot-fallback');
+              if (f) f.style.display = 'none';
+              shown = false;
+              if (timer) { clearInterval(timer); timer = null; }
+              clearInterval(mountIv); mountIv = null;
+            }
+          }, 400);
         }
         function el(id) { return document.getElementById(id); }
         function isHttp(u) { return /^https?:/i.test(u || ''); }
+        function servedByVite() { return !!document.querySelector('script[src*="@vite/client"]'); }
 
         function show(reason, url) {
           if (shown || mounted()) return;
@@ -67,18 +88,24 @@
           if (r && reason) r.textContent = String(reason).slice(0, 300);
           var f = el('boot-fallback');
           if (f) f.style.display = 'grid';
+          watchMount();
           if (failedUrl && isHttp(failedUrl)) startAutoRetry();
           useStandaloneBuild();
         }
 
-        // The sources can only run under Vite (dev server). Anywhere else - GitHub Pages, a plain
-        // static host, file:// - fall through to the prebuilt single file sitting next to this page.
+        // The sources can only run under Vite (dev server). Anywhere else - GitHub Pages, a
+        // plain static host, file:// - fall through to the prebuilt single file next to this
+        // page. NEVER under Vite though: the root snapshot (build:standalone) is built on
+        // demand and can lag behind the live sources — redirecting there silently served an
+        // OLD version of the app after any boot hiccup (the "didn't see the update" bug).
         function useStandaloneBuild() {
           var here = location.pathname || '';
           if (/atmos-sim-standalone\.html$/.test(here)) return; // never redirect into a loop
           var target = 'atmos-sim-standalone.html';
           var go = function () { location.replace(target); };
           if (location.protocol === 'file:') { go(); return; }
+          if (servedByVite()) return;                 // live dev/preview: stay on the live app
+          if (!(failedUrl && /\/src\/main\.tsx([?#]|$)/.test(failedUrl))) return; // only raw-source hosting
           fetch(target, { method: 'HEAD', cache: 'no-store' })
             .then(function (res) { if (res && res.ok) { var r = el('boot-reason'); if (r) r.textContent = 'starting the prebuilt single-file build…'; go(); } })
             .catch(function () {});
@@ -120,16 +147,23 @@
 
         window.addEventListener('error', function (e) {
           var t = e.target;
-          if (t && t !== window && (t.src || t.href)) scheduleShow('failed to load ' + (t.src || t.href), t.src || t.href);
-          else scheduleShow(e.message || 'script error');
+          if (t && t !== window && (t.src || t.href)) {
+            var u = t.src || t.href;
+            // Only script/module/style failures can prevent boot. A missing image, font or
+            // other asset must never claim the app failed to boot.
+            if (/\.(m?js|tsx?|css)([?#]|$)/i.test(u) || /\/src\//.test(u)) scheduleShow('failed to load ' + u, u);
+          } else scheduleShow(e.message || 'script error');
         }, true);
         window.addEventListener('unhandledrejection', function (e) {
           var r = e.reason;
           scheduleShow((r && r.message) || r || 'unhandled promise rejection');
         });
+        // First Vite load compiles the whole module graph (the GLSL module alone is huge);
+        // 6 s raced that and covered healthy apps with the failure panel. 15 s only fires
+        // when React truly never rendered anything.
         setTimeout(function () {
-          if (!mounted()) show('the app never mounted (6 s timeout)');
-        }, 6000);
+          if (!mounted()) show('the app never mounted (15 s timeout)');
+        }, 15000);
 
         document.addEventListener('DOMContentLoaded', function () {
           var b = el('boot-retry');
