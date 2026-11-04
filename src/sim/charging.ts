@@ -1,25 +1,31 @@
 /**
- * Mixed-phase thunderstorm electrification.
+ * Mixed-phase thunderstorm electrification — generation + separation.
  *
- * Replaces the old single-coefficient, single-reversal-temperature source with:
- *  - Saunders-type non-inductive graupel/ice rebounding charging whose sign-reversal
- *    temperature depends on liquid water content and whose rate depends on collision
- *    kinetic energy, supercooled liquid, ice and graupel concentrations;
- *  - inductive charging of rebounding particles in the existing vertical electric field;
- *  - a *dynamic* charge structure anchored to the freezing level and each column's own
- *    cloud top instead of fixed 1.2 / 4.2 / 8 km bands:
+ * GENERATION (where charge is created):
+ *  - Saunders-type non-inductive graupel/ice rebounding with an LWC-dependent reversal
+ *    temperature. The sign carried by GRAUPEL (ice takes the opposite) is physical:
  *
- *        cloud top −700 m … top   negative screening skin (caps every real storm)
- *        zMidTop …… cloud top    upper positive (ice lofted by the updraft)
- *        z0 − 500 …… zMidTop     main negative on graupel
- *        800 m ……… z0 − 500      lower positive warm mixed-phase pocket
+ *      T warmer than the reversal      → NEGATIVE graupel   (main mid-level negative)
+ *      T colder than the reversal      → POSITIVE graupel   (cold mixed-phase)
+ *      below the freezing level (warm
+ *      reversal, T > T0 − 9)           → POSITIVE graupel   (lower positive pocket)
  *
- *    The fixed bands dropped charge into clear air above shallow clouds and never formed
- *    the negative screening layer that observations show capping the anvil.
- *  - charge carried on heavy and light hydrometeors, sedimented and decayed by the existing
- *    conductivity profile.
+ *  - inductive charging of rebounding particles in the existing vertical field;
+ *  - ion attachment at the cloud top: the topmost 700 m relaxes toward a NEGATIVE
+ *    screening skin (fair-weather ions of opposite sign drift in and attach).
  *
- * This is still a grid-scale bulk parameterization: it does not resolve individual collisions.
+ * SEPARATION (how the structure forms): NO band-target relaxation exists any more —
+ * the tripole is *transported* into place:
+ *  - negative graupel sediments with the heavy species → main mid-level negative;
+ *  - the ice crystals carry the opposite sign and ride the updraft (they only settle at
+ *    their tiny terminal speed relative to the air) → upper positive;
+ *  - warm-reversal graupel sits low and falls → lower positive pocket;
+ *  - the cold-side negative ice lofted to the top reinforces the screening skin.
+ * Charge rides the existing hydrometeor advection + sedimentation and decays with the
+ * conductivity profile (micro.ts chargeDecay).
+ *
+ * This is still a grid-scale bulk parameterization: it does not resolve individual
+ * collisions. Diagnostics partition the dynamic bands for the tripole index.
  */
 import type { Atmosphere } from './atmosphere';
 import { T0 } from './consts';
@@ -28,15 +34,15 @@ import { rhoFac, vtGraupel, vtIce } from './micro';
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 
 /** Lumped non-inductive charging coefficient, tuned to give realistic grid-scale E fields. */
-const K_NI = 7.5e-4;
-const K_IND = 2.2e-10;
-const Q_SCREEN = 2.4e-9;
+const K_NI = 7.0;
+const K_IND = 1.0e-9;
+const Q_SCREEN = 2.0e-9;
 const Q_LIMIT = 5.0e-7;
 
 export interface ChargeDiagnostics {
   sepRate: number;       // C/s over the domain, non-inductive
   inductiveRate: number; // C/s, inductive
-  screeningRate: number; // C/s, screening/tripole relaxation
+  screeningRate: number; // C/s, cloud-top ion screening
   upperPos: number; midNeg: number; lowerPos: number; // C per layer band
   tripole: number;       // 0..1 structural index
   flashEnergy: number;   // proxy J in the separated charge field
@@ -58,7 +64,8 @@ export function chargeSeparation(a: Atmosphere, dt: number) {
   const kNI = K_NI * rate, kInd = K_IND * rate, qScreen = Q_SCREEN * rate, qLimit = Q_LIMIT * Math.max(0.4, rate);
   let sep = 0, ind = 0, scr = 0, upper = 0, mid = 0, lower = 0;
 
-  // ---- freezing level from the mean profile: the whole layer structure hangs off this.
+  // ---- freezing level from the mean profile: diagnostics bands and the warm-reversal
+  // pocket hang off this.
   let z0 = 4000, found0 = false;
   for (let k = 1; k < nz; k++) {
     const Ta = a.prof.th[k - 1] * a.prof.pi[k - 1];
@@ -86,6 +93,9 @@ export function chargeSeparation(a: Atmosphere, dt: number) {
     colTop[ij] = top;
   }
 
+  // Diagnostics partition (upper/mid/lower) — bands follow the freezing level and cloud top.
+  const zPosLo = Math.max(z0 + 2200, 5200);
+
   for (let k = 0; k < nz; k++) {
     const rho = rhoC[k], rf = rhoFac(rho), z = g.zc[k];
     for (let ij = 0; ij < nxy; ij++) {
@@ -98,13 +108,20 @@ export function chargeSeparation(a: Atmosphere, dt: number) {
       const graupel = qg[idx];
       const vol = area * g.dz[k] * rho;
       const zTopC = colTop[ij];
+      const zMidTop = clamp(Math.min(zPosLo, zTopC - 1100), z0 - 300, zPosLo);
 
-      // 1. Non-inductive charging in the mixed-phase region (-5 to -38 C).
-      if (T < T0 - 5 && T > 233.15 && graupel > 1e-7 && ice > 1e-7 && qc[idx] > 1e-7) {
-        // Warmer / high-LWC reversal moves toward -20 C; dry / cold toward -8 C.
+      // 1. Non-inductive charging (mixed phase). Gate widened to just below freezing so the
+      //    warm-reversal pocket can form; supercooled liquid is still required.
+      if (T < T0 - 1 && T > 233.15 && graupel > 1e-7 && ice > 1e-7 && qc[idx] > 1e-7) {
+        // Primary reversal: warmer / high-LWC toward -20 C; dry / cold toward -8 C.
         const Trev = T0 - 12 - 7 * clamp((lwc - 0.35) / 1.8, 0, 1) + 3 * clamp(1 - lwc / 0.6, 0, 1);
         const dT = T - Trev;
-        const sign = dT >= 0 ? 1 : -1;
+        // Sign carried by GRAUPEL (ice takes the opposite). Warm side of the primary
+        // reversal → negative graupel (the main mid-level negative, transported down by
+        // sedimentation); cold side → positive graupel. Below the freezing level the warm
+        // reversal flips graupel positive — the lower positive pocket.
+        const warmPocket = z < z0 + 250 && T > T0 - 9;
+        const sign = warmPocket ? 1 : (dT >= 0 ? -1 : 1);
         const thermal = clamp(Math.abs(dT) / 11, 0.08, 1) * clamp((T - 233.15) / 12, 0, 1) * clamp((T0 - 5 - T) / 9, 0, 1);
         const liquid = clamp(lwc / 1.1, 0, 1);
         const vrel = Math.max(1.2, vtGraupel(rho * graupel, rf) - vtIce(rf));
@@ -123,29 +140,28 @@ export function chargeSeparation(a: Atmosphere, dt: number) {
         ind += Math.abs(dq) * vol;
       }
 
-      // 3. Dynamic layer structure (see header). Charge is tied to existing hydrometeors,
-      //    so clear air never generates field; the relaxation time is a few minutes.
-      //    Bands are anchored to the freezing level and this column's cloud top, and the
-      //    topmost 700 m of cloud relaxes toward a NEGATIVE screening skin.
-      const zPosLo = Math.max(z0 + 2200, 5200);
-      const zMidTop = clamp(Math.min(zPosLo, zTopC - 1100), z0 - 300, zPosLo);
-      let target = 0;
+      // 3. Cloud-top ion screening: the topmost 700 m of each column relaxes toward a
+      //    negative skin — fair-weather ions drift in and attach at the storm boundary.
+      //    The ion current closes just beneath the skin, so the mirrored positive charge is
+      //    deposited in the cell below: screening stays a neutral dipole and cannot starve
+      //    the domain of positive charge (a one-sided sink left the storm 70 C net-negative
+      //    and the Poisson solve with nothing positive to work with).
       if (z >= zTopC - 700) {
-        target = -qScreen * 1.15 * clamp((qi[idx] + qs[idx]) / 3e-4, 0, 1.3);
-      } else if (z > zMidTop) {
-        target = qScreen * clamp((qi[idx] + qs[idx]) / 3e-4, 0, 1.4);
-      } else if (z > z0 - 500) {
-        if (graupel > 1e-7) target = -qScreen * 1.45 * clamp(graupel / 3e-4, 0, 1.4);
-      } else if (z > 800 && T > T0 - 14) {
-        if (graupel > 1e-7) target = qScreen * 0.85 * clamp(graupel / 3e-4, 0, 1.4);
-      }
-      if (target !== 0) {
+        const target = -qScreen * 1.15 * clamp((qi[idx] + qs[idx]) / 3e-4, 0, 1.3);
         const cur = qh[idx] + ql[idx];
         const delta = (target - cur) * Math.min(1, dt / 240);
-        const heavyShare = target < 0 ? 0.72 : 0.58;
+        const heavyShare = 0.7;
         qh[idx] += delta * heavyShare;
         ql[idx] += delta * (1 - heavyShare);
         scr += Math.abs(delta) * vol;
+        if (k > 0 && delta !== 0) {
+          const ib = idx - nxy;
+          if (qc[ib] + qi[ib] + qs[ib] + qg[ib] > 1e-9) {
+            const mirror = -delta * 0.85;
+            qh[ib] += mirror * 0.6;
+            ql[ib] += mirror * 0.4;
+          }
+        }
       }
 
       qh[idx] = clamp(qh[idx], -qLimit, qLimit);

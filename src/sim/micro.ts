@@ -74,12 +74,15 @@ export function microphysics(a: Atmosphere, dt: number) {
           }
         }
       }
-      // 5. saturation adjustment (liquid above -38C; ice-saturation limited below)
+      // 5. saturation adjustment (liquid above -38C; ice-saturation limited below).
+      //    Evaporation is RATE-LIMITED (entrainment mixing with dry air is finite): cloud
+      //    edges in subsaturated air erode over seconds instead of vanishing in one step,
+      //    which feathers cloud boundaries and keeps small cumulus alive realistically.
       if (T >= 233.15) {
         for (let it = 0; it < 2; it++) {
           const q = qsl(T, p);
           let dq = (tqv - q) / (1 + (LV * LV * q) / (CP * RV * T * T));
-          if (dq < 0) dq = -Math.min(-dq, tqc);
+          if (dq < 0) dq = -Math.min(-dq, tqc * Math.min(1, dt * 2.2));
           tqv -= dq; tqc += dq; T += (LV / CP) * dq;
         }
       } else {
@@ -87,6 +90,17 @@ export function microphysics(a: Atmosphere, dt: number) {
         if (tqv > 1.05 * q) {
           const dq = (tqv - q) / (1 + (LS * LS * q) / (CP * RV * T * T));
           tqv -= dq; tqi += dq; T += (LS / CP) * dq;
+        }
+        // 5b. sublimation of snow/graupel in subsaturated air (anvil edges, virga): slow,
+        //     ventilation-limited mass loss with the latent cooling that goes with it.
+        if (tqs + tqg > 1e-9 && tqv < q) {
+          const deficit = 1 - tqv / Math.max(1e-9, q);
+          const lim = Math.max(0, (q - tqv) / (1 + (LS * LS * q) / (CP * RV * T * T)));
+          const e = Math.min(0.05 * deficit * dt * (tqs + tqg), tqs + tqg, lim);
+          if (e > 1e-12) {
+            const fS = tqs / (tqs + tqg);
+            tqs -= e * fS; tqg -= e * (1 - fS); tqv += e; T -= (LS / CP) * e;
+          }
         }
       }
       // 6. collision-coalescence (autoconversion + accretion)

@@ -22,6 +22,8 @@ export interface VehiclePose {
   pitch: number; roll: number; steer: number; bounce: number;
   speed: number; damage: number; probe: boolean; lights: boolean; brake: boolean;
   wind: number; pressureDrop: number; distance: number; bearing: number; closing: number;
+  /** Seconds of energy-drink boost left (×10 speed), 0 when dry. */
+  drink: number;
 }
 
 /** Player controller with a foot mode and a fully player-driven intercept vehicle. */
@@ -38,6 +40,9 @@ export class Player {
   private touches = new Map<number, { x: number; y: number }>(); private pinch = 0;
   private cleanup: (() => void)[] = [];
   private bounceV = 0; private tT = 0;
+  /** Energy-drink boost deadline (performance.now ms): ×10 speed while now < drinkUntil. */
+  private drinkUntil = 0;
+  drinkActive() { return performance.now() < this.drinkUntil; }
 
   constructor(el: HTMLElement, terrain: Terrain, spawn: [number, number]) {
     this.terrain = terrain;
@@ -57,6 +62,8 @@ export class Player {
       if (e.code === 'KeyV' && !e.repeat) this.toggleVehicle();
       if (e.code === 'KeyP' && !e.repeat && this.mode === 'vehicle') this.vehicle.probe = !this.vehicle.probe;
       if (e.code === 'KeyL' && !e.repeat && this.mode === 'vehicle') this.vehicle.lights = !this.vehicle.lights;
+      // Energy drink: 30 s of ×10 power/speed. Re-drinking refreshes the timer.
+      if (e.code === 'KeyG' && !e.repeat) this.drinkUntil = performance.now() + 30000;
       if (['Space', 'ArrowUp', 'ArrowDown'].includes(e.code)) e.preventDefault();
     });
     on(window, 'keyup', (e: KeyboardEvent) => this.keys.delete(e.code));
@@ -126,6 +133,7 @@ export class Player {
       speed: v.speed, damage: v.damage, probe: v.probe, lights: v.lights, brake: v.brake,
       wind: v.wind, pressureDrop: v.pressureDrop, distance: v.distance, bearing: v.bearing,
       closing: v.closing,
+      drink: Math.max(0, (this.drinkUntil - performance.now()) / 1000),
     };
   }
 
@@ -142,8 +150,10 @@ export class Player {
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) s += 1;
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) s -= 1;
     const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
-    // 5x the original walking pace (running still ~2.75x faster than walking)
-    const sp = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 27.5 : 10.0;
+    // 5x the original walking pace (running still ~2.75x faster than walking); the energy
+    // drink multiplies it again by 10 for its 30 s window.
+    const sp = (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 27.5 : 10.0)
+      * (this.drinkActive() ? 10 : 1);
     const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw), rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
     const tvx = (fx * f + rx * s) * sp, tvz = (fz * f + rz * s) * sp;
     const k = 1 - Math.exp(-dt * 7);
@@ -192,14 +202,17 @@ export class Player {
     let fwd = v.vx * fx + v.vz * fz;
     let lat = v.vx * rx + v.vz * rz;
 
-    // Power curve with speed falloff; hull damage steals power.
+    // Power curve with speed falloff; hull damage steals power. The energy drink multiplies
+    // engine power ×10, quarter-drag and raises the speed clamp ×10 for its 30 s window.
+    const boost = this.drinkActive() ? 10 : 1;
     const dmg = v.damage;
-    const power = 15.5 * (1 - 0.34 * dmg) * (1 - 0.75 * Math.min(1, Math.abs(fwd) / 50));
-    const accel = throttle >= 0 ? power * throttle : 21 * throttle;
-    const drag = 0.010 * fwd * Math.abs(fwd) + 0.30 * fwd;
+    const power = 15.5 * boost * (1 - 0.34 * dmg) * (1 - 0.75 * Math.min(1, Math.abs(fwd) / (50 * boost)));
+    const accel = throttle >= 0 ? power * throttle : 21 * boost * throttle;
+    const dragScale = boost > 1 ? 0.25 : 1;
+    const drag = (0.010 * fwd * Math.abs(fwd) + 0.30 * fwd) * dragScale;
     fwd += (accel - (drag + (handbrake ? 16 * Math.sign(fwd) : 0))) * dt;
     if (Math.abs(throttle) < 0.02) fwd *= Math.exp(-dt * 0.55);   // engine braking
-    fwd = clamp(fwd, -11, 50);
+    fwd = clamp(fwd, -11, 50 * boost);
 
     // Lateral grip: firm normally, cut by the handbrake (drift), by damage and by water.
     const grip = (handbrake ? 1.15 : 7.0) * (1 - 0.4 * dmg);

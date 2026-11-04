@@ -72,6 +72,8 @@ let flashes = 0;
 let cgNeg = 0;
 let cgPos = 0;
 let ic = 0;
+let cc = 0;
+let anvil = 0;
 let blowup = false;
 let peakW = 0;
 let peakRain = 0;
@@ -86,6 +88,8 @@ while (a.time < tEnd) {
     flashes++;
     if (e.type === 'CG-') cgNeg++;
     else if (e.type === 'CG+') cgPos++;
+    else if (e.type === 'CC') cc++;
+    else if (e.type === 'ANVIL') anvil++;
     else ic++;
     if (flashes <= 40) {
       const strike = e.strike ? e.strike.map((v: number) => v.toFixed(0)).join(',') : '-';
@@ -126,7 +130,7 @@ while (a.time < tEnd) {
 
 console.log(
   `total ${Date.now() - tw} ms, steps ${steps}, sim ${(hours).toFixed(2)} h, ` +
-    `flashes ${flashes} (CG- ${cgNeg}, CG+ ${cgPos}, IC ${ic}), peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h, ` +
+    `flashes ${flashes} (CG- ${cgNeg}, CG+ ${cgPos}, IC ${ic}, CC ${cc}, ANVIL ${anvil}), peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h, ` +
   `tornado ${tornadoSeen ? 'YES' : 'no'}, peak vortex ${peakTornado.toFixed(2)}, peak tripole ${peakTripole.toFixed(2)}`,
 );
 console.log(blowup ? 'RESULT: FAIL (blow-up)' : failed ? `RESULT: FAIL (${failed} validation checks)` : 'RESULT: PASS');

@@ -136,7 +136,7 @@ export interface FlashEvent {
 }
 export interface FlashVis {
   ev: FlashEvent; t0: number; mesh: THREE.Mesh; mat: THREE.ShaderMaterial; off: THREE.Vector3;
-  cloudPos: THREE.Vector3; groundPos: THREE.Vector3; end: number; dist: number;
+  cloudPos: THREE.Vector3; groundPos: THREE.Vector3; end: number; dist: number; shook?: boolean;
 }
 
 const L = DOMAIN;
@@ -151,7 +151,11 @@ export class Engine {
   cloudMat: THREE.ShaderMaterial; compMat: THREE.ShaderMaterial;
   terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh; shaftMesh: THREE.Mesh;
   mistMesh!: THREE.Mesh;
+  /** Crown-splash impact droplets ejected off wet ground under heavy rain. */
+  dropMesh!: THREE.Mesh;
   funnelMesh: THREE.Mesh; debrisPoints: THREE.Points; vehicleGroup: THREE.Group;
+  /** Deployed weather-station mast (anemometer/vane/shield/gauge) beside the truck. */
+  stationGroup: THREE.Group | null = null;
   /** GPU stable-fluids flow field; clouds/shafts/rain sample its velocity texture. */
   fluid: FluidSim;
   /** Charge-particle cloud (+/− glyphs) for the show-charges toggle. */
@@ -161,6 +165,8 @@ export class Engine {
   private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
+  /** Thunder shock: positional shake on a fixed random axis, gated at 720 Hz (see render). */
+  shake: { t0: number; amp: number; axis: THREE.Vector3; phase: number } | null = null;
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
@@ -292,6 +298,9 @@ export class Engine {
     this.splashMesh = new THREE.Mesh(this.buildParticles(Math.max(1, Math.floor(q.rain * 0.42))), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
     if (!q.splashes) this.splashMesh.visible = false;
     this.splashMesh.frustumCulled = false; this.splashMesh.renderOrder = 3; this.scene.add(this.splashMesh);
+    // ---- impact droplets: ballistic crown-splash micro droplets under heavy rain
+    this.dropMesh = new THREE.Mesh(this.buildParticles(Math.max(48, Math.floor(q.rain * 1.1))), mk(S.dropVert, S.dropFrag, {}, { transparent: true, depthWrite: false }));
+    this.dropMesh.frustumCulled = false; this.dropMesh.renderOrder = 3; this.scene.add(this.dropMesh);
 
     // ---- rain mist: soft ground-hugging puffs under precipitating shafts (auto-gated by
     // the local rain field in the shader — no separate toggle needed)
@@ -317,6 +326,9 @@ export class Engine {
     this.lampM = mk(T.vehicleVert, T.lampFrag, { uHead: { value: 0 }, uTail: { value: 0 }, uPulse: { value: 0 } });
     this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag), this.lampM);
     this.vehicleGroup.visible = false; this.vehicleGroup.renderOrder = 4; this.scene.add(this.vehicleGroup);
+    // ---- weather station: instrument mast deployed beside the truck
+    this.stationGroup = this.buildStation(mk(T.vehicleVert, T.vehicleFrag));
+    this.stationGroup.visible = false; this.stationGroup.renderOrder = 4; this.scene.add(this.stationGroup);
     // ---- charge particles: + (red) and − (blue) glyphs over the simulated charge pockets
     const MAXCH = 6000;
     const chGeo = new THREE.BufferGeometry();
@@ -427,6 +439,52 @@ export class Engine {
    * cup anemometer, rotating radome, deployable front probe, brake/head lamps and steered,
    * spinning wheels are all separate nodes so `render()` can animate them from the pose.
    */
+  /** Instrument mast parked beside the truck: spinning cups, wind vane, T shield, rain gauge. */
+  private buildStation(material: THREE.ShaderMaterial): THREE.Group {
+    const g = new THREE.Group();
+    const part = (parent: THREE.Object3D, geom: THREE.BufferGeometry, color: [number, number, number],
+                  x: number, y: number, z: number, rx = 0, ry = 0, rz = 0) => {
+      const geo = geom.clone();
+      const n = geo.getAttribute('position').count;
+      const cols = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cols[i * 3] = color[0]; cols[i * 3 + 1] = color[1]; cols[i * 3 + 2] = color[2]; }
+      geo.setAttribute('aColor', new THREE.BufferAttribute(cols, 3));
+      const m = new THREE.Mesh(geo, material);
+      m.position.set(x, y, z); m.rotation.set(rx, ry, rz);
+      m.frustumCulled = false;
+      parent.add(m);
+      return m;
+    };
+    const white: [number, number, number] = [0.88, 0.89, 0.87];
+    const dark: [number, number, number] = [0.12, 0.13, 0.14];
+    part(g, new THREE.CylinderGeometry(0.05, 0.07, 2.3, 8), white, 0, 1.15, 0);
+    part(g, new THREE.CylinderGeometry(0.32, 0.38, 0.08, 10), dark, 0, 0.04, 0);
+    // radiation shield: stacked discs over the temperature/humidity sensor
+    for (let i = 0; i < 4; i++) part(g, new THREE.CylinderGeometry(0.13, 0.13, 0.02, 10), white, 0, 1.42 + i * 0.05, 0);
+    // tipping-bucket rain gauge
+    part(g, new THREE.CylinderGeometry(0.11, 0.11, 0.3, 10), dark, 0.45, 0.36, 0);
+    // anemometer: 3 cups on a free-spinning head
+    const cups = new THREE.Group();
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * Math.PI * 2;
+      part(cups, new THREE.BoxGeometry(0.22, 0.018, 0.018), dark, Math.cos(a) * 0.11, 0, Math.sin(a) * 0.11, 0, -a, 0);
+      const cup = part(cups, new THREE.SphereGeometry(0.055, 8, 6, 0, Math.PI), dark, Math.cos(a) * 0.22, 0, Math.sin(a) * 0.22, 0, -a, 0);
+      cup.scale.set(1, 0.75, 1);
+    }
+    part(cups, new THREE.CylinderGeometry(0.03, 0.03, 0.08, 8), white, 0, -0.02, 0);
+    cups.position.y = 2.34;
+    g.add(cups);
+    // wind vane: arrow into the wind, fin downwind
+    const vane = new THREE.Group();
+    part(vane, new THREE.BoxGeometry(0.34, 0.02, 0.02), white, 0.05, 0, 0);
+    part(vane, new THREE.BoxGeometry(0.02, 0.13, 0.15), white, -0.15, 0.02, 0);
+    part(vane, new THREE.CylinderGeometry(0.025, 0.025, 0.06, 8), dark, 0, -0.02, 0);
+    vane.position.y = 2.5;
+    g.add(vane);
+    g.userData = { cups, vane };
+    return g;
+  }
+
   private buildVehicle(material: THREE.ShaderMaterial, lamp: THREE.ShaderMaterial): THREE.Group {
     const group = new THREE.Group();
     const part = (geom: THREE.BufferGeometry, color: [number, number, number], x: number, y: number, z: number, rx = 0, ry = 0, rz = 0, mat: THREE.ShaderMaterial = material) => {
@@ -854,7 +912,7 @@ export class Engine {
       uniforms: {
         uOff: { value: off }, uT: { value: 0 }, uStep: { value: leaderStep }, uRS: { value: 1 / 1.5e6 }, uN: { value: Math.min(8, ev.strokes.length) },
         uStrokeT: { value: st }, uStrokeA: { value: sa }, uCCEnd: { value: ev.ccEnd }, uCCAmp: { value: ev.ccAmp }, uLeaderEnd: { value: ev.leaderEnd },
-        uPol: { value: ev.type === 'CG+' ? 1 : ev.type === 'CG-' ? -1 : 0 },
+        uPol: { value: ev.type === 'CG+' || ev.type === 'ANVIL' ? 1 : ev.type === 'CG-' ? -1 : 0 },
       },
     });
     const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false; mesh.renderOrder = 5;
@@ -935,6 +993,21 @@ export class Engine {
     this.cloudMat.uniforms.uDenoise.value = U.uDenoise.value;
     U.uHeavyRain.value += (this.heavyRain - U.uHeavyRain.value) * Math.min(1, rawDt * 2);
     this.camera.position.set(cam.x, cam.y, cam.z);
+    // Thunder shock offset: a fixed random axis per strike, oscillating at 720 Hz. Real frame
+    // timing jitters, so the sign pattern reads as a violent rattle rather than a slow wobble.
+    if (this.shake) {
+      const ss = (performance.now() - this.shake.t0) / 1000;
+      if (ss > 1.3) this.shake = null;
+      else {
+        const env = Math.min(1, ss * 55) * Math.exp(-ss * 3.4);
+        const ph = Math.PI * 2 * 720 * (performance.now() / 1000) + this.shake.phase;
+        const osc = Math.sin(ph) >= 0 ? 1 : -1;
+        const a = this.shake.amp * env * osc;
+        this.camera.position.x += this.shake.axis.x * a;
+        this.camera.position.y += this.shake.axis.y * a;
+        this.camera.position.z += this.shake.axis.z * a;
+      }
+    }
     this.camera.rotation.set(cam.pitch, cam.yaw, 0);
     if (Math.abs(this.camera.fov - cam.fov) > 0.01) { this.camera.fov = cam.fov; this.camera.updateProjectionMatrix(); }
     this.camera.updateMatrixWorld(true);
@@ -956,6 +1029,24 @@ export class Engine {
     (this.debrisPoints.material as THREE.ShaderMaterial).uniforms.uDebris.value = tor && tor.active ? tor.debris : 0;
     this.debrisPoints.visible = this.funnelMesh.visible && tor && tor.debris > 0.08 && tor.distance < 9000;
     this.setVehiclePose(this.vehiclePose);
+    // ---- deployed weather-station mast: parked 3.6 m beside the truck, live instruments
+    if (this.stationGroup) {
+      const show = !!(this.vehiclePose && this.vehiclePose.active);
+      this.stationGroup.visible = show;
+      if (show) {
+        const pose = this.vehiclePose;
+        const rx = Math.cos(pose.heading), rz = -Math.sin(pose.heading);
+        const sx = pose.x - rx * 3.6, sz = pose.z - rz * 3.6;
+        this.stationGroup.position.set(sx, this.terrain.groundHeight(sx, sz), sz);
+        const ud = this.stationGroup.userData as { cups: THREE.Group; vane: THREE.Group };
+        const w = Math.hypot(this.localWind.x, this.localWind.y);
+        ud.cups.rotation.y += dt * (0.7 + w * 0.55);
+        const target = Math.atan2(-this.localWind.x, -this.localWind.y);
+        let dAng = target - ud.vane.rotation.y;
+        dAng = Math.atan2(Math.sin(dAng), Math.cos(dAng));
+        ud.vane.rotation.y += dAng * Math.min(1, dt * 3);
+      }
+    }
     // ---- animate the intercept vehicle: rotor, radome, probe boom, lamps, wheels
     if (this.vehiclePose && this.vehiclePose.active && this.vehicleGroup.visible) {
       const pose = this.vehiclePose;
@@ -1018,6 +1109,17 @@ export class Engine {
         fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 15 * lum);
       }
       flashSum += (lum * 7) / (1 + (f.dist * f.dist) / (3500 * 3500));
+      // Thunder shock: the sound wave reaches the camera at dist / 340 s — start a 720 Hz
+      // random-axis positional shake then (the bolt itself is already on screen).
+      if (!f.shook && t >= f.dist / 340) {
+        f.shook = true;
+        const near = 1 / (1 + f.dist / 2500);
+        const amp = Math.min(0.4, 0.42 * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
+        if (amp > 0.015) {
+          const a = new THREE.Vector3(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
+          this.shake = { t0: nowMs, amp, axis: a, phase: Math.random() * Math.PI * 2 };
+        }
+      }
       if (t > f.end) this.removeFlash(f);
     });
     this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dt / 0.15));
@@ -1070,7 +1172,7 @@ export class Engine {
     // Lower history weight: stale cloud formations should not ghost or reappear.
     let blend = 0.92 * Math.exp(-ang * 1.2);
     if (this.cheapMode) blend = Math.min(0.975, blend * 1.02);   // lean on temporal history
-    if (this.flashLevel > 0.05) blend *= 0.35;
+    if (this.flashLevel > 0.05) blend *= 0.55;
     cm.uBlend.value = this.frame < 3 ? 0 : blend;
     cm.uFrame.value = this.frame & 1023;
     cm.uInvProj.value.copy(this.camera.projectionMatrixInverse);
