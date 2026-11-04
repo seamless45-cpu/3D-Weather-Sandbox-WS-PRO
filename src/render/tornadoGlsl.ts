@@ -115,17 +115,20 @@ void main(){
 
 // Vehicle lamps: one shader for head lamps (white → uHead), tail/brake lamps (red → uTail)
 // and the amber beacon bar (pulses with uPulse). The part colour selects the channel.
+// Head lamps take their emission tint/intensity from uHeadCol/uHeadI so the fitted
+// technology (halogen / xenon / LED) visibly changes the lamps.
 export const lampFrag = /* glsl */ `
 ${COMMON}
 varying vec3 vN; varying vec3 vW; varying vec3 vCol;
 uniform float uHead; uniform float uTail; uniform float uPulse;
+uniform vec3 uHeadCol; uniform float uHeadI;
 void main(){
   // white≈ neutral (r≈g≈b), amber (beacon) has g well above b but far below r,
   // red tail has g tiny. Order matters: amber before red.
   bool white = abs(vCol.r - vCol.b) < 0.15;
   bool amber = !white && vCol.g > 0.30 * vCol.r;
   float k = white ? uHead : (amber ? (0.25 + 0.75 * uPulse) : uTail);
-  vec3 emis = vCol * k * (1.4 + 0.9 * k);
+  vec3 emis = white ? uHeadCol * (k * uHeadI) * 2.1 : vCol * k * (1.4 + 0.9 * k);
   // A little surface shading keeps the lens housings attached to the truck at night.
   vec3 n = normalize(vN);
   float dif = max(dot(n, uSunDir), 0.0);
@@ -133,4 +136,33 @@ void main(){
   if (uFlashOn > 0.5) col += flashLight(vW, n) * 0.2;
   col = applyFog(col, vW);
   gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Headlight beams: two open cones (apex at the lamps, widening forward) rendered
+// additively. vY runs 0 at the lamp → 1 at the far end, vR 0 on the axis → 1 at the
+// cone wall; both falloffs plus uBeamI (type intensity × darkness) shape the pool of
+// light the truck throws down the road.
+export const beamVert = /* glsl */ `
+varying float vY; varying float vR;
+void main(){
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vY = clamp(-position.y / 11.0, 0.0, 1.0);
+  float rr = 0.95 * vY + 1e-4;
+  vR = length(position.xz) / rr;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+export const beamFrag = /* glsl */ `
+varying float vY; varying float vR;
+uniform vec3 uBeamCol; uniform float uBeamI;
+void main(){
+  if (uBeamI < 0.004) discard;
+  float along = 1.0 - smoothstep(0.10, 1.0, vY);
+  float across = 1.0 - smoothstep(0.0, 1.0, vR);
+  float a = along * across * across;
+  // hot pool right in front of the lamps
+  a += (1.0 - smoothstep(0.0, 0.45, vR)) * (1.0 - smoothstep(0.0, 0.35, vY)) * 0.55;
+  a *= uBeamI;
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(uBeamCol * a, 1.0);
 }`;

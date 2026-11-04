@@ -4,6 +4,17 @@ import { DOMAIN } from './sim/consts';
 const EYE = 1.7;
 const wrap = (v: number) => ((v % DOMAIN) + DOMAIN) % DOMAIN;
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
+const TAU = Math.PI * 2;
+const wrapAngle = (a: number) => ((a % TAU) + TAU) % TAU;
+
+/** Headlight technologies the truck can be fitted with (K / the LIGHT button cycles them).
+ *  col = lens emission tint, i = relative intensity — halogen is warm and modest, xenon is
+ *  a brighter blue-white HID, LED is the crispest cool white. */
+export const LIGHT_TYPES: { name: string; col: [number, number, number]; i: number }[] = [
+  { name: 'HALOGEN', col: [1.0, 0.84, 0.58], i: 1.0 },
+  { name: 'XENON', col: [0.80, 0.90, 1.0], i: 1.45 },
+  { name: 'LED', col: [0.93, 0.97, 1.0], i: 1.75 },
+];
 const wrapDelta = (d: number) => d - DOMAIN * Math.round(d / DOMAIN);
 
 export interface VehicleState {
@@ -12,6 +23,7 @@ export interface VehicleState {
   vx: number; vz: number; speed: number;
   pitch: number; roll: number; steer: number; bounce: number;
   damage: number; probe: boolean; lights: boolean; brake: boolean;
+  lightType: number;    // index into LIGHT_TYPES: 0 halogen, 1 xenon, 2 LED
   wind: number; pressureDrop: number; distance: number; bearing: number;
   closing: number;      // m/s toward the vortex (positive = closing in)
   prevDist: number;
@@ -21,6 +33,7 @@ export interface VehiclePose {
   active: boolean; x: number; z: number; heading: number;
   pitch: number; roll: number; steer: number; bounce: number;
   speed: number; damage: number; probe: boolean; lights: boolean; brake: boolean;
+  lightType: number;
   wind: number; pressureDrop: number; distance: number; bearing: number; closing: number;
   /** Seconds of energy-drink boost left (×10 speed), 0 when dry. */
   drink: number;
@@ -45,6 +58,20 @@ export class Player {
   drinkActive() { return performance.now() < this.drinkUntil; }
   /** Trigger the 30 s energy-drink boost (G on desktop, the G button on mobile). */
   drink() { this.drinkUntil = performance.now() + 30000; }
+  /** Set by the app: honk the truck horn (H on desktop, HORN button on mobile). */
+  onHorn?: () => void;
+  /** Cycle headlight technology (halogen → xenon → LED) and switch the lamps on. */
+  cycleLights() {
+    this.vehicle.lights = true;
+    this.vehicle.lightType = (this.vehicle.lightType + 1) % LIGHT_TYPES.length;
+  }
+  /** Touch: one button round-robins OFF → halogen → xenon → LED → OFF. */
+  touchLights() {
+    const v = this.vehicle;
+    const next = v.lights ? v.lightType + 1 : 0;
+    if (next >= LIGHT_TYPES.length) v.lights = false;
+    else { v.lights = true; v.lightType = next; }
+  }
   /** Vertical velocity for the foot-mode jump (gravity-integrated in updateFoot). */
   private vy = 0;
   private jumpQueued = false;
@@ -59,7 +86,7 @@ export class Player {
     this.vehicle = {
       active: false, x: this.x, z: this.z, heading: this.yaw,
       vx: 0, vz: 0, speed: 0, pitch: 0, roll: 0, steer: 0, bounce: 0,
-      damage: 0, probe: false, lights: false, brake: false,
+      damage: 0, probe: false, lights: false, brake: false, lightType: 0,
       wind: 0, pressureDrop: 0, distance: Infinity, bearing: 0, closing: 0, prevDist: Infinity,
     };
     const on = (t: EventTarget, ev: string, fn: (e: any) => void, opts?: AddEventListenerOptions) => {
@@ -70,6 +97,10 @@ export class Player {
       if (e.code === 'KeyV' && !e.repeat) this.toggleVehicle();
       if (e.code === 'KeyP' && !e.repeat && this.mode === 'vehicle') this.vehicle.probe = !this.vehicle.probe;
       if (e.code === 'KeyL' && !e.repeat && this.mode === 'vehicle') this.vehicle.lights = !this.vehicle.lights;
+      // Cycle headlight technology (halogen → xenon → LED); turns the lamps on.
+      if (e.code === 'KeyK' && !e.repeat && this.mode === 'vehicle') this.cycleLights();
+      // Horn (WebAudio lives in AudioEngine; the controller just reports the press).
+      if (e.code === 'KeyH' && !e.repeat && this.mode === 'vehicle') this.onHorn?.();
       // Energy drink: 30 s of ×10 power/speed. Re-drinking refreshes the timer.
       if (e.code === 'KeyG' && !e.repeat) this.drink();
       // Jump (foot mode): edge-triggered so holding Space does not bunny-hop on landing.
@@ -141,6 +172,7 @@ export class Player {
       active: v.active, x: v.x, z: v.z, heading: v.heading,
       pitch: v.pitch, roll: v.roll, steer: v.steer, bounce: v.bounce,
       speed: v.speed, damage: v.damage, probe: v.probe, lights: v.lights, brake: v.brake,
+      lightType: v.lightType,
       wind: v.wind, pressureDrop: v.pressureDrop, distance: v.distance, bearing: v.bearing,
       closing: v.closing,
       drink: Math.max(0, (this.drinkUntil - performance.now()) / 1000),
@@ -218,7 +250,10 @@ export class Player {
     const steerRate = steer * (0.95 - 0.58 * Math.min(1, Math.abs(v.speed) / 42));
     v.heading += steerRate * dt;
     this.yaw += steerRate * dt;
-    v.heading = wrap(v.heading);
+    // Angle normalisation — NOT wrap(): DOMAIN (32000) is not a multiple of 2π, so the old
+    // domain wrap snapped a negative yaw ~15° away from the camera every frame (the truck
+    // stopped facing where you look).
+    v.heading = wrapAngle(v.heading);
     v.steer += (steer - v.steer) * Math.min(1, dt * 8);
 
     const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);

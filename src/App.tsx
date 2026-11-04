@@ -5,7 +5,7 @@ import { Terrain } from './sim/terrain';
 import { DEFAULT_PARAMS, PARAM_SPECS, SimParams } from './sim/params';
 import { clockString } from './sim/sun';
 import { Engine, detectQuality, detectGpuTier, gpuLabel, readTierPref, readPRPref, writePRPref, qualityFor, solverGrid } from './render/engine';
-import { Player } from './controls';
+import { Player, LIGHT_TYPES } from './controls';
 import { AudioEngine } from './audio';
 import { drawSkewT, drawSlice, drawRadar, radarRaster, RadarMode } from './ui/draw';
 
@@ -123,6 +123,7 @@ export default function App() {
         player.onModeChange = setVehicleMode;
         const audio = new AudioEngine();
         audio.start(terrain);
+        player.onHorn = () => audio.horn();
         const worker = new SimWorker();
         const rt: Rt = { engine, player, audio, worker, terrain, raf: 0, info: null };
         rtRef.current = rt; (window as any).__rt = rt;
@@ -505,7 +506,7 @@ export default function App() {
               </div>
               <div className="lbl">wind {f0(veh.wind, 0)}m/s · Δp {f0(veh.pressureDrop, 1)}hPa{tor?.active ? ` · EF${Math.max(0, tor.ef)}` : ''}</div>
               <div className={veh.damage > 0.35 ? 'text-[#ff9a5a]' : 'lbl'}>
-                hull {f0(veh.damage * 100, 0)}%{veh.damage > 0.7 ? ' · POWER LOSS' : ''} · W/S gas · A/D steer · Space slide · P probe · L lights · G drink
+                hull {f0(veh.damage * 100, 0)}%{veh.damage > 0.7 ? ' · POWER LOSS' : ''} · W/S gas · A/D steer · Space slide · P probe · <span className="text-[#7fd4ff]">{veh.lights ? LIGHT_TYPES[veh.lightType ?? 0].name : 'LIGHTS OFF'}</span> (L) · K cycle · H horn · G drink
               </div>
             </div>
           )}
@@ -524,6 +525,20 @@ export default function App() {
                     title="Jump"
                     onTouchStart={(e) => { e.stopPropagation(); player?.jump(); }}
                   >⬆ JUMP</button>
+                )}
+                {vehicleMode === 'vehicle' && (
+                  <>
+                    <button
+                      className="hbtn !px-3 !py-3 !text-sm"
+                      title="Horn"
+                      onTouchStart={(e) => { e.stopPropagation(); player?.onHorn?.(); }}
+                    >📯 HORN</button>
+                    <button
+                      className="hbtn !px-3 !py-3 !text-sm"
+                      title="Headlights: off → halogen → xenon → LED → off"
+                      onTouchStart={(e) => { e.stopPropagation(); player?.touchLights(); }}
+                    >💡 {player?.vehicle.lights ? ['HAL', 'XEN', 'LED'][player.vehicle.lightType] : 'OFF'}</button>
+                  </>
                 )}
               </div>
               <div className="flex flex-col gap-2">
