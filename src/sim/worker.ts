@@ -20,6 +20,11 @@ let lastFlashPost = 0;
 let showCharges = false;
 let windOff = new Float32Array(32);
 let lastSnapSimTime = 0;
+/** Weather-station peak gust (decays over ~45 s of real time between snapshots). */
+let gustMs = 0, lastGustReal = 0;
+/** Advanced-radar request: App posts the truck position while the scope is open. */
+let radarReq: { cx: number; cz: number; on: boolean } = { cx: 0, cz: 0, on: false };
+let lastRadarReal = 0;
 let emptyTex = false;
 let cloudBytes = 0, surfBytes = 0;
 let layerK0 = new Int32Array(NZR), layerW = new Float32Array(NZR);
@@ -185,6 +190,44 @@ function updateWindOffsets(a: Atmosphere, dtSim: number) {
   }
 }
 
+/**
+ * Advanced radar sweep: 64×64 plan-view over a ±48 km box centred on the truck.
+ * Reflectivity = Z(R) plus an ice/graupel echo boost sampled up the column; velocity =
+ * lowest-level radial wind (the solved field already contains the vortex couplet).
+ */
+function buildRadar() {
+  const a = atm!;
+  const N = 64, RANGE = 48000;
+  const dbz = new Uint8Array(N * N), vel = new Int8Array(N * N);
+  const { nx, ny, nz, nxy } = a, g = a.g, L = nx * g.dx;
+  const cx = ((radarReq.cx % L) + L) % L, cz = ((radarReq.cz % L) + L) % L;
+  for (let j = 0; j < N; j++) {
+    const wz = ((cz + ((j / (N - 1)) - 0.5) * RANGE) % L + L) % L;
+    const jj = Math.min(ny - 1, Math.floor(wz / g.dy));
+    for (let i = 0; i < N; i++) {
+      const wx = ((cx + ((i / (N - 1)) - 0.5) * RANGE) % L + L) % L;
+      const ii = Math.min(nx - 1, Math.floor(wx / g.dx));
+      const ij = jj * nx + ii;
+      const R = a.rainRate[ij];
+      let Z = 200 * Math.pow(Math.max(0, R), 1.6);
+      for (let k = 1; k < nz; k++) {
+        const c = k * nxy + ij;
+        const ice = a.qs[c] + a.qg[c] + 0.5 * a.qi[c];
+        if (ice > 1e-6) Z += 26000 * ice * a.prof.rho[k] * g.dz[k] * 0.001;
+      }
+      dbz[j * N + i] = Math.max(0, Math.min(75, Math.round(10 * Math.log10(1 + Z))));
+      const k = 1;
+      const u = 0.5 * (a.u[k * nxy + ij] + a.u[k * nxy + jj * nx + ((ii + 1) % nx)]);
+      const v = 0.5 * (a.v[k * nxy + ij] + a.v[k * nxy + ((jj + 1) % ny) * nx + ii]);
+      const dx = wx - cx, dz = wz - cz, r = Math.hypot(dx, dz) || 1;
+      const vr = (u * dx + v * dz) / r;                    // + = away from the truck
+      vel[j * N + i] = Math.max(-127, Math.min(127, Math.round((vr / 40) * 127)));
+    }
+  }
+  ctx.postMessage({ type: 'radar', n: N, range: RANGE, cx: radarReq.cx, cz: radarReq.cz, t: a.time, dbz, vel },
+    [dbz.buffer as ArrayBuffer, vel.buffer as ArrayBuffer]);
+}
+
 function snapshot() {
   const a = atm!;
   const ci = Math.min(a.nx - 1, Math.max(0, Math.floor(cam.x / a.g.dx))), cj = Math.min(a.ny - 1, Math.max(0, Math.floor(cam.z / a.g.dy)));
@@ -203,10 +246,20 @@ function snapshot() {
   const d = diag.enabled ? diagSlice(a, diag.field, diag.mode, diag.level, ci, cj, capeM) : null;
   const ij = cj * a.nx + ci;
   const sfcU = 0.5 * (a.u[ij] + a.u[cj * a.nx + (ci + 1) % a.nx]), sfcV = 0.5 * (a.v[ij] + a.v[((cj + 1) % a.ny) * a.nx + ci]);
+  // Station gust: peak of a 30-second decaying envelope around the surface wind.
+  const nowG = performance.now();
+  const gdt = lastGustReal ? (nowG - lastGustReal) / 1000 : 0;
+  lastGustReal = nowG;
+  gustMs = Math.max(Math.hypot(sfcU, sfcV) * 100, gustMs * Math.exp(-gdt / 30));
   const msg: any = {
     type: 'snap', time: a.time, speed: actualSpeed, stepMs, dt: a.dt, paused,
     cloud, surf, windOff: windOff.slice(), stats: { ...a.stats }, sounding: snd, mode, capeMean: capeM.mean, capeMax: capeM.max,
-    diag: d, local: { u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn, wetness: a.soilM[ij], surfW: a.surfW[ij] },
+    diag: d, local: {
+      u: sfcU, v: sfcV, rain: a.rainRate[ij], T: snd.surfT, rh: snd.surfRH, tau: snd.tauColumn,
+      wetness: a.soilM[ij], surfW: a.surfW[ij], p: a.prof.p[0] / 100,
+      gh: a.terrain.groundHeight(ci * a.g.dx, cj * a.g.dy),
+      gust: gustMs / 100,
+    },
     tornado: a.tornado.snapshot(cam.x, cam.z), charge: { ...a.chargeDiag },
     heavyRain: Math.min(1, a.stats.maxRain / 55),
     sunSin: a.sunSin, empty: emptyTex, snowLevel: precipTypeHeight(a), params: a.params, envCape: a.env.cape,
@@ -265,6 +318,7 @@ function loop() {
     // worker still has time to answer controls and return recycled buffers.
     const snapInterval = stepMs > 35 || lastStepMs > 50 ? 350 : 250;
     if (now - lastSnap > snapInterval) { lastSnap = now; snapshot(); }
+    if (radarReq.on && now - lastRadarReal > 500) { lastRadarReal = now; buildRadar(); }
   }
   setTimeout(loop, 8);
 }
@@ -299,6 +353,7 @@ ctx.onmessage = (ev: MessageEvent) => {
     }
     case 'cfg': if (m.paused !== undefined) paused = m.paused; if (m.speed !== undefined) speed = m.speed; break;
     case 'charges': showCharges = !!m.enabled; break;
+    case 'radar': radarReq = { cx: m.cx || 0, cz: m.cz || 0, on: !!m.on }; break;
     case 'cam': cam = { x: m.x, z: m.z }; break;
     case 'diag': {
       const nextStride = m.field === 'cape' ? 2 : 4;

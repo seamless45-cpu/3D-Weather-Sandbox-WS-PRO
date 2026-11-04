@@ -7,7 +7,7 @@ import { clockString } from './sim/sun';
 import { Engine, detectQuality, detectGpuTier, gpuLabel, readTierPref, readPRPref, writePRPref, qualityFor, solverGrid } from './render/engine';
 import { Player } from './controls';
 import { AudioEngine } from './audio';
-import { drawSkewT, drawSlice } from './ui/draw';
+import { drawSkewT, drawSlice, drawRadar, radarRaster, RadarMode } from './ui/draw';
 
 const SPEEDS = [1, 5, 15, 30, 60];
 const FIELDS: [string, string][] = [['w', 'W'], ['cloud', 'CLD'], ['precip', 'PCP'], ['T', 'T'], ['RH', 'RH'], ['E', 'E-FLD'], ['thp', "θ'"], ['p', "P'"], ['zeta', 'ζ'], ['cape', 'CAPE']];
@@ -53,8 +53,54 @@ export default function App() {
     try { if (v === 'auto') localStorage.removeItem('atmos.perf'); else localStorage.setItem('atmos.perf', v); } catch { /* ignore */ }
   };
   const [lastFlash, setLastFlash] = useState<any>(null);
+  const [radarOn, setRadarOn] = useState(false);
+  const [radarMode, setRadarMode] = useState<RadarMode>('ref');
+  const [stationOn, setStationOn] = useState(false);
+  const radarRef = useRef<HTMLCanvasElement>(null);
+  const radarDataRef = useRef<any>(null);
 
   const send = useCallback((m: any) => rtRef.current?.worker.postMessage(m), []);
+
+  // ---- advanced radar: request sweeps while the scope is open, redraw at frame rate
+  useEffect(() => {
+    if (!radarOn) { send({ type: 'radar', cx: 0, cz: 0, on: false }); return; }
+    const tick = () => {
+      const p = rtRef.current?.player;
+      if (p) send({ type: 'radar', cx: p.x, cz: p.z, on: true });
+    };
+    tick();
+    const iv = setInterval(tick, 400);
+    return () => clearInterval(iv);
+  }, [radarOn, send]);
+
+  useEffect(() => {
+    if (!radarOn) return;
+    let raf = 0;
+    let raster: HTMLCanvasElement | null = null;
+    let rasterSrc: any = null;
+    let rasterMode: RadarMode | null = null;
+    const loop = () => {
+      const cv = radarRef.current;
+      const data = radarDataRef.current;
+      if (cv && data) {
+        if (data !== rasterSrc || radarMode !== rasterMode) {
+          raster = radarRaster(data, radarMode); rasterSrc = data; rasterMode = radarMode;
+        }
+        const p = rtRef.current?.player;
+        const tor = snapRef.current?.tornado;
+        drawRadar(cv, raster, {
+          mode: radarMode, range: data.range, cx: data.cx, cz: data.cz,
+          truckX: p?.x ?? 0, truckZ: p?.z ?? 0,
+          heading: p ? (((-p.yaw * 180) / Math.PI) % 360 + 360) % 360 : 0,
+          tornado: tor ? { x: tor.x, z: tor.z, active: !!tor.active } : null,
+          sweep: (performance.now() / 1400) * Math.PI * 2,
+        });
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [radarOn, radarMode]);
 
   const start = useCallback(() => {
     setError(null);
@@ -92,6 +138,8 @@ export default function App() {
               const cloudBuf = m.cloud.buffer as ArrayBuffer, surfBuf = m.surf.buffer as ArrayBuffer;
               worker.postMessage({ type: 'recycle', cloud: cloudBuf, surf: surfBuf }, [cloudBuf, surfBuf]);
             }
+          } else if (m.type === 'radar') {
+            radarDataRef.current = m;
           } else if (m.type === 'flash') {
             // A lightning burst must not allocate bolt geometry, thunder and React state updates
             // for every breakdown. The worker already keeps the nearest flash of each burst.
@@ -203,6 +251,7 @@ export default function App() {
   const wind = s ? Math.hypot(s.local.u, s.local.v) : 0;
   const levelKm = rtRef.current?.info ? (rtRef.current.info.zc[Math.min(level, rtRef.current.info.nz - 1)] / 1000).toFixed(1) : '—';
   const flashAge = lastFlash ? (performance.now() - lastFlash.t) / 1000 : 999;
+  const flashCls = (t: string) => (t === 'CG+' || t === 'ANVIL') ? 'text-[#ffb35a]' : t === 'CC' ? 'text-[#c99bff]' : 'text-[#7fd4ff]';
   const effPr = rtRef.current?.engine.renderer.getPixelRatio() ?? pr;
   const effW = rtRef.current?.engine.renderer.domElement.width ?? 0;
   const effH = rtRef.current?.engine.renderer.domElement.height ?? 0;
@@ -295,16 +344,46 @@ export default function App() {
             {rtRef.current?.engine.timerExt && <div className="lbl">GPU scene {rtRef.current.engine.profile.scene.toFixed(1)} · cloud {rtRef.current.engine.profile.cloud.toFixed(1)} · comp {rtRef.current.engine.profile.comp.toFixed(1)} ms</div>}
           </div>
           {/* heading */}
-          <div className="hud absolute left-1.5 top-[46px] z-10 px-1.5 py-0.5"><b>{card}</b> {f0(heading)}° <span className="lbl">FOV</span> {f0(player?.fov || 72)}</div>
+          <div className="hud absolute left-1.5 top-[46px] z-10 px-1.5 py-0.5"><b>{card}</b> {f0(heading)}° <span className="lbl">FOV</span> {f0(player?.fov || 72)}{veh && veh.drink > 0 && <span className="text-[#ffd27a]"> · ⚡ DRINK ×10 {f0(veh.drink, 0)}s</span>}</div>
+
+          {/* weather station: live surface observations at the truck */}
+          {stationOn && s && (
+            <div className="hud absolute left-1.5 top-[70px] z-10 px-1.5 py-1 tabular-nums">
+              <div className="mb-0.5"><b>STATION</b> <span className="lbl">mobile mesonet</span></div>
+              <div><span className="lbl">T</span> <b>{f0(s.local.T, 1)}</b>°C · <span className="lbl">Td</span> {f0(
+                (() => { const g0 = Math.log(Math.max(1, s.local.rh) / 100) + (17.62 * s.local.T) / (243.12 + s.local.T); return (243.12 * g0) / (17.62 - g0); })(), 1)}°C · <span className="lbl">RH</span> {f0(s.local.rh, 0)}%</div>
+              <div><span className="lbl">P</span> <b>{f0(s.local.p, 1)}</b> hPa · <span className="lbl">wind</span> <b>{f0(wind, 1)}</b> m/s {card} · <span className="lbl">gust</span> {f0(s.local.gust ?? 0, 1)}</div>
+              <div><span className="lbl">rain</span> {f0(s.local.rain, 1)} mm/h · <span className="lbl">wet</span> {f0((s.local.wetness ?? 0) * 100, 0)}% · <span className="lbl">alt</span> {f0(s.local.gh, 0)} m</div>
+            </div>
+          )}
+
+          {/* advanced radar scope */}
+          {radarOn && (
+            <div className="hud absolute right-1.5 top-[34px] z-10 w-[268px] p-1.5">
+              <div className="mb-1 flex items-center justify-between">
+                <b>📡 RADAR</b>
+                <div className="flex gap-0.5">
+                  <button className={`hbtn !px-1.5 ${radarMode === 'ref' ? 'on' : ''}`} onClick={() => setRadarMode('ref')}>REF</button>
+                  <button className={`hbtn !px-1.5 ${radarMode === 'vel' ? 'on' : ''}`} onClick={() => setRadarMode('vel')}>VEL</button>
+                  <button className="hbtn !px-1.5" onClick={() => setRadarOn(false)}>×</button>
+                </div>
+              </div>
+              <canvas ref={radarRef} width={250} height={250} className="w-full border border-cyan-900/60" />
+              <div className="lbl mt-0.5">{radarMode === 'ref' ? 'reflectivity dBZ' : 'radial velocity m/s · green in / red out'} · ±48 km · rings 16/32 km</div>
+              <div className="lbl">{radarDataRef.current ? `sweep ${f0(radarDataRef.current.t, 0)}s` : 'awaiting sweep…'}</div>
+            </div>
+          )}
           {/* top-right controls */}
           <div className="hud absolute right-1.5 top-1.5 z-10 flex max-w-[60vw] flex-wrap items-center justify-end gap-1 px-1.5 py-1">
             <button className={`hbtn ${paused ? 'on' : ''}`} onClick={() => setPaused((p) => !p)}>{paused ? '▶' : '‖'}</button>
             {SPEEDS.map((v) => <button key={v} className={`hbtn ${speed === v ? 'on' : ''}`} onClick={() => setSpeed(v)}>{v}×</button>)}
             <button className={`hbtn ${envOpen ? 'on' : ''}`} onClick={() => setEnvOpen((o) => !o)} title="Environment and microphysics controls">⚙ env</button>
             <button className={`hbtn ${chargesOn ? 'on' : ''}`} onClick={() => setChargesOn((c) => !c)} title="Show charge particles: + positive (red) / − negative (blue)">± charges</button>
+            <button className={`hbtn ${radarOn ? 'on' : ''}`} onClick={() => { setRadarOn((r) => !r); setDiagOn(false); }} title="Advanced radar: reflectivity and radial velocity scope centred on the truck">📡 radar</button>
+            <button className={`hbtn ${stationOn ? 'on' : ''}`} onClick={() => setStationOn((o) => !o)} title="Weather station: live surface observations at your position">☂ met</button>
             <button className="hbtn" onClick={reset} title="Reset to clear sky with the current parameters">⟲ clear</button>
             <button className={`hbtn ${vehicleMode === 'vehicle' ? 'on' : ''}`} onClick={() => rtRef.current?.player.toggleVehicle()} title="Enter / exit the intercept vehicle">🚙 {vehicleMode === 'vehicle' ? 'exit' : 'drive'}</button>
-            <button className={`hbtn ${diagOn ? 'on' : ''}`} onClick={() => setDiagOn((d) => !d)}>diag</button>
+            <button className={`hbtn ${diagOn ? 'on' : ''}`} onClick={() => { setDiagOn((d) => !d); setRadarOn(false); }}>diag</button>
             <button className={`hbtn ${sound ? 'on' : ''}`} onClick={() => setSound((d) => !d)}>♪</button>
             <button className="hbtn" onClick={() => setAbout(true)}>i</button>
           </div>
@@ -315,7 +394,7 @@ export default function App() {
             <div><span className="lbl">LCL</span> {km(sd?.sb.lcl)} <span className="lbl">LFC</span> {km(sd?.sb.lfc)} <span className="lbl">EL</span> {km(sd?.sb.el)} <span className="lbl">km</span></div>
             <div><span className="lbl">SHR0-6</span> {f0(sd?.shear06, 1)} <span className="lbl">m/s</span> <span className="lbl">WMAX</span> {f0(st?.maxW, 1)}</div>
             <div className="text-[#ffd27a]">{s?.mode?.label || '…'}</div>
-            <div><span className="lbl">⚡</span> {st?.flashes ?? 0} {flashAge < 20 && <span className={lastFlash.type === 'CG+' ? 'text-[#ffb35a]' : 'text-[#7fd4ff]'}>last {lastFlash.type} {f0(lastFlash.dist / 1000, 1)}km</span>}</div>
+            <div><span className="lbl">⚡</span> {st?.flashes ?? 0} {flashAge < 20 && <span className={flashCls(lastFlash.type)}>last {lastFlash.type} {f0(lastFlash.dist / 1000, 1)}km</span>}</div>
             <div className={tor?.active ? 'text-[#ff9a5a]' : 'lbl'}>
               {tor?.active ? `🌪 EF${Math.max(0, tor.ef)} ${f0(tor.maxWind, 0)}m/s Δp ${f0(tor.pressureDrop, 0)}hPa · ${f0(tor.distance / 1000, 1)}km` : `🌪 potential ${f0(tor?.potential, 2)} · shear1 ${f0(tor?.shear1, 1)} SRH1 ${f0(tor?.srh1, 1)}`}
             </div>
@@ -385,9 +464,36 @@ export default function App() {
                 <b>INTERCEPT</b>
                 <span className="lbl">{veh.lights ? '◉ LIGHTS' : '○ lights'} · {veh.probe ? 'PROBE OUT' : 'probe stowed'}</span>
               </div>
-              <div className="mt-0.5 flex items-baseline justify-between">
-                <span><b>{f0(veh.speed * 3.6, 0)}</b> <span className="lbl">km/h</span> <span className="lbl">· {f0(veh.speed, 1)}m/s</span></span>
-                <span className="lbl">{f0(Math.abs(veh.roll) * 57.3, 0)}° roll</span>
+              <div className="mt-0.5 flex items-center gap-2">
+                {/* analog speedometer: 0–200 km/h over a 240° sweep */}
+                <svg width="78" height="72" viewBox="0 0 78 72" className="shrink-0">
+                  <circle cx="39" cy="36" r="32" fill="#03131c" stroke="#164e63" strokeWidth="1.5" />
+                  {Array.from({ length: 9 }, (_, i) => {
+                    const a = ((-210 + i * 30) * Math.PI) / 180;
+                    const r0 = i % 2 === 0 ? 24 : 27;
+                    return <line key={i} x1={39 + Math.cos(a) * r0} y1={36 + Math.sin(a) * r0}
+                      x2={39 + Math.cos(a) * 30} y2={36 + Math.sin(a) * 30}
+                      stroke={i >= 6 ? '#ff8a5a' : '#3a7a94'} strokeWidth={i % 2 === 0 ? 1.6 : 1} />;
+                  })}
+                  {(() => {
+                    const kmh = Math.min(200, Math.max(0, (veh?.speed ?? 0) * 3.6));
+                    const a = ((-210 + (kmh / 200) * 240) * Math.PI) / 180;
+                    const col = (veh?.drink ?? 0) > 0 ? '#ffd27a' : kmh > 145 ? '#ff8a5a' : '#7fd4ff';
+                    return <line x1={39 - Math.cos(a) * 6} y1={36 - Math.sin(a) * 6}
+                      x2={39 + Math.cos(a) * 25} y2={36 + Math.sin(a) * 25}
+                      stroke={col} strokeWidth="2.6" strokeLinecap="round" />;
+                  })()}
+                  <circle cx="39" cy="36" r="2.5" fill="#e8f6ff" />
+                  <text x="39" y="60" textAnchor="middle" fontSize="12" fontWeight="700" fill="#e8f6ff" fontFamily="monospace">{f0((veh?.speed ?? 0) * 3.6, 0)}</text>
+                  <text x="39" y="18" textAnchor="middle" fontSize="7" fill="#5f8fa8" fontFamily="monospace">km/h</text>
+                </svg>
+                <div className="flex-1 tabular-nums">
+                  <div><b>{f0(veh.speed * 3.6, 0)}</b> <span className="lbl">km/h</span> <span className="lbl">· {f0(veh.speed, 1)}m/s</span></div>
+                  <div className="lbl">{f0(Math.abs(veh.roll) * 57.3, 0)}° roll · {f0(Math.abs(veh.pitch) * 57.3, 0)}° pitch</div>
+                  {(veh.drink ?? 0) > 0
+                    ? <div className="text-[#ffd27a]">⚡ ENERGY {f0(veh.drink, 0)}s <span className="lbl">×10 speed</span></div>
+                    : <div className="lbl">G — energy drink ×10 / 30s</div>}
+                </div>
               </div>
               <div className="mt-0.5 h-[5px] w-full border border-cyan-900/70 bg-[#03131c]">
                 <div className="h-full bg-cyan-400/80" style={{ width: `${Math.max(0, Math.min(100, (veh.speed / 50) * 100))}%` }} />
@@ -399,7 +505,7 @@ export default function App() {
               </div>
               <div className="lbl">wind {f0(veh.wind, 0)}m/s · Δp {f0(veh.pressureDrop, 1)}hPa{tor?.active ? ` · EF${Math.max(0, tor.ef)}` : ''}</div>
               <div className={veh.damage > 0.35 ? 'text-[#ff9a5a]' : 'lbl'}>
-                hull {f0(veh.damage * 100, 0)}%{veh.damage > 0.7 ? ' · POWER LOSS' : ''} · W/S gas · A/D steer · Space slide · P probe · L lights
+                hull {f0(veh.damage * 100, 0)}%{veh.damage > 0.7 ? ' · POWER LOSS' : ''} · W/S gas · A/D steer · Space slide · P probe · L lights · G drink
               </div>
             </div>
           )}

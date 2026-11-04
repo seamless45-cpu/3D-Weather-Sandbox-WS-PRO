@@ -595,6 +595,61 @@ void main(){
 }`;
 
 // ---------------------------------------------------------------------------------------------
+// Impact droplets: crown-splash micro droplets ejected ballistically off wet ground under
+// heavy rain. Each particle loops a short arc (launch → apex → landing) with outward drift,
+// gated by the same local rain field as the splashes it accompanies.
+// ---------------------------------------------------------------------------------------------
+export const dropVert = /* glsl */ `
+${COMMON}
+${TERRAIN_FN}
+attribute vec3 aSeed;
+attribute vec4 aDrop;
+varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol;
+void main(){
+  if (aSeed.z > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec2 size = vec2(70.0);
+  vec2 rel = mod(aSeed.xy * size - cameraPosition.xz + size * 0.5, size) - size * 0.5;
+  // Fade before the wrap radius so a modulo wrap never teleports a visible droplet.
+  vec2 cell = abs(rel) / 35.0;
+  float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, cell.y));
+  if (length(rel) > 46.0 || edge < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec2 xz = cameraPosition.xz + rel;
+  float gh = groundH(xz);
+  if (gh < -0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
+  float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
+  float inten = clamp(pow(s.g, 0.46) * local, 0.0, 1.0);
+  float gate = (1.0 - smoothstep(inten * 0.9 - 0.06, inten * 0.9 + 0.10, fract(aSeed.z * 41.3 + aDrop.z)))
+    * smoothstep(0.004, 0.016, s.g) * step(0.0, gh);
+  // Ballistic arc: launch at ph=0, apex mid-flight, lands at ph=1.
+  float Tl = 0.34 + 0.26 * aDrop.x;
+  float ph = fract(uTime / Tl + aSeed.z * 17.0 + aDrop.z);
+  float v0 = 1.4 + 2.4 * aDrop.y;
+  float tl = ph * Tl;
+  float h = max(v0 * tl - 4.9 * tl * tl, 0.0);
+  float ang = aDrop.w * 6.2831;
+  vec2 drift = vec2(cos(ang), sin(ang)) * (0.3 + 1.1 * aDrop.y) * tl;
+  vec3 wp = vec3(xz.x + drift.x, gh + h + 0.02, xz.y + drift.y);
+  vPh = ph; vP = position.xy * 2.0;
+  vVis = gate * edge * (1.0 - smoothstep(24.0, 46.0, length(rel))) * (1.0 - smoothstep(0.82, 1.0, ph));
+  vCol = (uSkyAmb * 0.95 + uSunCol * 0.35 + vec3(0.02)) * 1.4;
+  if (uFlashOn > 0.5) vCol += flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6 + uFlashCol * uFlashGlow * 0.10;
+  gl_Position = vVis > 0.02 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+}`;
+export const dropFrag = /* glsl */ `
+varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol;
+void main(){
+  float rr = length(vP);
+  float a = (1.0 - smoothstep(0.30, 0.92, rr)) * vVis;
+  // Sun glint near the droplet centre sells the crown sparkle.
+  float glint = exp(-rr * rr * 14.0);
+  vec3 c = vCol * (0.7 + 0.75 * glint);
+  a *= 0.55 + 0.45 * (1.0 - vPh);
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(c, a);
+}`;
+
+// ---------------------------------------------------------------------------------------------
 // Rain mist: large, soft, ground-hugging puffs that only exist where precipitation reaches
 // the surface. They drift with the integrated wind plus a bounded taste of the fluid field,
 // hug the terrain, and fade before the wrap box so nothing ever teleports.
@@ -1060,7 +1115,12 @@ void main(){
   // No hard 45 km / 15 km box: density fades with height and distance before the march ends.
   // Terrain depth is the only real occlusion boundary.
   float t1 = min(60000.0, tTer);
-  float staticJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  // Jitter keyed to the WORLD ray direction, not gl_FragCoord: a screen-fixed pattern slides
+  // over the cloud surface whenever the camera turns (clouds appeared to shift under you).
+  // The ray through a given world direction keeps the same cell, so history reprojection is
+  // exact under rotation; translation errors are one cell (~half a pixel).
+  vec3 rcell = floor(rd * 2048.0);
+  float staticJ = fract(52.9829189 * fract(dot(rcell, vec3(0.06711056, 0.00583715, 0.11311993))));
   float frameJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
   // Almost entirely a fixed per-pixel offset: only a hint of frame variation, so the
   // temporal blend has something stable to accumulate instead of chasing a new dither.
@@ -1109,10 +1169,11 @@ void main(){
     // murk that fills the air under a shaft and softens the ground contact of heavy rain.
     float mist = (1.0 - smoothstep(60.0, 950.0, p.y)) * smoothstep(0.008, 0.14, rainD) * (0.55 + 0.90 * uHeavyRain);
     float sm = mist * 0.011;
-    // Smooth horizon / top extinction hides the finite periodic texture box completely.
-    float horizonFade = 1.0 - smoothstep(32000.0, 60000.0, t);
+    // No spherical horizon fade: that shell (32-60 km around the camera) was the "bounding
+    // sphere" clipping the cloud volume along a visible curved edge. Distance haze now
+    // saturates before the march cap instead (fogF below) — same perf bound, no edge.
     float topFade = 1.0 - smoothstep(12600.0, 15000.0, p.y);
-    float sig = (sc + sr + sm) * horizonFade * topFade;
+    float sig = (sc + sr + sm) * topFade;
     if (sig > 1e-5){
       // Sun transmittance is the most expensive part of a dense march. Recompute it on the first
       // hit, then every 4 steps normally or every 8 in the cheap storm path.
@@ -1173,6 +1234,9 @@ void main(){
   float tMean = wSum > 1e-4 ? tSum / wSum : 60000.0;
   float dist = tHit > 0.0 ? tHit : min(t1, 60000.0);
   float fogF = 1.0 - exp(-dist / (uVis * 2.2));   // storms stay readable from many km away
+  // Fully hazed well before the 60 km march cap, so the cloud volume never ends along a
+  // visible spherical shell around the camera (the removed horizonFade was that shell).
+  fogF = max(fogF, smoothstep(30000.0, 52000.0, dist));
   vec3 haze = mix(uHorizon, uSkyAmb, 0.55) * 0.85;   // air, not white fog
   L = L * (1.0 - fogF) + haze * fogF * (1.0 - T);
   // ---- temporal reprojection at the real scattering depth (a fixed 9 km point smears
@@ -1200,6 +1264,9 @@ void main(){
   float rel = abs(histD - tMean) / max(min(histD, tMean), 200.0);
   b2 *= 1.0 - smoothstep(0.45, 1.2, rel);
   b2 *= 1.0 - 0.9 * uCamCloud;   // inside cloud: trust the (cheap, short) current march
+  // Even a rejected history keeps a fifth of its weight: full rejection flashed the raw
+  // jittered march back in and read as grain/flicker on every snapshot tick.
+  b2 = max(b2, 0.20 * valid);
   outColor = mix(vec4(L, T), hist, b2);
   outAux = vec4(tMean, T, 0.0, 1.0);
 }

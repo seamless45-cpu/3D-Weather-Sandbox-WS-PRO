@@ -16,7 +16,7 @@ import type { Atmosphere } from './atmosphere';
 export type Polarity = 'neg' | 'pos';
 
 export interface FlashEvent {
-  id: number; type: 'CG-' | 'CG+' | 'IC'; simTime: number;
+  id: number; type: 'CG-' | 'CG+' | 'IC' | 'CC' | 'ANVIL'; simTime: number;
   init: [number, number, number]; strike: [number, number, number] | null;
   segs: Float32Array; // per segment 10 floats: x0,y0,z0,x1,y1,z1, gen, dist, order, width  (world frame: X, up, Z)
   strokes: { t: number; amp: number }[]; ccEnd: number; ccAmp: number; leaderEnd: number;
@@ -79,11 +79,19 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   // structure it cannot cross). This is the valve that keeps intracloud flashes the majority:
   // negative leaders branch heavily and stall more, positive leaders from the anvil mostly
   // survive the long trip down — so both polarities still attach, at realistic rates.
-  const stallP = positive ? 0.005 : 0.021;
+  const stallP = positive ? 0.008 : 0.032;
+  // Flash flavour: 'cc' = cloud-to-cloud (never attaches, wanders horizontally through the
+  // charge); 'anvil' = positive anvil crawler (starts > 7 km, flattens into a long horizontal
+  // run through the anvil and may attach far from the core). Everything else is normal IC/CG.
+  let flavor: 'norm' | 'cc' | 'anvil' = 'norm';
+  const rFlav = rnd();
+  if (rFlav < 0.15) flavor = 'cc';
+  else if (positive && z > 7000 && rFlav < 0.55) flavor = 'anvil';
   // Start with a descending polarity leader and an ascending counter-leader. A purely random
   // bidirectional pair often wandered sideways and produced a horizontal "spider" instead of a bolt.
   const az = 2 * Math.PI * rnd(), horiz = 0.35 + 0.35 * rnd(), down = Math.sqrt(1 - horiz * horiz);
-  const d0 = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
+  let d0: [number, number, number] = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
+  if (flavor === 'anvil') d0 = [Math.cos(az), Math.sin(az), -0.18 - 0.12 * rnd()];   // flat crawler start
   tips.push({ x, y, z, s: descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0, born: 0 });
   tips.push({ x, y, z, s: -descS, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0, born: 0 });
 
@@ -121,6 +129,10 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
         // The polarity leader descends toward the ground; the counter-leader climbs into the
         // cloud — for both polarities, which is what keeps CG+ from wandering sideways.
         dz += tp.s === descS ? -vBias : vBias;
+        // Anvil crawlers stay flat for their first ~70 generations (z is up): that is the
+        // long horizontal run along the anvil that makes them read as a distinct type.
+        if (flavor === 'anvil' && gen < 70) dz *= 0.30;
+        else if (flavor === 'cc') dz *= 0.55;   // cloud-to-cloud wanders between charge levels
         const nl = Math.hypot(dx, dy, dz) || 1; dx /= nl; dy /= nl; dz /= nl;
         const px = tp.x + dx * len, py = tp.y + dy * len, pz = tp.z + dz * len;
         cx.push(px); cy.push(py); cz.push(pz); cdx.push(dx); cdy.push(dy); cdz.push(dz);
@@ -177,8 +189,9 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
       tp.node = nodesX.length - 1;
       phiSum += gfun(tp.x, tp.y, tp.z); phiCnt++;
       if (!grounded) phiCh = phiSum / phiCnt;
-      // Ground attachment: only the descending polarity leader can connect (~60 m above terrain).
-      if (!grounded && tp.s === descS && tp.z - Math.max(0, ground(tp.x, tp.y)) < 70) {
+      // Ground attachment: only the descending polarity leader can connect (~60 m above
+      // terrain). Cloud-to-cloud flashes never attach by definition.
+      if (!grounded && flavor !== 'cc' && tp.s === descS && tp.z - Math.max(0, ground(tp.x, tp.y)) < 70) {
         grounded = true; strikeNode = tp.node; attachGen = gen; phiCh = 0; tp.alive = false;
         continue;
       }
@@ -265,8 +278,9 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   const strokes: { t: number; amp: number }[] = [];
   let ccEnd = 0, ccAmp = 0, type: FlashEvent['type'] = 'IC';
   let strike: [number, number, number] | null = null;
+  type = flavor === 'anvil' ? 'ANVIL' : flavor === 'cc' ? 'CC' : 'IC';
   if (grounded) {
-    type = polarity === 'neg' ? 'CG-' : 'CG+';
+    if (flavor !== 'anvil') type = polarity === 'neg' ? 'CG-' : 'CG+';
     strike = [nodesX[strikeNode], nodesZ[strikeNode], ((nodesY[strikeNode] % L) + L) % L];
     let t = attachGen * STEP + 0.004;
     const ns = positive ? (rnd() < 0.15 ? 2 : 1) : Math.min(8, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.0));
@@ -280,7 +294,8 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
     let t = leaderEnd + 0.008;
     const scale = positive ? 1.4 : 1;
     for (let s = 0; s < np; s++) { strokes.push({ t, amp: (0.08 + 0.26 * rnd()) * scale }); t += 0.015 + 0.05 * rnd(); }
-    ccEnd = strokes[0].t + 0.05; ccAmp = 0.06 * scale;
+    ccEnd = strokes[0].t + (type === 'CC' ? 0.14 + 0.30 * rnd() : 0.05);
+    ccAmp = type === 'CC' ? 0.14 * scale : 0.06 * scale;
   }
   return {
     id: nextId++, type, simTime: a.time, init: [nodesX[0], nodesZ[0], ((nodesY[0] % L) + L) % L], strike, segs, strokes, ccEnd, ccAmp, leaderEnd,
@@ -295,12 +310,15 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
  *  inside a well-supplied positive charge region). */
 export function tryLightning(a: Atmosphere): FlashEvent[] {
   const out: FlashEvent[] = [];
-  if (a.stats.maxEratio < 0.75) return out;
+  // Breakdown gate: hydrometeor tips and channel space charge enhance the local field by
+  // several-fold, so the effective ambient threshold sits below the ideal ~97 kV/m — flashes
+  // start once the storm reaches ~62% of it and the cadence scales with severity above 0.75.
+  if (a.stats.maxEratio < 0.62) return out;
   // Electrostatics/lightning is evaluated every 4 steps, so each call covers two intervals.
   // The mean interval scales with how far past breakdown the storm is, and is re-jittered
   // every call: flashes arrive in irregular clumps rather than on a fixed metronome.
   const sev = Math.max(0, a.stats.maxEratio - 0.75);
-  const meanT = (16 / (0.45 + Math.min(3.5, sev * 1.6))) * (0.45 + 1.3 * a.rng());
+  const meanT = (6.5 / (0.45 + Math.min(3.5, sev * 1.6))) * (0.45 + 1.3 * a.rng());
   const p = 1 - Math.exp(-(a.dt * 2) / Math.max(2.5, meanT));
   const { nx, ny, nz, nxy } = a;
   const used: [number, number, number][] = [];
