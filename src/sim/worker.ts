@@ -176,9 +176,12 @@ function updateWindOffsets(a: Atmosphere, dtSim: number) {
     const k = Math.min(a.nz - 1, Math.floor((b + 0.5) / B * a.nz));
     const u = windW[b] > 1e-4 ? windU[b] / windW[b] : a.prof.u[k];
     const v = windW[b] > 1e-4 ? windV[b] / windW[b] : a.prof.v[k];
-    const wrap = (v: number) => ((v % DOMAIN) + DOMAIN) % DOMAIN;
-    windOff[b * 2] = wrap(windOff[b * 2] + u * dtSim);
-    windOff[b * 2 + 1] = wrap(windOff[b * 2 + 1] + v * dtSim);
+    // Deliberately NOT wrapped: windOffAt() interpolates between these bands, and bands that
+    // each wrap into [0, DOMAIN) independently straddle the 32 km seam — the mix then lands
+    // tens of kilometres off and every crossing shifts the cloud layers. The shader's texture
+    // wraps naturally, so unbounded offsets are both correct and invisible.
+    windOff[b * 2] += u * dtSim;
+    windOff[b * 2 + 1] += v * dtSim;
   }
 }
 
