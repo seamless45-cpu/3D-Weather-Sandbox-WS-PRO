@@ -150,12 +150,14 @@ export class Engine {
   cloudScene = new THREE.Scene(); compScene = new THREE.Scene(); ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   cloudMat: THREE.ShaderMaterial; compMat: THREE.ShaderMaterial;
   terrainMesh: THREE.Mesh; waterMesh: THREE.Mesh; treeMesh: THREE.Mesh; rainMesh: THREE.Mesh; splashMesh: THREE.Mesh; shaftMesh: THREE.Mesh;
+  mistMesh!: THREE.Mesh;
   funnelMesh: THREE.Mesh; debrisPoints: THREE.Points; vehicleGroup: THREE.Group;
   /** GPU stable-fluids flow field; clouds/shafts/rain sample its velocity texture. */
   fluid: FluidSim;
   /** Charge-particle cloud (+/− glyphs) for the show-charges toggle. */
   chargePoints!: THREE.Points;
   private chargeCount = 0; chargeVisible = false;
+  private chargeStage: Float32Array | null = null; private chargeCountT = 0;
   private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
@@ -163,6 +165,7 @@ export class Engine {
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
   localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
+  windTarget = new THREE.Vector2(); windDrift = new THREE.Vector2();
   lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0; lastSoftSpike = 0;
   /** User pixel-ratio target (device pixels per CSS pixel); initialised from the tier preset. */
   userPR: number;
@@ -204,7 +207,11 @@ export class Engine {
     const NS = 48;
     this.noiseTex = new THREE.Data3DTexture(makeNoiseData(NS), NS, NS, NS);
     this.noiseTex.format = THREE.RGBAFormat; this.noiseTex.type = THREE.UnsignedByteType;
-    this.noiseTex.minFilter = this.noiseTex.magFilter = THREE.LinearFilter;
+    // Mipmapped: the cloud march and shafts sample this at wildly varying footprints, and
+    // with LinearFilter (LOD 0) every distant tap aliased into crawling per-pixel grain.
+    this.noiseTex.magFilter = THREE.LinearFilter;
+    this.noiseTex.minFilter = THREE.LinearMipmapLinearFilter;
+    this.noiseTex.generateMipmaps = true;
     this.noiseTex.wrapS = this.noiseTex.wrapT = this.noiseTex.wrapR = THREE.RepeatWrapping;
     this.noiseTex.unpackAlignment = 1; this.noiseTex.needsUpdate = true;
     this.surfTex = new THREE.DataTexture(new Uint8Array(nx * nx * 4), nx, nx, THREE.RGBAFormat);
@@ -222,7 +229,7 @@ export class Engine {
       uDomain: { value: DOMAIN }, uVis: { value: 30000 }, uSkyScale: { value: 14 }, uCloud: { value: this.cloudTex },
       uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.82, 0.88, 1.0) },
       uFlashOn: { value: 0 },
-      uWind: { value: this.localWind },
+      uWind: { value: this.localWind }, uWindDrift: { value: this.windDrift },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
       uCamCloud: { value: 0 }, uPrecipDensity: { value: 1 }, uCheapShadows: { value: 0 },
@@ -275,6 +282,7 @@ export class Engine {
     // ---- precipitation shafts (one billboard per column, from the ground into the cloud base)
     this.shaftMesh = new THREE.Mesh(this.buildShafts(Math.max(12, Math.min(q.shafts, nx))), mk(S.shaftVert, S.shaftFrag, {
       uShaftWind: { value: new THREE.Vector2() }, uSnowLevel: { value: 3500 }, uNoise: { value: this.noiseTex },
+      uLodScale: { value: 0.1 },
     }, { transparent: true, depthWrite: false }));
     this.shaftMesh.frustumCulled = false; this.shaftMesh.renderOrder = 2; this.scene.add(this.shaftMesh);
 
@@ -284,6 +292,12 @@ export class Engine {
     this.splashMesh = new THREE.Mesh(this.buildParticles(Math.max(1, Math.floor(q.rain * 0.42))), mk(S.splashVert, S.splashFrag, {}, { transparent: true, depthWrite: false, side: THREE.DoubleSide }));
     if (!q.splashes) this.splashMesh.visible = false;
     this.splashMesh.frustumCulled = false; this.splashMesh.renderOrder = 3; this.scene.add(this.splashMesh);
+
+    // ---- rain mist: soft ground-hugging puffs under precipitating shafts (auto-gated by
+    // the local rain field in the shader — no separate toggle needed)
+    const mistN = q.tier === 'low' ? 450 : q.tier === 'mid' ? 850 : 1400;
+    this.mistMesh = new THREE.Mesh(this.buildParticles(mistN), mk(S.mistVert, S.mistFrag, {}, { transparent: true, depthWrite: false }));
+    this.mistMesh.frustumCulled = false; this.mistMesh.renderOrder = 2.2; this.scene.add(this.mistMesh);
 
     // ---- solver-driven condensation funnel, debris cloud and intercept vehicle
     const funnelGeo = new THREE.CylinderGeometry(1, 1, 1, 64, 36, true);
@@ -322,6 +336,8 @@ export class Engine {
         ...U, uNoise: { value: this.noiseTex }, uDepth: { value: null }, uHist: { value: null }, uHistAux: { value: null }, uInvProj: { value: new THREE.Matrix4() },
         uCamWorld: { value: new THREE.Matrix4() }, uPrevVP: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
         uFrame: { value: 0 }, uBlend: { value: 0 }, uStepScale: { value: q.stepScale }, uMaxSteps: { value: q.steps },
+        uLodScale: { value: 0.1 },
+        uCloudSeed: { value: new THREE.Vector3(Math.random() * 5000, Math.random() * 3000, Math.random() * 5000) },
         uDetail: { value: 1 }, uCheapLight: { value: 0 }, uWindOff: { value: Array.from({ length: 16 }, () => new THREE.Vector2()) },
       },
     });
@@ -627,10 +643,13 @@ export class Engine {
     (this.surfTex.image.data as Uint8Array).set(s.surf); this.surfTex.needsUpdate = true;
     const dtr = Math.max(0.03, realNow - this.offT);
     for (let i = 0; i < 32; i++) {
-      const target = s.windOff[i];
-      let d = target - this.offCur[i];
-      if (d > DOMAIN * 0.5) d -= DOMAIN;
-      else if (d < -DOMAIN * 0.5) d += DOMAIN;
+      // Keep offCur *continuous*: choose the equivalent target nearest the current value.
+      // Bands that each wrap into [0, DOMAIN) straddle the seam in windOffAt()'s mix, and
+      // every crossing shifted whole cloud layers by kilometres.
+      let target = s.windOff[i];
+      while (target - this.offCur[i] > DOMAIN * 0.5) target -= DOMAIN;
+      while (target - this.offCur[i] < -DOMAIN * 0.5) target += DOMAIN;
+      const d = target - this.offCur[i];
       this.offVel[i] = d / dtr;
       this.offCur[i] = target;
     }
@@ -638,7 +657,7 @@ export class Engine {
     this.lastSimTime = s.time;
     this.camTau = s.local.tau; this.rainAtCam = s.local.rain; this.rh = s.local.rh / 100;
     if (typeof s.snowLevel === 'number') this.snowLevel = s.snowLevel;
-    this.localWind.set(s.local.u, s.local.v);
+    this.windTarget.set(s.local.u, s.local.v);   // smoothed into localWind every frame
     this.tornado = s.tornado || null;
     if (this.chargeVisible) this.setCharges(s.charges || null);
     this.chargeTripole = typeof s.charge?.tripole === 'number' ? s.charge.tripole : 0;
@@ -664,23 +683,60 @@ export class Engine {
     v.rotation.set(pose.pitch || 0, pose.heading || 0, pose.roll || 0);
   }
 
-  /** Update the charge-particle buffer (5 floats per point: x, y, z, signed magnitude, phase). */
+  /** Stage the charge-particle data (5 floats per point: x, y, z, signed magnitude, phase).
+   *  The geometry is lerped toward this stage every frame by lerpCharges(): writing each
+   *  250 ms snapshot straight into the buffers made every glyph jump size and position on
+   *  the tick — particle flicker. New points snap in at zero magnitude and fade up. */
   setCharges(data: Float32Array | null) {
-    const n = data ? Math.floor(data.length / 5) : 0;
+    const geo = this.chargePoints.geometry;
+    const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+    const cap = pos.array.length / 3;
+    if (!this.chargeStage || this.chargeStage.length < cap * 5) this.chargeStage = new Float32Array(cap * 5);
+    const stage = this.chargeStage;
+    stage.fill(0);
+    const n = data ? Math.min(Math.floor(data.length / 5), cap) : 0;
+    if (data) stage.set(data.subarray(0, n * 5));
+    const prev = this.chargeCountT;
+    if (n > prev) {
+      const pa = pos.array as Float32Array;
+      const aq = geo.getAttribute('aQ') as THREE.BufferAttribute;
+      const qa = aq.array as Float32Array;
+      for (let i = prev; i < n; i++) {
+        pa[i * 3] = stage[i * 5]; pa[i * 3 + 1] = stage[i * 5 + 1]; pa[i * 3 + 2] = stage[i * 5 + 2];
+        qa[i * 2] = 0;
+      }
+      pos.needsUpdate = true; aq.needsUpdate = true;
+    }
+    this.chargeCountT = n;
+    this.chargeCount = n;
+    geo.setDrawRange(0, cap);
+    if (n > 0 && this.chargeVisible) this.chargePoints.visible = true;
+  }
+  /** Per-frame ease of the geometry toward the staged snapshot (see setCharges). */
+  private lerpCharges(dt: number) {
+    const stage = this.chargeStage;
+    if (!stage) return;
     const geo = this.chargePoints.geometry;
     const pos = geo.getAttribute('position') as THREE.BufferAttribute;
     const aq = geo.getAttribute('aQ') as THREE.BufferAttribute;
     const pa = pos.array as Float32Array, qa = aq.array as Float32Array;
-    const cap = pa.length / 3;
-    const m = Math.min(n, cap);
-    for (let i = 0; i < m; i++) {
-      pa[i * 3] = data![i * 5]; pa[i * 3 + 1] = data![i * 5 + 1]; pa[i * 3 + 2] = data![i * 5 + 2];
-      qa[i * 2] = data![i * 5 + 3]; qa[i * 2 + 1] = data![i * 5 + 4];
+    const cap = pa.length / 3, n = this.chargeCountT;
+    const k = Math.min(1, dt * 7);
+    let live = 0;
+    for (let i = 0; i < cap; i++) {
+      if (i < n) {
+        pa[i * 3] += (stage[i * 5] - pa[i * 3]) * k;
+        pa[i * 3 + 1] += (stage[i * 5 + 1] - pa[i * 3 + 1]) * k;
+        pa[i * 3 + 2] += (stage[i * 5 + 2] - pa[i * 3 + 2]) * k;
+        qa[i * 2] += (stage[i * 5 + 3] - qa[i * 2]) * k;
+        qa[i * 2 + 1] += (stage[i * 5 + 4] - qa[i * 2 + 1]) * k;
+      } else {
+        qa[i * 2] *= 1 - k;   // points the snapshot dropped fade out in place
+      }
+      if (qa[i * 2] > 0.004 || qa[i * 2] < -0.004) live++;
     }
     pos.needsUpdate = true; aq.needsUpdate = true;
-    geo.setDrawRange(0, m);
-    this.chargeCount = m;
-    this.chargePoints.visible = this.chargeVisible && m > 0;
+    this.chargePoints.visible = this.chargeVisible && (n > 0 || live > 0);
   }
   showCharges(on: boolean) {
     this.chargeVisible = on;
@@ -937,8 +993,10 @@ export class Engine {
     const sm = this.shaftMesh.material as THREE.ShaderMaterial;
     sm.uniforms.uShaftWind.value.set(this.localWind.x, this.localWind.y);
     sm.uniforms.uSnowLevel.value = this.snowLevel;
+    // Noise-volume mip scale for the shafts' distance-based LOD (metres → texels/pixel).
+    const fovR = this.camera.fov * Math.PI / 180;
+    sm.uniforms.uLodScale.value = 48 * 2 * Math.tan(fovR / 2) / Math.max(1, this.renderer.domElement.height);
     (this.rainMesh.material as THREE.ShaderMaterial).uniforms.uSnowLevel.value = this.snowLevel;
-    this.localWind.lerp(this.tmpV.set(this.localWind.x, this.localWind.y, 0), 0);
     const tw = this.treeMesh.material as THREE.ShaderMaterial;
     const ww = Math.min(3.2, Math.hypot(this.localWind.x, this.localWind.y) * 0.3);
     const wl = Math.hypot(this.localWind.x, this.localWind.y) || 1;
@@ -979,11 +1037,19 @@ export class Engine {
     // ---- cloud noise advection offsets (extrapolated between snapshots)
     const dts = Math.min(0.4, Math.max(0, nowMs / 1000 - this.offT));
     const wo = this.cloudMat.uniforms.uWindOff.value as THREE.Vector2[];
-    const wrap = (v: number) => ((v % DOMAIN) + DOMAIN) % DOMAIN;
     for (let b = 0; b < 16; b++) {
-      wo[b].set(wrap(this.offCur[b * 2] + this.offVel[b * 2] * dts),
-                wrap(this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts));
+      // Continuous, unwrapped offsets (see applySnapshot): the shader's texture lookups
+      // wrap naturally, and unwrapped bands are what windOffAt() can interpolate across.
+      wo[b].set(this.offCur[b * 2] + this.offVel[b * 2] * dts,
+                this.offCur[b * 2 + 1] + this.offVel[b * 2 + 1] * dts);
     }
+
+    // ---- wind: smooth the 250 ms snapshot target into localWind (bounded consumers — shaft
+    // lean, trees, fluid relaxation — follow it without steps) and integrate it into
+    // windDrift, which particles advect with (continuous — no Δwind × uTime teleports).
+    this.localWind.lerp(this.windTarget, Math.min(1, dt * 1.4));
+    this.windDrift.addScaledVector(this.localWind, dt);
+    if (this.chargeVisible) this.lerpCharges(dt);
 
     // ---- fluid dynamics: advance the shared flow field, then hand its texture to every material
     this.fluid.step(dt, { wind: this.localWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
@@ -1013,6 +1079,8 @@ export class Engine {
     cm.uCamPos.value.copy(this.camera.position);
     cm.uDepth.value = this.rtScene.depthTexture;
     const prev = this.rtCloud[1 - this.cur], curRT = this.rtCloud[this.cur];
+    // Noise-volume mip scale for the cloud march (its LOD is derived from ray distance).
+    cm.uLodScale.value = 48 * 2 * Math.tan(fovR / 2) / Math.max(1, curRT.height);
     cm.uHist.value = prev.textures[0];
     cm.uHistAux.value = prev.textures[1];
     this.beginTimer(1);
@@ -1101,6 +1169,7 @@ export class Engine {
   reset(){
     this.frame = 0; this.denoise = 0;
     for (let i = 0; i < 32; i++) { this.offCur[i] = 0; this.offVel[i] = 0; }
+    this.windDrift.set(0, 0); this.localWind.set(0, 0); this.windTarget.set(0, 0);
     if (this.cloudTex) { (this.cloudTex.image.data as Uint8Array).fill(0); this.cloudTex.needsUpdate = true; }
     if (this.surfTex) { (this.surfTex.image.data as Uint8Array).fill(0); this.surfTex.needsUpdate = true; }
   }

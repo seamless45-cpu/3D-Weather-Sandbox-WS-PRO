@@ -16,6 +16,10 @@ uniform sampler3D uCloud;
 uniform vec4 uFlash[6]; uniform vec3 uFlashCol; uniform float uFlashOn;
 uniform vec2 uWind;
 uniform sampler2D uFluid;   // GPU stable-fluids horizontal flow (m/s, domain-periodic)
+// Integrated surface-wind drift (metres). Particles advect with this instead of wind*uTime:
+// multiplying an ever-growing clock by a wind that changes every 250 ms snapshot teleported
+// every drop across the map (jump = Δwind × uTime), which read as constant particle flicker.
+uniform vec2 uWindDrift;
 // Horizontal flow at a world position from the fluid pass. Clouds, rain shafts, near-camera
 // drops and the funnel all lean through this same evolving field, so every visual element
 // swirls with the same turbulent motion instead of sliding along a constant wind vector.
@@ -464,12 +468,22 @@ void main(){
   // Marshall-Palmer-ish size distribution: small drops drift more, big drops fall faster.
   float fall = mix(4.0 + 7.0 * cls + rnd * 0.8, 0.9 + 0.9 * cls + rnd * 0.4, flake);
   float windResp = mix(1.35, 0.68, clamp(cls / 1.5, 0.0, 1.0));
-  vec3 vel = vec3(uWind.x * windResp, -fall, uWind.y * windResp);
-  vel.x += sin(uTime * 1.7 + phase * 6.2831) * 0.25 * (1.0 - cls / 1.6);
-  vel.z += cos(uTime * 1.4 + phase * 6.2831) * 0.25 * (1.0 - cls / 1.6);
-  vec3 rel = mod(seed + vel * uTime - cameraPosition + size * 0.5, size) - size * 0.5;
+  vec3 vel = vec3(uWind.x * windResp, -fall, uWind.y * windResp);   // for drop orientation only
+  // Advection: horizontal drift comes from the integrated wind (constant per-drop response),
+  // vertical is a constant fall speed — so uTime only ever multiplies constants. The old
+  // form (wind + wobble) * uTime repositioned every drop by Δwind × uTime on each 250 ms
+  // snapshot and grew the wobble without bound: the root cause of particle flicker.
+  vec3 adv = vec3(
+    uWindDrift.x * windResp + sin(uTime * 1.7 + phase * 6.2831) * 0.6 * (1.0 - cls / 1.6),
+    -fall * uTime,
+    uWindDrift.y * windResp + cos(uTime * 1.4 + phase * 6.2831) * 0.6 * (1.0 - cls / 1.6));
+  vec3 rel = mod(seed + adv - cameraPosition + size * 0.5, size) - size * 0.5;
+  // Fade to zero before any axis of the wrap box is reached: otherwise a drop teleports the
+  // instant its modulo wraps — a visible blink at full alpha.
+  vec3 cell = abs(rel) / (size * 0.5);
+  float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, max(cell.y, cell.z)));
   float dist = length(rel);
-  if (dist > 56.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  if (dist > 56.0 || edge < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 p = cameraPosition + rel;
   // The drops ride the fluid field as well as the mean wind: coherent swirls and eddies
   // instead of a uniform drift. Bounded (no uTime factor), so a changing flow never pops.
@@ -478,7 +492,10 @@ void main(){
   vec4 s = sampleCloud(p);
   float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
   float inten = clamp(pow(s.g, 0.40) * local, 0.0, 1.0);
-  if (mix(rnd, rnd2, flake) > inten) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  // Soft intensity gate: a hard step popped drops in and out every time the 250 ms cloud
+  // snapshot landed, which read as particle flicker.
+  float gate = 1.0 - smoothstep(inten - 0.16, inten + 0.04, mix(rnd, rnd2, flake));
+  if (gate < 0.02) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   if (p.y < 1400.0 && p.y < groundH(p.xz) + 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // A drop is a motion-blurred teardrop: rounded bright head, tapering tail. Flakes are short.
   float len = mix(0.35 + 1.25 * cls, 0.16 + 0.12 * cls, flake) * (1.0 + clamp(dist * 0.025, 0.0, 2.0)) * (0.82 + 0.35 * uRainIntensity + 0.45 * uHeavyRain);
@@ -494,7 +511,7 @@ void main(){
   vec3 col = uSkyAmb * 1.1 + uSunCol * (0.10 + 0.75 * fwd) + uGroundAmb * 0.4 + vec3(0.015);
   if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 0.0, 1.0)) * 0.8 + uFlashCol * uFlashGlow * 0.12;
   vCol = mix(col, col * vec3(1.06, 1.06, 1.12) + vec3(0.045), flake);
-  vAlpha = smoothstep(0.25, 1.2, dist) * (1.0 - smoothstep(38.0, 60.0, dist)) * mix(0.68 + 0.24 * cls, 0.46, flake) * (0.90 + 0.55 * uHeavyRain);
+  vAlpha = smoothstep(0.25, 1.2, dist) * (1.0 - smoothstep(38.0, 60.0, dist)) * mix(0.68 + 0.24 * cls, 0.46, flake) * (0.90 + 0.55 * uHeavyRain) * gate * edge;
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const rainFrag = /* glsl */ `
@@ -539,23 +556,29 @@ void main(){
   if (aSeed.z > uPrecipDensity) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 size = vec2(70.0);
   vec2 rel = mod(aSeed.xy * size - cameraPosition.xz + size * 0.5, size) - size * 0.5;
+  // Fade before the wrap radius (35 m per axis) so a modulo wrap never teleports a visible
+  // splash across the box.
+  vec2 cell = abs(rel) / 35.0;
+  float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, cell.y));
   float rdist = length(rel);
-  if (rdist > 48.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  if (rdist > 48.0 || edge < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 xz = cameraPosition.xz + rel;
   float gh = groundH(xz);
   vec4 s = sampleCloud(vec3(xz.x, max(gh, 0.0) + 40.0, xz.y));
   float local = clamp(0.55 + 0.75 * uRainIntensity + 0.55 * uHeavyRain, 0.55, 1.5);
   float inten = clamp(pow(s.g, 0.46) * local, 0.0, 1.0);
   float ph = fract(uTime * (1.6 + 0.8 * aDrop.x) + aSeed.z * 13.0 + aDrop.z);
-  float vis = step(fract(aSeed.z * 37.7 + aDrop.z), inten * 0.9) * step(0.004, s.g) * step(0.0, gh);
+  // Soft gates: the old hard steps popped splashes in/out with every cloud snapshot.
+  float gate = (1.0 - smoothstep(inten * 0.9 - 0.06, inten * 0.9 + 0.10, fract(aSeed.z * 37.7 + aDrop.z)))
+    * smoothstep(0.003, 0.013, s.g) * step(0.0, gh);
   float r = (0.035 + 0.16 * ph) * (0.7 + 0.7 * aDrop.x);
   vec3 wp = vec3(xz.x + position.x * 2.0 * r, gh + 0.03, xz.y + position.y * 2.0 * r);
   vPh = ph; vP = position.xy * 2.0; vShape = aDrop.w;
   vDist = length(rel);
-  vVis = vis * (1.0 - smoothstep(26.0, 48.0, vDist));
+  vVis = gate * edge * (1.0 - smoothstep(26.0, 48.0, vDist));
   vCol = (uSkyAmb * 0.85 + uSunCol * 0.3 + vec3(0.01)) * 1.3;
   if (uFlashOn > 0.5) vCol += flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6 + uFlashCol * uFlashGlow * 0.10;
-  gl_Position = vis > 0.5 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+  gl_Position = gate > 0.05 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
 }`;
 export const splashFrag = /* glsl */ `
 varying float vPh; varying vec2 vP; varying float vVis; varying vec3 vCol; varying float vDist; varying float vShape;
@@ -567,6 +590,58 @@ void main(){
   float mist = (1.0 - smoothstep(0.0, 0.95, rr)) * 0.10;
   float droplets = smoothstep(0.82, 0.98, rr) * (0.5 + 0.5 * spikes) * 0.07;
   float a = (ring * 0.34 + mist * 1.25 + droplets * 1.3) * (1.0 - vPh) * (1.0 - vPh) * 0.85 * vVis * (1.0 + 0.85 * uHeavyRain);
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(vCol, a);
+}`;
+
+// ---------------------------------------------------------------------------------------------
+// Rain mist: large, soft, ground-hugging puffs that only exist where precipitation reaches
+// the surface. They drift with the integrated wind plus a bounded taste of the fluid field,
+// hug the terrain, and fade before the wrap box so nothing ever teleports.
+// ---------------------------------------------------------------------------------------------
+export const mistVert = /* glsl */ `
+${COMMON}
+${TERRAIN_FN}
+attribute vec3 aSeed;
+attribute vec4 aDrop;   // size, phase, height fraction, tint
+varying float vA; varying vec3 vCol; varying vec2 vQ;
+void main(){
+  vec2 box = vec2(240.0, 240.0);
+  vec2 rel = mod(aSeed.xy * box + uWindDrift * (0.20 + 0.10 * aDrop.x) - cameraPosition.xz + box * 0.5, box) - box * 0.5;
+  vec2 xz = cameraPosition.xz + rel;
+  float gh = groundH(xz);
+  float hf = aDrop.z;
+  float y = gh + 5.0 + hf * hf * 300.0;
+  // Only where rain is actually reaching the ground.
+  vec4 s = sampleCloud(vec3(xz.x, gh + 130.0, xz.y));
+  float rain = clamp(pow(max(s.g, 0.0), 0.5) * (0.55 + 0.75 * uRainIntensity + 0.85 * uHeavyRain), 0.0, 1.0);
+  vec3 p = vec3(xz.x, y, xz.y);
+  // Bounded fluid sway (no uTime gain): a changing flow field shifts mist gently, never jumps.
+  p.xz += fluidVel(p.xz) * (0.8 + 0.4 * sin(uTime * 0.4 + aDrop.y * 6.2831)) * 1.1;
+  float dist = length(p - cameraPosition);
+  float size = mix(14.0, 52.0, aDrop.x) * (0.8 + 0.4 * hf);
+  // Edge fade before the 120 m wrap radius, overhead fade, no-rain fade.
+  vec2 cell = abs(rel) / (box * 0.5);
+  float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, cell.y));
+  float near0 = smoothstep(4.0, 26.0, dist);
+  vA = rain * edge * near0 * (0.50 + 0.50 * aDrop.w) * (1.0 - smoothstep(0.55, 1.0, hf));
+  vA *= 1.0 - smoothstep(130.0, 230.0, dist);
+  if (vA < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec3 toCam = normalize(cameraPosition - p);
+  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
+  vec3 up = cross(toCam, right);
+  vec3 wp = p + right * (position.x * size) + up * (position.y * size);
+  vQ = position.xy * 2.0;
+  vec3 col = (uSkyAmb * 1.25 + uSunCol * 0.26 + uGroundAmb * 0.35 + vec3(0.02)) * vec3(0.92, 0.95, 1.0);
+  if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 1.0, 0.0)) * 0.7 + uFlashCol * uFlashGlow * 0.14;
+  vCol = col;
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+}`;
+export const mistFrag = /* glsl */ `
+varying float vA; varying vec3 vCol; varying vec2 vQ;
+void main(){
+  float r2 = dot(vQ, vQ);
+  float a = exp(-r2 * 2.6) * vA;
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
@@ -655,6 +730,7 @@ void main(){
 export const shaftFrag = /* glsl */ `
 ${COMMON}
 uniform sampler3D uNoise;
+uniform float uLodScale;   // texels-per-metre-per-pixel for the noise volume
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
 varying vec2 vFlow;
@@ -670,10 +746,13 @@ void main(){
   float fallA = uTime * 0.055;
   float fallB = uTime * 0.14;
   // The fluid field advects the interior structure, so rain inside the shaft circulates.
+  // Distance-based mip LOD (the march-free equivalent of nlod in the cloud pass): without it
+  // the fine layers alias into crawling grain on distant curtains.
   vec2 nxy = vWorld / shaftP + vFlow * 0.00045;
-  vec4 nA = texture(uNoise, vec3(nxy + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.20 - fallA));
-  vec4 nB = texture(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB));
-  vec4 nC = texture(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7));
+  float lod = clamp(log2(max(1.0, vDist * uLodScale / shaftP)) + 0.3, 0.0, 5.0);
+  vec4 nA = textureLod(uNoise, vec3(nxy + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.20 - fallA), lod);
+  vec4 nB = textureLod(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB), lod + 1.9);
+  vec4 nC = textureLod(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7), min(lod + 3.2, 5.0));
   // Sub-columns of heavier / lighter precipitation inside one shaft.
   float strand = 0.42 + 0.58 * (0.55 * nB.r + 0.45 * nC.a);
   float streak = 0.20 + 0.48 * nA.r + 0.38 * nA.g + 0.66 * (nB.r * 0.5 + nB.g * 0.5) + 0.34 * (nC.r - 0.5);
@@ -815,6 +894,8 @@ uniform mat4 uInvProj; uniform mat4 uCamWorld; uniform mat4 uPrevVP; uniform vec
 uniform float uFrame; uniform float uBlend; uniform float uStepScale; uniform float uMaxSteps;
 uniform float uDetail; uniform float uCheapLight;   // fast storm-load path
 uniform vec2 uWindOff[16];
+uniform float uLodScale;   // texels-per-metre-per-pixel factor for the noise volume
+uniform vec3 uCloudSeed;   // per-session constant offset: every run builds different structures
 varying vec2 vUv;
 // MRT: location 0 = premultiplied cloud radiance + transmittance, location 1 = scattering depth
 layout(location = 0) out vec4 outColor;
@@ -841,6 +922,11 @@ float phase(float c, float k){ return hg(c, 0.6 * k) * 1.15; }
 float phase(float c, float k){ return 0.78 * hg(c, 0.72 * k) + 0.22 * hg(c, -0.18 * k); }
 #endif
 
+// Mip level for the noise volume. The march runs in non-uniform control flow where screen
+// derivatives are undefined, so the footprint is derived from ray distance instead — without
+// this every high-frequency noise tap aliases into per-pixel grain on distant cloud.
+float nlod(float t, float period){ return clamp(log2(max(1.0, t * uLodScale / period)) + 0.3, 0.0, 5.0); }
+
 // The solver supplies broad condensate, ice fraction, rain and vertical velocity. A
 // Perlin-Worley base shapes that coverage into billows; height/ice/updraft make towers and
 // smoother anvils; cellular detail erodes only the exposed edges. No extra cloud fetches.
@@ -861,24 +947,34 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   base *= topFade * baseFade;
   if (base < 0.0006) return 0.0;
   float updraft = clamp((s.a - 0.5) * 2.0, -1.0, 1.0);
-  float cover = smoothstep(0.003, 0.58, base);
   // Integer noise periods per 32 km domain. A constant wind offset preserves periodicity;
   // the fluid displacement is also domain-periodic, so the tiling survives it too.
   float broadP = uDomain / 6.0, midP = uDomain / 32.0, fineP = uDomain / 128.0;
-  vec2 wo = windOffAt(p.y) + fluidVel(p.xz) * 7.0;
-  vec3 np = p + vec3(wo.x, 0.0, wo.y);
-  vec4 nA = texture(uNoise, np / broadP);
+  // Fluid shear displaces the sampling frame, but bounded: the raw field carries grid-scale
+  // noise that a x7 gain amplified into cloud shimmer between frames.
+  vec2 wo = windOffAt(p.y) + fluidVel(p.xz) * 4.5;
+  vec3 np = p + vec3(wo.x, 0.0, wo.y) + uCloudSeed;
+  // ---- regional regime: one very-broad periodic field gives different parts of the domain
+  // different cloud character (stratus decks, cumulus fields, fibrous cirrus) and varies the
+  // coverage threshold / warp strength per region — so the domain never repeats one structure.
+  vec4 nR = textureLod(uNoise, np / (uDomain / 2.0), nlod(t, uDomain / 2.0));
+  float regime = nR.r;
+  float wStratus = 1.0 - smoothstep(0.34, 0.50, regime);
+  float wCirrus = smoothstep(0.62, 0.80, regime);
+  float wCumulus = clamp(1.0 - wStratus - wCirrus, 0.0, 1.0);
+  float cover = smoothstep(0.003 + 0.011 * nR.g, 0.52 + 0.16 * nR.b, base);
+  vec4 nA = textureLod(uNoise, np / broadP, nlod(t, broadP));
   // A gentle domain-periodic organisation: broad bands + cellular billows, no per-frame drift.
   float broad = 0.58 * nA.r + 0.42 * (1.0 - nA.g);
   float billow = smoothstep(0.16, 0.80, broad);
   float band = 0.5 + 0.5 * sin((np.x + 0.35 * np.z) / (uDomain / 3.0) + 2.0 * nA.b);
-  vec2 warp = (nA.gb - 0.5) * mix(420.0, 950.0, smoothstep(0.35, 0.95, iceF));
+  vec2 warp = (nA.gb - 0.5) * mix(420.0, 950.0, smoothstep(0.35, 0.95, iceF)) * (0.70 + 0.60 * nR.g);
   vec3 np2 = np + vec3(warp.x, warp.y * 0.25, warp.y);
-  vec4 nB = texture(uNoise, np2 / midP);
+  vec4 nB = textureLod(uNoise, np2 / midP, nlod(t, midP));
   // Second, finer warp: this is what turns smooth blobs into lobed cauliflower with creases.
   vec2 warp2 = (nB.ba - 0.5) * 165.0;
   vec3 np3 = np2 + vec3(warp2.x, warp2.y * 0.4, warp2.y);
-  vec4 nC = texture(uNoise, np3 / midP);
+  vec4 nC = textureLod(uNoise, np3 / midP, nlod(t, midP));
   float towerW = smoothstep(0.04, 0.82, updraft);
   float iceW = smoothstep(0.35, 0.95, iceF);
   float hW = smoothstep(1800.0, 5400.0, p.y);
@@ -887,16 +983,42 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   float lobes = 1.0 - abs(2.0 * nC.g - 1.0);
   lobes = mix(0.5, lobes, 0.5 + 0.3 * billow);
   float lowShape = cover * (0.46 + 0.58 * billow + 0.34 * lobes) * (0.84 + 0.28 * band);
+  // ---- cloud types selected by the regional regime field
+  // cumulus humilis: small puffy fair-weather fields with a hard ceiling
+  float humShape = cover * smoothstep(150.0, 500.0, p.y) * (1.0 - smoothstep(1700.0, 3100.0, p.y))
+    * (0.42 + 0.62 * billow + 0.40 * lobes) * (0.84 + 0.26 * band);
+  // stratus / stratocumulus deck: flat base, lumpy top, modest depth (never deletes the
+  // solver's cloud above the deck — it fades to a quarter density instead of zero)
+  float deckTop = 1900.0 + 1500.0 * nR.a;
+  float stratusShape = cover * smoothstep(280.0, 680.0, p.y)
+    * (1.0 - 0.75 * smoothstep(deckTop * 0.80, deckTop * 1.9, p.y))
+    * (0.72 + 0.34 * billow + 0.16 * band) * (0.88 + 0.22 * nA.r);
+  // cirrus: high fibrous ice, read from a 4x-stretched slice (still domain-periodic)
+  float fib = 0.5;
+  float cirrusShape = 0.0;
+  if (wCirrus > 0.02) {
+    vec4 nF = textureLod(uNoise, vec3(np.x / (8.0 * midP), np.y / midP, np.z / midP), nlod(t, 8.0 * midP));
+    fib = nF.r * 0.55 + (1.0 - abs(2.0 * nF.g - 1.0)) * 0.45;
+    cirrusShape = cover * smoothstep(7200.0, 9000.0, p.y) * (1.0 - smoothstep(12400.0, 14600.0, p.y))
+      * (0.30 + 0.85 * fib) * (0.66 + 0.40 * band) * 0.60;
+  }
+  float cumulusShape = mix(lowShape, humShape, 0.45);
+  float bg = wStratus * stratusShape + wCumulus * cumulusShape + wCirrus * cirrusShape;
+  bg = max(bg, 0.28 * lowShape);   // the solver's structure always shows through
   float towerShape = cover * (0.48 + 0.60 * billow + 0.40 * lobes) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
   float anvilShape = cover * (0.62 + 0.46 * nA.r) * (0.84 + 0.30 * nC.r) * (1.0 - 0.12 * billow);
-  float shape = mix(lowShape, towerShape, hW);
+  // Deep convection overrides the regional background only where updrafts actually build
+  // towers; quiescent high regions keep their regime character (cirrus stays fibrous).
+  float shape = mix(bg, towerShape, hW * (0.30 + 0.70 * towerW));
   shape = mix(shape, anvilShape, anvilW);
+  // the cirrus regime shears the anvil top into wind-drawn ice fibres, not smooth blobs
+  if (wCirrus > 0.05) shape *= 1.0 - 0.35 * wCirrus * anvilW * (1.0 - fib);
   if (!detail) return clamp(shape, 0.0, 1.0);
   float mid = 0.60 * nC.r + 0.40 * (1.0 - nC.g);
   shape *= 0.82 + mix(0.34, 0.22, uDenoise) * mid;
   float fine = nC.b * 0.62 + nC.a * 0.38;
   if (t < 3400.0) {
-    vec4 nD = texture(uNoise, np3 / fineP);
+    vec4 nD = textureLod(uNoise, np3 / fineP, nlod(t, fineP));
     fine = fine * 0.58 + (0.55 * nD.r + 0.45 * (1.0 - nD.g)) * 0.42;
   }
   edge = 1.0 - smoothstep(0.08, 0.72, shape);
@@ -940,8 +1062,9 @@ void main(){
   float t1 = min(60000.0, tTer);
   float staticJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
   float frameJ = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * uFrame, vec2(0.06711056, 0.00583715))));
-  // Mostly a fixed per-pixel offset: temporal jitter is dithered, not a new random walk each frame.
-  float jitter = mix(staticJ, frameJ, mix(0.35, 0.12, uDenoise));
+  // Almost entirely a fixed per-pixel offset: only a hint of frame variation, so the
+  // temporal blend has something stable to accumulate instead of chasing a new dither.
+  float jitter = mix(staticJ, frameJ, mix(0.16, 0.05, uDenoise));
   float cosT = dot(rd, uSunDir);
   vec3 L = vec3(0.0); float T = 1.0; float tHit = -1.0;
   float tSum = 0.0, wSum = 0.0;
@@ -964,8 +1087,9 @@ void main(){
     if (float(i) >= maxSteps || t > t1 || T < 0.02) break;
     vec3 p = ro + rd * t;
     float stepLen = clamp(0.045 * t + 55.0, 55.0, 1200.0) * uStepScale;
-    // vary the step length per pixel *and* per frame: breaks slice banding without a fixed pattern
-    stepLen *= 0.97 + 0.06 * hash12(gl_FragCoord.xy + vec2(float(i) * 1.37, 0.0));
+    // vary the step length with a *smooth* per-pixel field: white noise here read as grain
+    // in the integrated density, low-frequency variation just breaks slice banding
+    stepLen *= 0.97 + 0.06 * vnoise2(gl_FragCoord.xy * 0.13 + vec2(float(i) * 7.3, float(i) * 3.1));
     // optically thick cloud does not need fine steps: grow them as the beam is extinguished
     stepLen *= mix(1.0, 2.6, 1.0 - T);
     float rainD, iceF, edge;
@@ -973,15 +1097,22 @@ void main(){
     float d = cloudDensity(p, t, rainD, iceF, edge, detail);
     float rainFade = smoothstep(120.0, 700.0, t);
     float sc = d * 0.085;
+    // Smooth low-frequency modulation of the precipitation scattering: the old per-sample
+    // white noise was a grain generator inside every shaft.
+    float rm = vnoise2(vec2(p.x * 0.0011 + p.z * 0.0007, p.y * 0.0009 + p.z * 0.0005));
 #ifdef LOWQ
     float sr = rainD * 0.0055 * rainFade * 0.95;
 #else
-    float sr = rainD * 0.0055 * rainFade * (0.55 + 0.9 * hash12(vec2(p.x * 0.012 + p.z * 0.007, p.y * 0.0015)));
+    float sr = rainD * 0.0055 * rainFade * (0.55 + 0.85 * rm);
 #endif
+    // ---- rain mist: dense low-level haze suspended beneath precipitating cloud. This is the
+    // murk that fills the air under a shaft and softens the ground contact of heavy rain.
+    float mist = (1.0 - smoothstep(60.0, 950.0, p.y)) * smoothstep(0.008, 0.14, rainD) * (0.55 + 0.90 * uHeavyRain);
+    float sm = mist * 0.011;
     // Smooth horizon / top extinction hides the finite periodic texture box completely.
     float horizonFade = 1.0 - smoothstep(32000.0, 60000.0, t);
     float topFade = 1.0 - smoothstep(12600.0, 15000.0, p.y);
-    float sig = (sc + sr) * horizonFade * topFade;
+    float sig = (sc + sr + sm) * horizonFade * topFade;
     if (sig > 1e-5){
       // Sun transmittance is the most expensive part of a dense march. Recompute it on the first
       // hit, then every 4 steps normally or every 8 in the cheap storm path.
@@ -1025,7 +1156,9 @@ void main(){
       vec3 iceTint = mix(vec3(1.0), vec3(0.95, 0.97, 1.06), iceF);
       vec3 Sc = (uSunCol * sunTint * sunL * sideShade * (0.55 + 0.70 * silver) * powder + amb + fl * 0.28) * iceTint;
       vec3 Sr = (uSunCol * sunTint * 0.09 * sunL * sideShade + amb * 0.8 + fl * 0.18) * vec3(0.78, 0.84, 0.94);
-      vec3 S = (sc * Sc + sr * Sr) / sig;
+      // Mist scatters like thin haze: skylight-dominated, slightly sunlit, cool grey.
+      vec3 Sm = (uSkyAmb * 1.2 + uSunCol * 0.30 * exp(-tau * 0.55) + vec3(0.015)) * vec3(0.86, 0.90, 0.97);
+      vec3 S = (sc * Sc + sr * Sr + sm * Sm) / max(sig, 1e-7);
       float Ts = exp(-sig * stepLen);
       float wgt = T * (1.0 - Ts);
       tSum += wgt * t; wSum += wgt;
@@ -1061,9 +1194,11 @@ void main(){
   vec4 hmax = max(max(hist, h0), max(max(h1, h2), h3));
   vec4 histC = clamp(hist, hmin - vec4(0.04), hmax + vec4(0.04));
   hist = mix(hist, histC, uDenoise);
-  float b2 = mix(uBlend, 0.975, uDenoise) * valid * (1.0 - smoothstep(0.2, 0.5, abs(hist.a - T)));
+  // Softer history rejection: the old tight thresholds discarded history on ordinary
+  // snapshot-to-snapshot changes, snapping between old/new results as one-frame flicker.
+  float b2 = mix(uBlend, 0.975, uDenoise) * valid * (1.0 - smoothstep(0.30, 0.68, abs(hist.a - T)));
   float rel = abs(histD - tMean) / max(min(histD, tMean), 200.0);
-  b2 *= 1.0 - smoothstep(0.3, 0.9, rel);
+  b2 *= 1.0 - smoothstep(0.45, 1.2, rel);
   b2 *= 1.0 - 0.9 * uCamCloud;   // inside cloud: trust the (cheap, short) current march
   outColor = mix(vec4(L, T), hist, b2);
   outAux = vec4(tMean, T, 0.0, 1.0);
@@ -1134,7 +1269,9 @@ void main(){
   float vg = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.2);
   col *= vg;
   col = pow(col, vec3(1.0 / 2.2));
-  float n = fract(sin(dot(vUv * uRes + fract(uTime), vec2(12.9898, 78.233))) * 43758.5453);
+  // Static per-pixel dither: the old fract(uTime) re-randomised it every frame, dithering
+  // the ENTIRE composite (particles, clouds, terrain) into frame-by-frame flicker.
+  float n = fract(sin(dot(vUv * uRes, vec2(12.9898, 78.233))) * 43758.5453);
   col += (n - 0.5) / 255.0;
   gl_FragColor = vec4(col, 1.0);
 }

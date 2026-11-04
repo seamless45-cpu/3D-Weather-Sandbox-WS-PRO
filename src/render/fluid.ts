@@ -165,6 +165,23 @@ void main(){
   gl_FragColor = vec4(v, 0.0, 1.0);
 }`;
 
+// Visual output: a 3x3 gaussian of the solved field. Grid-scale velocity noise is invisible
+// inside the solver but amplifies into shimmer on anything that displaces by fluidVel
+// (clouds ×4.5, rain, shaft lean), so every visual samples this copy instead of the raw field.
+const BLUR = /* glsl */ `
+precision highp float;
+uniform sampler2D uVel; uniform vec2 uTexel;
+varying vec2 vUv;
+void main(){
+  vec2 o = uTexel;
+  vec2 v = texture(uVel, vUv).rg * 0.25;
+  v += (texture(uVel, vUv + vec2(o.x, 0.0)).rg + texture(uVel, vUv - vec2(o.x, 0.0)).rg
+      + texture(uVel, vUv + vec2(0.0, o.y)).rg + texture(uVel, vUv - vec2(0.0, o.y)).rg) * 0.125;
+  v += (texture(uVel, vUv + o).rg + texture(uVel, vUv - o).rg
+      + texture(uVel, vUv + vec2(o.x, -o.y)).rg + texture(uVel, vUv + vec2(-o.x, o.y)).rg) * 0.0625;
+  gl_FragColor = vec4(v, 0.0, 1.0);
+}`;
+
 export interface FluidStepOpts {
   /** Surface wind (m/s) the far field relaxes toward. */
   wind: THREE.Vector2;
@@ -194,6 +211,7 @@ export class FluidSim {
   private press: THREE.WebGLRenderTarget[];    // ping-pong, `pi` = readable
   private curl: THREE.WebGLRenderTarget;
   private div: THREE.WebGLRenderTarget;
+  private blurRT: THREE.WebGLRenderTarget;
   private vi = 0;
   private pi = 0;
   private texel: THREE.Vector2;
@@ -207,6 +225,7 @@ export class FluidSim {
     this.press = [rt(N), rt(N)];
     this.curl = rt(N);
     this.div = rt(N);
+    this.blurRT = rt(N);
     const mk = (frag: string, extra: Record<string, { value: any }>) =>
       new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: frag, uniforms: extra, depthTest: false, depthWrite: false });
     const t4 = { value: new THREE.Vector4() };
@@ -224,6 +243,7 @@ export class FluidSim {
       clear: mk(CLEAR, { uSrc: { value: null }, uScale: { value: 0.85 } }),
       jacobi: mk(JACOBI, { uPress: { value: null }, uDiv: { value: null }, uTexel: { value: this.texel } }),
       grad: mk(GRADIENT, { uVel: { value: null }, uPress: { value: null }, uTexel: { value: this.texel } }),
+      blur: mk(BLUR, { uVel: { value: null }, uTexel: { value: this.texel } }),
     };
     this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.mat.advect);
     this.quad.frustumCulled = false;
@@ -231,11 +251,13 @@ export class FluidSim {
     // Clear both ping-pong chains once so the first frames start from rest.
     this.pass('clear', { uSrc: { value: this.press[0].texture }, uScale: { value: 0 } }, this.press[1]);
     this.pass('clear', { uSrc: { value: this.vel[0].texture }, uScale: { value: 0 } }, this.vel[1]);
+    // blurRT is intentionally not cleared here (reading it into itself would be a hazard);
+    // step() rewrites it before anything samples it.
     this.renderer.setRenderTarget(null);
   }
 
-  /** Texture the rest of the renderer should sample this frame (the readable velocity buffer). */
-  get texture(): THREE.Texture { return this.vel[this.vi].texture; }
+  /** Texture the rest of the renderer should sample this frame (the smoothed velocity copy). */
+  get texture(): THREE.Texture { return this.blurRT.texture; }
 
   private pass(name: string, uniforms: Record<string, { value: any }>, dst: THREE.WebGLRenderTarget) {
     const m = this.mat[name];
@@ -286,6 +308,9 @@ export class FluidSim {
     const finalDst = cur === dst ? src : dst;
     this.pass('grad', { uVel: { value: cur.texture }, uPress: { value: pr.texture } }, finalDst);
     this.vi = finalDst === this.vel[0] ? 0 : 1;
+    // Visuals read a blurred copy: raw grid-scale noise in the field shimmers through every
+    // material that displaces by fluidVel.
+    this.pass('blur', { uVel: { value: this.vel[this.vi].texture } }, this.blurRT);
     // Leave the default target bound so three.js' next setRenderTarget behaves normally.
     this.renderer.setRenderTarget(null);
   }
@@ -299,7 +324,7 @@ export class FluidSim {
   }
 
   dispose() {
-    for (const t of [...this.vel, ...this.press, this.curl, this.div]) t.dispose();
+    for (const t of [...this.vel, ...this.press, this.curl, this.div, this.blurRT]) t.dispose();
     for (const m of Object.values(this.mat)) m.dispose();
     (this.quad.geometry as THREE.BufferGeometry).dispose();
   }

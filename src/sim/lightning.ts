@@ -50,7 +50,7 @@ export function phiAt(a: Atmosphere, x: number, y: number, z: number): number {
   return samp(k) * (1 - t) + samp(k + 1) * t;
 }
 
-interface Tip { x: number; y: number; z: number; s: number; dx: number; dy: number; dz: number; order: number; alive: boolean; node: number; }
+interface Tip { x: number; y: number; z: number; s: number; dx: number; dy: number; dz: number; order: number; alive: boolean; node: number; born: number; }
 
 export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Polarity): FlashEvent {
   const { nx, ny, nxy } = a, g = a.g;
@@ -75,16 +75,21 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   // its positive leader down from the upper (or lower) positive charge region.
   const descS = polarity === 'neg' ? 1 : -1;
   const positive = polarity === 'pos';
+  // Per-step chance the descending leader stalls out (screening, branching losses, charge
+  // structure it cannot cross). This is the valve that keeps intracloud flashes the majority:
+  // negative leaders branch heavily and stall more, positive leaders from the anvil mostly
+  // survive the long trip down — so both polarities still attach, at realistic rates.
+  const stallP = positive ? 0.005 : 0.021;
   // Start with a descending polarity leader and an ascending counter-leader. A purely random
   // bidirectional pair often wandered sideways and produced a horizontal "spider" instead of a bolt.
   const az = 2 * Math.PI * rnd(), horiz = 0.35 + 0.35 * rnd(), down = Math.sqrt(1 - horiz * horiz);
   const d0 = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
-  tips.push({ x, y, z, s: descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0 });
-  tips.push({ x, y, z, s: -descS, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0 });
+  tips.push({ x, y, z, s: descS, dx: d0[0], dy: d0[1], dz: d0[2], order: 0, alive: true, node: 0, born: 0 });
+  tips.push({ x, y, z, s: -descS, dx: -d0[0], dy: -d0[1], dz: -d0[2], order: 0, alive: true, node: 0, born: 0 });
 
   const EPROP = 1.1e4, ETA = 1.35, NC = 12;
   const smooth = (a: number, b: number, x: number) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
-  const MAXSEG = 1400, MAXGEN = 180, MAXTIPS = 28;
+  const MAXSEG = 1400, MAXGEN = 180, MAXTIPS = 16;
   let grounded = false, strikeNode = -1, attachGen = 0;
   let gen = 0;
   for (gen = 1; gen <= MAXGEN && nodesX.length < MAXSEG; gen++) {
@@ -93,6 +98,9 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
     for (let ti = 0; ti < nt; ti++) {
       const tp = tips[ti];
       if (!tp.alive) continue;
+      // Branches are pruned after ~45 generations: forks that wander forever turned every
+      // flash into a hairball. The main channel and counter-leader are never pruned.
+      if (tp.order > 0 && gen - tp.born > 45) { tp.alive = false; continue; }
       any = true;
       // Longer, smoother leader steps with gentle kinks; branches get shorter steps.
       // Positive leaders propagate in longer, straighter segments than stepped negative ones.
@@ -158,11 +166,12 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
         if (best < 0) best = cw.lastIndexOf(Math.max(...cw));
       }
       const parent = tp.node;
-      const jit = 0.14 * len;
+      const jit = 0.10 * len;
       tp.x = cx[best] + (rnd() - 0.5) * jit;
       tp.y = cy[best] + (rnd() - 0.5) * jit;
       tp.z = Math.max(25, cz[best] + (rnd() - 0.5) * jit);
-      tp.dx = 0.68 * tp.dx + 0.32 * cdx[best]; tp.dy = 0.68 * tp.dy + 0.32 * cdy[best]; tp.dz = 0.68 * tp.dz + 0.32 * cdz[best];
+      // Smoother heading: real channels are long arcs with kinks, not lattice random walks.
+      tp.dx = 0.78 * tp.dx + 0.22 * cdx[best]; tp.dy = 0.78 * tp.dy + 0.22 * cdy[best]; tp.dz = 0.78 * tp.dz + 0.22 * cdz[best];
       const nl = Math.hypot(tp.dx, tp.dy, tp.dz) || 1; tp.dx /= nl; tp.dy /= nl; tp.dz /= nl;
       nodesX.push(tp.x); nodesY.push(tp.y); nodesZ.push(tp.z); nodeGen.push(gen); nodeParent.push(parent); nodeOrder.push(tp.order);
       tp.node = nodesX.length - 1;
@@ -173,11 +182,14 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
         grounded = true; strikeNode = tp.node; attachGen = gen; phiCh = 0; tp.alive = false;
         continue;
       }
+      // Stall (see stallP): a desc tip that dies here leaves the counter-leader finishing the
+      // flash as an IC — exactly how most flashes in a real storm end.
+      if (tp.s === descS && rnd() < stallP) { tp.alive = false; continue; }
       // Shallow forks, rarer with each generation; high-order branches stop subdividing.
       // Positive leaders fork much less than stepped negative ones.
       const pBranch = positive
         ? (tp.order < 2 && tp.z > 900 ? 0.055 * Math.pow(0.5, tp.order) : 0)
-        : (tp.order < 3 && tp.z > 550 ? 0.10 * Math.pow(0.52, tp.order) : 0);
+        : (tp.order < 3 && tp.z > 550 ? 0.085 * Math.pow(0.5, tp.order) : 0);
       // Keep a node reserve so branches can never starve the main channel of steps before it
       // reaches the ground (branches are what made every flash die as an IC).
       if (tips.length < MAXTIPS && nodesX.length < MAXSEG - 400 && rnd() < pBranch) {
@@ -185,7 +197,7 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
         let bx = tp.dx * (1 - bk) + r[0] * bk, by = tp.dy * (1 - bk) + r[1] * bk, bz = tp.dz * (1 - bk) + r[2] * bk;
         bz += tp.s < 0 ? -0.08 : 0.08;
         const bl = Math.hypot(bx, by, bz) || 1; bx /= bl; by /= bl; bz /= bl;
-        tips.push({ x: tp.x, y: tp.y, z: tp.z, s: tp.s, dx: bx, dy: by, dz: bz, order: tp.order + 1, alive: true, node: tp.node });
+        tips.push({ x: tp.x, y: tp.y, z: tp.z, s: tp.s, dx: bx, dy: by, dz: bz, order: tp.order + 1, alive: true, node: tp.node, born: gen });
       }
     }
     if (!any) break;
@@ -259,7 +271,8 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
     let t = attachGen * STEP + 0.004;
     const ns = positive ? (rnd() < 0.15 ? 2 : 1) : Math.min(8, 1 + Math.floor(-Math.log(rnd() + 1e-6) * 2.0));
     strokes.push({ t, amp: positive ? 2.1 : 1 });
-    for (let s = 1; s < ns; s++) { t += 0.018 + 0.065 * rnd(); strokes.push({ t, amp: (0.22 + 0.52 * rnd()) * (1 - 0.05 * s) }); }
+    // Subsequent strokes are dart leaders re-using the same channel: quick, tightly spaced.
+    for (let s = 1; s < ns; s++) { t += 0.014 + 0.05 * rnd(); strokes.push({ t, amp: (0.22 + 0.52 * rnd()) * (1 - 0.05 * s) }); }
     ccEnd = strokes[0].t + (positive ? 0.14 + 0.30 * rnd() : 0.012 + 0.045 * rnd());
     ccAmp = positive ? 0.34 : 0.10;
   } else {
@@ -283,8 +296,12 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
 export function tryLightning(a: Atmosphere): FlashEvent[] {
   const out: FlashEvent[] = [];
   if (a.stats.maxEratio < 0.75) return out;
-  // electrostatics/lightning is evaluated every 4 steps, so each call covers two intervals
-  const p = 1 - Math.exp(-(a.dt * 2) / 3);
+  // Electrostatics/lightning is evaluated every 4 steps, so each call covers two intervals.
+  // The mean interval scales with how far past breakdown the storm is, and is re-jittered
+  // every call: flashes arrive in irregular clumps rather than on a fixed metronome.
+  const sev = Math.max(0, a.stats.maxEratio - 0.75);
+  const meanT = (16 / (0.45 + Math.min(3.5, sev * 1.6))) * (0.45 + 1.3 * a.rng());
+  const p = 1 - Math.exp(-(a.dt * 2) / Math.max(2.5, meanT));
   const { nx, ny, nz, nxy } = a;
   const used: [number, number, number][] = [];
   const cd = a.chargeDiag;
@@ -292,18 +309,20 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
   for (let f = 0; f < 2; f++) {
     // ---- polarity. Positive CGs need a healthy upper-positive (or lower-positive) reservoir
     // and stay rare either way; everything else defaults to the common negative flash.
-    const pPos = Math.min(0.24, Math.max(0.04, 0.04 + 0.18 * posRes / (posRes + negRes + 1e-6)));
+    const pPos = Math.min(0.19, Math.max(0.03, 0.03 + 0.13 * posRes / (posRes + negRes + 1e-6)));
     let polarity: Polarity = a.rng() < pPos ? 'pos' : 'neg';
     let flipped = false;
     let bestR = 0, best = -1;
     for (;;) {
-      const minR = polarity === 'pos' ? 0.8 : 1.0;
+      const minR = polarity === 'pos' ? 0.85 : 1.0;
       bestR = minR; best = -1;
       for (let k = 0; k < nz; k++) {
         const z = a.g.zc[k];
         // Positive flashes start high in the anvil (> 7 km) or in the lower positive pocket
-        // (< 4.5 km); negative flashes start in the mid-level negative charge.
+        // (< 4.5 km); negative flashes start in the mid-level negative charge — never in the
+        // cloud-top screening skin, where the long path down mostly stalls as an IC.
         if (polarity === 'pos' && !(z > 7000 || (z < 4500 && cd.lowerPos > 0.5))) continue;
+        if (polarity === 'neg' && z > 8800) continue;
         const eth = a.thresholdE(k);
         for (let ij = 0; ij < nxy; ij++) {
           const c = k * nxy + ij;
