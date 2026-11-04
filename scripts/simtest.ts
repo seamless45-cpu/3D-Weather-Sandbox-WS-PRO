@@ -74,6 +74,9 @@ let cgPos = 0;
 let ic = 0;
 let cc = 0;
 let anvil = 0;
+let groundFlashes = 0;
+let peakQg = 0;
+let peakEsf = 0;
 let blowup = false;
 let peakW = 0;
 let peakRain = 0;
@@ -86,6 +89,7 @@ while (a.time < tEnd) {
   steps++;
   for (const e of a.flashEvents) {
     flashes++;
+    if (e.fromGround) groundFlashes++;
     if (e.type === 'CG-') cgNeg++;
     else if (e.type === 'CG+') cgPos++;
     else if (e.type === 'CC') cc++;
@@ -94,7 +98,7 @@ while (a.time < tEnd) {
     if (flashes <= 40) {
       const strike = e.strike ? e.strike.map((v: number) => v.toFixed(0)).join(',') : '-';
       console.log(
-        `  FLASH t=${(a.time / 3600).toFixed(3)}h ${e.type} segs=${e.segs.length / 10} ` +
+        `  FLASH t=${(a.time / 3600).toFixed(3)}h ${e.type}${e.fromGround ? '(ground)' : ''} segs=${e.segs.length / 10} ` +
           `Q=${e.chargeC.toFixed(1)}C ratio=${e.ratio.toFixed(2)} init z=${e.init[1].toFixed(0)} ` +
           `strokes=${e.strokes.length} strike=${strike}`,
       );
@@ -109,13 +113,15 @@ while (a.time < tEnd) {
     tornadoSeen = tornadoSeen || s.tornadoActive > 0;
     peakTornado = Math.max(peakTornado, s.tornadoIntensity);
     peakTripole = Math.max(peakTripole, s.chargeTripole);
+    peakQg = Math.max(peakQg, a.qgMax);
+    peakEsf = Math.max(peakEsf, s.maxEz0 || 0);
     console.log(
       `t=${(a.time / 3600).toFixed(2)}h dt=${a.dt.toFixed(1)} step=${((Date.now() - tw) / steps).toFixed(0)}ms ` +
         `maxW=${s.maxW.toFixed(1)}/${s.minW.toFixed(1)} qc=${(s.maxQc * 1e3).toFixed(2)} qi=${(s.maxQi * 1e3).toFixed(2)} ` +
         `qr=${(s.maxQr * 1e3).toFixed(2)} qg=${(s.maxQg * 1e3).toFixed(2)} rain=${s.maxRain.toFixed(1)} cf=${s.cloudFrac.toFixed(2)} ` +
         `cp=${s.coldPool.toFixed(3)}/${s.coldPoolMin.toFixed(1)} Ts=${s.meanTs.toFixed(1)} div=${s.maxDiv.toExponential(1)} ` +
         `cfl=${s.cfl.toFixed(2)} wres=${s.waterRes.toExponential(1)} eres=${s.energyRes.toExponential(1)} ` +
-        `E=${(s.maxE / 1e3).toFixed(0)}kV/m r=${s.maxEratio.toFixed(2)} fl=${flashes} UH=${s.maxUH.toFixed(0)} ` +
+        `E=${(s.maxE / 1e3).toFixed(0)}kV/m Ez0=${((s.maxEz0 || 0) / 1e3).toFixed(0)} r=${s.maxEratio.toFixed(2)} fl=${flashes} UH=${s.maxUH.toFixed(0)} ` +
         `KE=${s.KE.toExponential(1)} chMax=${a.chargeMax.toExponential(1)} Q+=${s.chargePos.toExponential(1)} Q-=${s.chargeNeg.toExponential(1)} ` +
         `TOR=${s.tornadoActive ? `EF${s.tornadoEF} ${s.maxTornadoWind.toFixed(0)}m/s ${s.tornadoPressure.toFixed(0)}hPa` : `pot=${s.tornadoPotential.toFixed(2)}`} ` +
         `CH=${(s.chargeSep / 1e3).toFixed(1)}kC/s tri=${s.chargeTripole.toFixed(2)}`,
@@ -130,8 +136,9 @@ while (a.time < tEnd) {
 
 console.log(
   `total ${Date.now() - tw} ms, steps ${steps}, sim ${(hours).toFixed(2)} h, ` +
-    `flashes ${flashes} (CG- ${cgNeg}, CG+ ${cgPos}, IC ${ic}, CC ${cc}, ANVIL ${anvil}), peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h, ` +
-  `tornado ${tornadoSeen ? 'YES' : 'no'}, peak vortex ${peakTornado.toFixed(2)}, peak tripole ${peakTripole.toFixed(2)}`,
+    `flashes ${flashes} (CG- ${cgNeg}, CG+ ${cgPos}, IC ${ic}, CC ${cc}, ANVIL ${anvil}) [ground-initiated ${groundFlashes}], peak surface charge ${peakQg.toExponential(1)} C/m², peak surface field ${(peakEsf / 1e3).toFixed(0)} kV/m, peak w ${peakW.toFixed(1)} m/s, peak rain ${peakRain.toFixed(1)} mm/h, ` +
+    `tornado ${tornadoSeen ? 'YES' : 'no'}, peak vortex ${peakTornado.toFixed(2)}, peak tripole ${peakTripole.toFixed(2)}` +
+    `\nground-trigger: gate-calls ${a.gd.call}, candidate-cells ${a.gd.cand}, r>0.55 cells ${a.gd.pass}, spacing-blocked ${a.gd.blk}, selected ${a.gd.sel}, rolls ${a.gd.roll}, max r ${a.gd.maxR.toFixed(2)} (bar 0.55)`,
 );
 console.log(blowup ? 'RESULT: FAIL (blow-up)' : failed ? `RESULT: FAIL (${failed} validation checks)` : 'RESULT: PASS');
 process.exit(blowup || failed ? 1 : 0);

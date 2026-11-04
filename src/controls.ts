@@ -43,6 +43,14 @@ export class Player {
   /** Energy-drink boost deadline (performance.now ms): ×10 speed while now < drinkUntil. */
   private drinkUntil = 0;
   drinkActive() { return performance.now() < this.drinkUntil; }
+  /** Trigger the 30 s energy-drink boost (G on desktop, the G button on mobile). */
+  drink() { this.drinkUntil = performance.now() + 30000; }
+  /** Vertical velocity for the foot-mode jump (gravity-integrated in updateFoot). */
+  private vy = 0;
+  private jumpQueued = false;
+  /** Queue a jump: consumed when the player is in foot mode and at ground contact.
+   *  The mobile JUMP button and the Space key both land here. */
+  jump() { this.jumpQueued = true; }
 
   constructor(el: HTMLElement, terrain: Terrain, spawn: [number, number]) {
     this.terrain = terrain;
@@ -63,7 +71,9 @@ export class Player {
       if (e.code === 'KeyP' && !e.repeat && this.mode === 'vehicle') this.vehicle.probe = !this.vehicle.probe;
       if (e.code === 'KeyL' && !e.repeat && this.mode === 'vehicle') this.vehicle.lights = !this.vehicle.lights;
       // Energy drink: 30 s of ×10 power/speed. Re-drinking refreshes the timer.
-      if (e.code === 'KeyG' && !e.repeat) this.drinkUntil = performance.now() + 30000;
+      if (e.code === 'KeyG' && !e.repeat) this.drink();
+      // Jump (foot mode): edge-triggered so holding Space does not bunny-hop on landing.
+      if (e.code === 'Space' && !e.repeat && this.mode === 'foot') this.jump();
       if (['Space', 'ArrowUp', 'ArrowDown'].includes(e.code)) e.preventDefault();
     });
     on(window, 'keyup', (e: KeyboardEvent) => this.keys.delete(e.code));
@@ -171,8 +181,24 @@ export class Player {
     const speed = Math.hypot(this.vx, this.vz);
     this.walking += speed * dt * 0.55;
     const gh = Math.max(0, this.terrain.groundHeight(this.x, this.z));
-    const target = gh + EYE + Math.sin(this.walking) * 0.035 * Math.min(1, speed / 9);
-    this.eyeY += (target - this.eyeY) * (1 - Math.exp(-dt * 14));
+    const groundEye = gh + EYE;
+    // Jump: gravity-integrated hop (~1 m apex at 7 m/s against 25 m/s²). A press while
+    // airborne stays queued and fires on touchdown.
+    if (this.jumpQueued && this.vy <= 0 && this.eyeY <= groundEye + 0.08) {
+      this.vy = 7.0;
+      this.jumpQueued = false;
+    }
+    // Physics only while actually airborne (jump/fall); the walk-bob path owns ground contact
+    // otherwise — a residual ≤10 cm is bob/terrain-follow slack, not flight.
+    if (this.vy !== 0 || this.eyeY > groundEye + 0.1) {
+      this.vy -= 25 * dt;
+      this.eyeY += this.vy * dt;
+      if (this.eyeY <= groundEye) { this.eyeY = groundEye; if (this.vy < 0) this.vy = 0; }
+    } else {
+      this.vy = 0;
+      const target = groundEye + Math.sin(this.walking) * 0.035 * Math.min(1, speed / 9);
+      this.eyeY += (target - this.eyeY) * (1 - Math.exp(-dt * 14));
+    }
     this.y = Math.max(this.eyeY, gh + 1.2);
   }
 
@@ -224,9 +250,17 @@ export class Player {
     let wind = 0, pressure = 0, distance = Infinity, bearing = 0;
     if (tornado && tornado.active) {
       const dx = wrapDelta(v.x - tornado.x), dz = wrapDelta(v.z - tornado.z);
-      const r = Math.max(1, Math.hypot(dx, dz)), R = Math.max(80, tornado.radius);
-      const vt = tornado.maxWind * (r < R ? r / R : Math.pow(R / r, 0.62) * Math.exp(-(r - R) / 4200));
-      const inflow = -0.2 * tornado.maxWind * Math.exp(-r / (1.8 * R));
+      const r = Math.max(1, Math.hypot(dx, dz)), R = Math.max(55, tornado.radius);
+      // Burgers–Rott profile, matching the solver-side vortex: solid-body core, smooth
+      // peak at r=R (no Rankine kink), 1/r decay and a far-field exponential cutoff.
+      const xr = Math.max(r, 12) / R;
+      let vt = tornado.maxWind * ((2 * xr) / (1 + xr * xr))
+        * (r > 1.6 * R ? Math.exp(-(r - 1.6 * R) / 5200) : 1);
+      // Suction-spot passage (mature multi-vortex): brief ~40% tangential gust as an
+      // orbiting sub-vortex sweeps past the truck.
+      const si = Math.max(0, Math.min(1, ((tornado.intensity || 0) - 0.5) / 0.45));
+      if (si > 0) vt *= 1 + 0.45 * si * Math.max(0, Math.sin(this.tT * 2.05 + v.x * 0.013 + v.z * 0.011));
+      const inflow = -(0.18 + 0.16 * (tornado.intensity || 0)) * tornado.maxWind * Math.exp(-r / (1.4 * R));
       const wx = -(dz / r) * vt + (dx / r) * inflow;
       const wz = (dx / r) * vt + (dz / r) * inflow;
       const vwx = fx * fwd + rx * lat, vwz = fz * fwd + rz * lat;

@@ -20,9 +20,9 @@ export interface Quality {
 export function qualityFor(tier: Tier): Quality {
   // M is the terrain lattice: 256 (125 m spacing) is already finer than any landform the
   // solver resolves, so a 512 mesh buys nothing and costs 4x the triangles.
-  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.62, stepScale: 2.2, minCloudScale: 0.45, M: 256, rain: 5000, treeGrid: 16, msaa: 0, splashes: true, shafts: 18, steps: 30, maxPixels: 1.4e6, maxCloudPixels: 0.9e6 };
-  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.72, stepScale: 1.3, minCloudScale: 0.50, M: 256, rain: 14000, treeGrid: 28, msaa: 0, splashes: true, shafts: 32, steps: 64, maxPixels: 2.6e6, maxCloudPixels: 1.4e6 };
-  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.9, stepScale: 1.0, minCloudScale: 0.62, M: 256, rain: 26000, treeGrid: 56, msaa: 2, splashes: true, shafts: 44, steps: 96, maxPixels: 4.2e6, maxCloudPixels: 2.2e6 };
+  if (tier === 'low') return { tier, pr: 0.8, cloudScale: 0.62, stepScale: 2.2, minCloudScale: 0.45, M: 256, rain: 9000, treeGrid: 16, msaa: 0, splashes: true, shafts: 18, steps: 30, maxPixels: 1.4e6, maxCloudPixels: 0.9e6 };
+  if (tier === 'mid') return { tier, pr: Math.min(window.devicePixelRatio || 1, 1), cloudScale: 0.72, stepScale: 1.3, minCloudScale: 0.50, M: 256, rain: 26000, treeGrid: 28, msaa: 0, splashes: true, shafts: 32, steps: 64, maxPixels: 2.6e6, maxCloudPixels: 1.4e6 };
+  return { tier: 'high', pr: Math.min(window.devicePixelRatio || 1, 1.25), cloudScale: 0.9, stepScale: 1.0, minCloudScale: 0.62, M: 256, rain: 44000, treeGrid: 56, msaa: 2, splashes: true, shafts: 44, steps: 96, maxPixels: 4.2e6, maxCloudPixels: 2.2e6 };
 }
 
 /** Probe the GPU string once and release the throwaway context (mobile browsers limit live contexts). */
@@ -109,7 +109,7 @@ export function detectQuality(): Quality {
     q.steps = Math.min(q.steps, 52);
     q.maxPixels = Math.min(q.maxPixels, 2.2e6);
     q.maxCloudPixels = Math.min(q.maxCloudPixels, 1.1e6);
-    q.rain = Math.min(q.rain, 8000);
+    q.rain = Math.min(q.rain, 16000);
     q.treeGrid = Math.min(q.treeGrid, 36);
     q.shafts = Math.min(q.shafts, 24);
     q.msaa = 0;
@@ -165,14 +165,20 @@ export class Engine {
   private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
   flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
-  /** Thunder shock: positional shake on a fixed random axis, gated at 720 Hz (see render). */
-  shake: { t0: number; amp: number; axis: THREE.Vector3; phase: number } | null = null;
+  /** Thunder shock: positional shake on a fixed random axis, hash-gated at 720 Hz (see render). */
+  shake: { t0: number; amp: number; axis: THREE.Vector3; phaseSeed: number } | null = null;
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
-  localWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
+  localWind = new THREE.Vector2(); gustWind = new THREE.Vector2(); tmpV = new THREE.Vector3();
   windTarget = new THREE.Vector2(); windDrift = new THREE.Vector2();
   lowTimer = 0; highTimer = 0; cloudScale: number; dynStep = 1; prScale = 1; lastSpike = 0; lastSoftSpike = 0;
+  /** Adaptive-quality dwell: timestamps of the last quality *action* and the last time
+   *  quality was recovered upward. Degrades are rate-limited, upgrades need a long quiet
+   *  window, and any action opens a cooldown — without this the controller oscillated with
+   *  a ~9 s period (rebuildCloud/resize/step-count churn every few seconds), which read as
+   *  the whole view hitching on a cycle. */
+  lastAdaptAct = -1e9; lastUpgrade = -1e9;
   /** User pixel-ratio target (device pixels per CSS pixel); initialised from the tier preset. */
   userPR: number;
   cloudW = 0; cloudH = 0; stormLoad = 0; cheapMode = false;
@@ -180,7 +186,7 @@ export class Engine {
   timerExt: any = null;
   profile = { scene: 0, cloud: 0, comp: 0 };
   private timerQ: WebGLQuery[][] = [[], [], []];
-  flashLevel = 0; sunDirV = new THREE.Vector3(0, 1, 0); defs?: Record<string, number>; cssW = 1; cssH = 1;
+  flashLevel = 0; flashSlow = 0; sunDirV = new THREE.Vector3(0, 1, 0); defs?: Record<string, number>; cssW = 1; cssH = 1;
   adaptive = true;   // runtime degradation; disabled with ?noadapt for diagnostics
   fps = 60;
   lightingDayness = 1; camTau = 0; rainAtCam = 0; rh = 0.5; snowLevel = 3500;
@@ -235,7 +241,7 @@ export class Engine {
       uDomain: { value: DOMAIN }, uVis: { value: 30000 }, uSkyScale: { value: 14 }, uCloud: { value: this.cloudTex },
       uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.82, 0.88, 1.0) },
       uFlashOn: { value: 0 },
-      uWind: { value: this.localWind }, uWindDrift: { value: this.windDrift },
+      uWind: { value: this.gustWind }, uWindDrift: { value: this.windDrift },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
       uClass: { value: cTex }, uSurf: { value: this.surfTex }, uCamXZ: { value: new THREE.Vector2() },
       uCamCloud: { value: 0 }, uPrecipDensity: { value: 1 }, uCheapShadows: { value: 0 },
@@ -304,7 +310,7 @@ export class Engine {
 
     // ---- rain mist: soft ground-hugging puffs under precipitating shafts (auto-gated by
     // the local rain field in the shader — no separate toggle needed)
-    const mistN = q.tier === 'low' ? 450 : q.tier === 'mid' ? 850 : 1400;
+    const mistN = q.tier === 'low' ? 700 : q.tier === 'mid' ? 1300 : 2100;
     this.mistMesh = new THREE.Mesh(this.buildParticles(mistN), mk(S.mistVert, S.mistFrag, {}, { transparent: true, depthWrite: false }));
     this.mistMesh.frustumCulled = false; this.mistMesh.renderOrder = 2.2; this.scene.add(this.mistMesh);
 
@@ -939,7 +945,7 @@ export class Engine {
     for (const s of ev.strokes) if (t > s.t) { const a = t - s.t; l += s.amp * (Math.exp(-a / 0.012) + 0.25 * Math.exp(-a / 0.07)); }
     if (t < ev.leaderEnd) l += 0.12 * (t / ev.leaderEnd);
     if (ev.strokes.length && t > ev.strokes[0].t && t < ev.ccEnd) l += ev.ccAmp;
-    if (t > ev.leaderEnd) l += 0.03 * Math.exp(-(t - ev.leaderEnd) / 0.42);
+    if (t > ev.leaderEnd) l += 0.05 * Math.exp(-(t - ev.leaderEnd) / 0.55);
     return l;
   }
 
@@ -993,15 +999,20 @@ export class Engine {
     this.cloudMat.uniforms.uDenoise.value = U.uDenoise.value;
     U.uHeavyRain.value += (this.heavyRain - U.uHeavyRain.value) * Math.min(1, rawDt * 2);
     this.camera.position.set(cam.x, cam.y, cam.z);
-    // Thunder shock offset: a fixed random axis per strike, oscillating at 720 Hz. Real frame
-    // timing jitters, so the sign pattern reads as a violent rattle rather than a slow wobble.
+    // Thunder shock offset: a fixed random axis per strike, gated at 720 Hz (see render).
     if (this.shake) {
       const ss = (performance.now() - this.shake.t0) / 1000;
       if (ss > 1.3) this.shake = null;
       else {
         const env = Math.min(1, ss * 55) * Math.exp(-ss * 3.4);
-        const ph = Math.PI * 2 * 720 * (performance.now() / 1000) + this.shake.phase;
-        const osc = Math.sin(ph) >= 0 ? 1 : -1;
+        // Hash-based sign flip on the 720 Hz tick index: sin() at 720 Hz aliased against a
+        // ~60 Hz frame grid samples a slowly drifting phase and freezes into a near-constant
+        // offset (the camera sticks, then jumps — perceived as a skip). Hashing the tick
+        // gives an uncorrelated ±1 every tick regardless of the frame-rate/cycle relation.
+        const tick = Math.floor(performance.now() * 0.72) + this.shake.phaseSeed;
+        let h = Math.imul(tick ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(tick + 0x165667b1, 0xc2b2ae35);
+        h ^= h >>> 15;
+        const osc = (h & 1) !== 0 ? 1 : -1;
         const a = this.shake.amp * env * osc;
         this.camera.position.x += this.shake.axis.x * a;
         this.camera.position.y += this.shake.axis.y * a;
@@ -1039,9 +1050,9 @@ export class Engine {
         const sx = pose.x - rx * 3.6, sz = pose.z - rz * 3.6;
         this.stationGroup.position.set(sx, this.terrain.groundHeight(sx, sz), sz);
         const ud = this.stationGroup.userData as { cups: THREE.Group; vane: THREE.Group };
-        const w = Math.hypot(this.localWind.x, this.localWind.y);
+        const w = Math.hypot(this.gustWind.x, this.gustWind.y);
         ud.cups.rotation.y += dt * (0.7 + w * 0.55);
-        const target = Math.atan2(-this.localWind.x, -this.localWind.y);
+        const target = Math.atan2(-this.gustWind.x, -this.gustWind.y);
         let dAng = target - ud.vane.rotation.y;
         dAng = Math.atan2(Math.sin(dAng), Math.cos(dAng));
         ud.vane.rotation.y += dAng * Math.min(1, dt * 3);
@@ -1082,7 +1093,7 @@ export class Engine {
     // camera engulfed by condensate: lets the surface shaders skip their cloud-shadow stack
     U.uCamCloud.value = this.camCloudAt(cam.x, cam.y, cam.z);
     const sm = this.shaftMesh.material as THREE.ShaderMaterial;
-    sm.uniforms.uShaftWind.value.set(this.localWind.x, this.localWind.y);
+    sm.uniforms.uShaftWind.value.set(this.gustWind.x, this.gustWind.y);
     sm.uniforms.uSnowLevel.value = this.snowLevel;
     // Noise-volume mip scale for the shafts' distance-based LOD (metres → texels/pixel).
     const fovR = this.camera.fov * Math.PI / 180;
@@ -1117,15 +1128,19 @@ export class Engine {
         const amp = Math.min(0.4, 0.42 * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
         if (amp > 0.015) {
           const a = new THREE.Vector3(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
-          this.shake = { t0: nowMs, amp, axis: a, phase: Math.random() * Math.PI * 2 };
+          this.shake = { t0: nowMs, amp, axis: a, phaseSeed: Math.floor(Math.random() * 4096) };
         }
       }
       if (t > f.end) this.removeFlash(f);
     });
     this.flashLevel = Math.max(flashSum, this.flashLevel * Math.exp(-dt / 0.15));
+    // Slow scattered-light component: cloud illumination keeps riding the afterglow envelope
+    // (~0.55 s) long after the blinding return-stroke peaks have died — the sky does not
+    // switch off between restrikes the way a pure bloom-driven flash would.
+    this.flashSlow = Math.max(flashSum, this.flashSlow * Math.exp(-dt / 0.55));
     U.uFlashOn.value = act.length > 0 ? 1 : 0;
     // Broad, decaying sky/cloud illumination outlives the individual point lights by a few frames.
-    U.uFlashGlow.value = Math.min(1.25, this.flashLevel * 0.34);
+    U.uFlashGlow.value = Math.min(1.25, this.flashLevel * 0.30 + this.flashSlow * 0.14);
 
     // ---- exposure: physically-motivated from sun elevation and overhead cloud optical depth, with flash compression
     const bright = lt.dayness * (0.3 + 0.7 * tc);
@@ -1150,11 +1165,23 @@ export class Engine {
     // lean, trees, fluid relaxation — follow it without steps) and integrate it into
     // windDrift, which particles advect with (continuous — no Δwind × uTime teleports).
     this.localWind.lerp(this.windTarget, Math.min(1, dt * 1.4));
-    this.windDrift.addScaledVector(this.localWind, dt);
+    // Boundary-layer gusts: real wind never blows at one steady vector — speed surges and
+    // direction wobbles at seconds timescale. Bounded sines (never integrated), so the gust
+    // layer can't drift or pop; everything streaky (rain orientation, shaft lean, trees,
+    // anemometer, fluid mean injection) rides the gusted vector while localWind stays the
+    // clean smoothed mean.
+    {
+      const lw = this.localWind, sp = Math.hypot(lw.x, lw.y), tg = this.time;
+      const dirWob = 0.10 * Math.sin(tg * 0.37) + 0.06 * Math.sin(tg * 0.79 + 2.1);
+      const magMod = 1 + (sp > 0.5 ? 0.26 * Math.sin(tg * 0.53 + 1.3) + 0.15 * Math.sin(tg * 1.13 + 0.7) : 0);
+      const gc = Math.cos(dirWob), gs = Math.sin(dirWob);
+      this.gustWind.set((lw.x * gc - lw.y * gs) * magMod, (lw.x * gs + lw.y * gc) * magMod);
+    }
+    this.windDrift.addScaledVector(this.gustWind, dt);
     if (this.chargeVisible) this.lerpCharges(dt);
 
     // ---- fluid dynamics: advance the shared flow field, then hand its texture to every material
-    this.fluid.step(dt, { wind: this.localWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
+    this.fluid.step(dt, { wind: this.gustWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
     U.uFluid.value = this.fluid.texture;
 
     this.pollTimer(0, 'scene'); this.pollTimer(1, 'cloud'); this.pollTimer(2, 'comp');
@@ -1208,24 +1235,38 @@ export class Engine {
     this.fps += (1 / rawDt - this.fps) * Math.min(1, rawDt * 0.15);
     const frameDt = rawDt * 1000;
     // Recovery must be reachable on ordinary 60 Hz displays (16.7 ms), not just 120 Hz ones.
-    if (frameDt > 28) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 19) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
+    // Wider dead-band (18..30 ms) than before so a frame time parked near a threshold cannot
+    // toggle timers on alternate samples.
+    if (frameDt > 30) { this.lowTimer += rawDt; this.highTimer = 0; } else if (frameDt < 18) { this.highTimer += rawDt; this.lowTimer = 0; } else { this.lowTimer = 0; this.highTimer = 0; }
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
     const stepCap = Math.max(24, Math.round(this.q.steps * (1 - 0.15 * this.stormLoad)));
     if (uMax.value > stepCap) uMax.value = stepCap;
     const stepFloor = Math.max(16, Math.floor(stepCap * 0.65));
+    // A degrade step may run at most every 4.5 s; an upgrade only after 10 s of headroom
+    // AND at most every 14 s — and every action starts a fresh cooldown. This breaks the
+    // former limit cycle (1 s degrade / 8 s upgrade → one rebuild or resize per cycle).
+    const canDegrade = nowMs - this.lastAdaptAct > 4500;
+    const canUpgrade = nowMs - this.lastAdaptAct > 6000 && nowMs - this.lastUpgrade > 14000;
     // A cheap path reacts to the first bad frame without reallocating render targets: coarser
     // march, fewer lighting/detail fetches, thinner precipitation, fewer upsample taps.
     if (this.adaptive && frameDt > 55 && nowMs - this.lastSoftSpike > 350) {
       this.lastSoftSpike = nowMs;
-      this.cheapMode = true;
-      this.dynStep = Math.max(this.dynStep, 2.0);
-      uMax.value = Math.min(uMax.value, stepFloor);
-      this.lowTimer = 0;
+      // After an automatic recovery, don't slam straight back into the cheap path — a rapid
+      // ON/OFF cycle itself hitches (detail flag, step counts and denoise all flip).
+      if ((!this.cheapMode && nowMs - this.lastUpgrade < 9000 && frameDt < 100) || !canDegrade) {
+        // hold quality; the next sustained bad frames will re-arm the cheap path
+      } else {
+        this.cheapMode = true;
+        this.dynStep = Math.max(this.dynStep, 2.0);
+        uMax.value = Math.min(uMax.value, stepFloor);
+        this.lowTimer = 0;
+        this.lastAdaptAct = nowMs;
+      }
     }
     // A single huge spike also coarsens the cloud buffer, but is rate-limited so a sustained
     // stall cannot turn into a reallocation storm.
-    if (this.adaptive && frameDt > 70 && nowMs - this.lastSpike > 1400) {
+    if (this.adaptive && frameDt > 70 && nowMs - this.lastSpike > 1400 && canDegrade) {
       this.lastSpike = nowMs;
       this.cheapMode = true;
       this.dynStep = Math.min(3.2, this.dynStep + 0.5);
@@ -1235,8 +1276,9 @@ export class Engine {
         this.rebuildCloud();
       }
       this.lowTimer = 0;
+      this.lastAdaptAct = nowMs;
     }
-    if (this.lowTimer > 1.0) {
+    if (this.lowTimer > 1.5 && canDegrade) {
       const p = this.profile;
       // GPU timers are opt-in. With no timing data, assume the volumetric pass is the bottleneck
       // instead of shrinking the whole screen first (the old zero-profile fallback did that).
@@ -1251,14 +1293,16 @@ export class Engine {
         else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
       }
       this.lowTimer = 0;
+      this.lastAdaptAct = nowMs;
     }
-    if (this.highTimer > 8) {
+    if (this.highTimer > 10 && canUpgrade) {
       if (this.cheapMode) this.cheapMode = false;
       else if (uMax.value < stepCap) uMax.value = Math.min(stepCap, uMax.value + 2);
       else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
       else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
       else if (this.prScale < 1) { this.prScale = Math.min(1, this.prScale + 0.1); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
+      this.lastAdaptAct = nowMs; this.lastUpgrade = nowMs;
     }
     this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * Math.max(this.dynStep, 1 + 0.28 * this.stormLoad);
   }
