@@ -688,9 +688,15 @@ export class Atmosphere {
     {
       const dec = Math.exp((-4 * this.dt) / 900);
       const cor = this.thresholdE(0) * 0.25;
+      // Induction: the ground under a storm is a conductor — the cloud's field induces a
+      // surface charge sheet sigma ~ eps0*Ez just above ground (positive under a negative
+      // cloud). Relax qGround toward that induced value on a ~2 min timescale, on top of the
+      // charge rained out by precipitation — otherwise the sheet only existed where rain
+      // carried charge down and most of the domain never accumulated any.
+      const ind = Math.min(1, (4 * this.dt) / 120);
       for (let ij = 0; ij < nxy; ij++) {
         let qg = this.qGround[ij];
-        if (qg === 0) continue;
+        qg += (EPS0 * this.ez[ij] - qg) * ind;
         qg *= dec;
         const eg = Math.abs(this.ez[ij]);
         if (eg > cor) qg *= Math.exp(((-4 * this.dt) / 180) * Math.min(4, (eg - cor) / cor));

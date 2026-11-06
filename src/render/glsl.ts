@@ -55,7 +55,7 @@ vec3 skyRad(vec3 dir){
   vec3 insc = (BR * phR + vec3(BMIE * 1.1 * phM)) / bt * (1.0 - fex);
   vec3 st = mix(sT, sqrt(sT), min(1.0, cy * 2.0));
   vec3 L = uSkyScale * insc * st;
-  L += vec3(0.0025, 0.0045, 0.012);
+  L += vec3(0.0016, 0.0030, 0.0085);
   float csp = max(cs, 0.0);
   L += uTwilight * vec3(0.55, 0.28, 0.2) * 0.35 * exp(-cy * 5.0) * (0.25 + 0.75 * csp * csp);
   return L;
@@ -163,6 +163,9 @@ varying vec3 vDir;
 void main(){
   vec3 d = normalize(vDir);
   vec3 c = skyRad(vec3(d.x, max(d.y, 0.0), d.z));
+  // Mild desaturation toward the horizon so the sky reads as air, not milk.
+  float lum = dot(c, vec3(0.333));
+  c = mix(c, vec3(lum), 0.14 * (1.0 - abs(d.y)));
   float cs = dot(d, uSunDir);
   float sam = uSunDir.y > 0.0 ? airMass(uSunDir.y) : 60.0;
   vec3 sT = exp(-(BR * 8000.0 + vec3(BMIE * 1320.0)) * sam);
@@ -435,7 +438,9 @@ void main(){
   float ndl = max(dot(N, uSunDir), 0.0);
   float ao = clamp(0.35 + 0.65 * (vW.y - floor(vW.y)) , 0.0, 1.0);
   vec3 amb = mix(uGroundAmb, uSkyAmb, 0.5 + 0.5 * N.y) * vSV;
-  vec3 col = vCol * (vSun * (0.15 + 0.85 * ndl) * step(0.0, uSunDir.y) + amb * 1.1);
+  // Slightly desaturate + darken so distant trees read as dark green specks, not white dots.
+  vec3 base = mix(vCol, vec3(dot(vCol, vec3(0.333))), 0.22);
+  vec3 col = base * (vSun * (0.15 + 0.85 * ndl) * step(0.0, uSunDir.y) + amb * 0.72);
   if (uFlashOn > 0.5) col += flashLight(vW, N) * vCol * 0.9;
   col = applyFog(col, vW);
   gl_FragColor = vec4(col, 1.0);
@@ -751,14 +756,14 @@ uniform float uSnowLevel;
 #define SHAFT_PLANES 6.0
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
-varying vec2 vFlow;
+varying vec2 vFlow; varying float vFace;
 void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
   float layer = aCol.w;
   float seed = fract(aCol.z + layer * 0.371);
   vRain = 0.0; vU = 0.0; vV = 0.0; vSeed = seed; vSnow = 0.0; vDist = 0.0;
-  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0; vFlow = vec2(0.0);
+  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0; vFlow = vec2(0.0); vFace = 1.0;
   if (rain <= 0.008 || seed > max(1.0, uPrecipDensity)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // Wrap precipitation around the mesocyclone, leaving a dry lower inflow notch.
   vec2 tv = xz - uTornado.xy;
@@ -809,6 +814,9 @@ void main(){
   p += vec3(-right.z, 0.0, right.x) * bow;
 
   gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+  // Facing of this curtain plane vs the camera: a vertical plane seen exactly edge-on
+  // collapses to a 1-px full-height line — the fragment shader fades that case out.
+  vFace = abs(dot(vec3(-right.z, 0.0, right.x), normalize(cameraPosition - p)));
   vRain = smoothstep(0.005, 0.42, rain) * (0.92 + 0.42 * uHeavyRain);
   vU = h;
   vV = across * 2.0;
@@ -822,9 +830,11 @@ uniform sampler3D uNoise;
 uniform float uLodScale;   // texels-per-metre-per-pixel for the noise volume
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
-varying vec2 vFlow;
+varying vec2 vFlow; varying float vFace;
 void main(){
   if (vRain < 0.01) discard;
+  // Kill the edge-on artifact: a shaft plane viewed edge-on is a full-height 1-px line.
+  if (vFace < 0.985) { float eo = 1.0 - smoothstep(0.90, 0.985, vFace); if (eo <= 0.0) discard; }
   // Soft multi-lobe edge, then torn by noise: the card boundary itself becomes wispy.
   float edge = exp(-1.5 * vV * vV) * (1.0 - smoothstep(0.76, 1.0, abs(vV)));
   if (edge < 0.01) discard;
@@ -843,7 +853,8 @@ void main(){
   vec4 nB = textureLod(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB), lod + 1.9);
   vec4 nC = textureLod(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7), min(lod + 3.2, 5.0));
   // Sub-columns of heavier / lighter precipitation inside one shaft.
-  float strand = 0.42 + 0.58 * (0.55 * nB.r + 0.45 * nC.a);
+  // Heavier AND lighter patches within a single shaft (real curtains are not an even sheet).
+  float strand = 0.30 + 0.85 * (0.55 * nB.r + 0.45 * nC.a);
   float streak = 0.20 + 0.48 * nA.r + 0.38 * nA.g + 0.66 * (nB.r * 0.5 + nB.g * 0.5) + 0.34 * (nC.r - 0.5);
   streak *= strand;
   // Torn edges: the fine layer erodes the silhouette where it is already thin.
@@ -859,6 +870,13 @@ void main(){
   float planeGain = 0.86 + 0.16 * sin(vLayer * 2.399 + vSeed * 6.2831);
   float a = vRain * streak * edge * topFade * botFade * tendril * mix(0.62, 1.08, vU) * (0.66 + 0.44 * body) * planeGain;
   a *= clamp(0.72 + 0.85 * uRainIntensity + 0.95 * uHeavyRain, 0.72, 2.65);
+  // Edge-on fade (see vertex): plane seen edge-on must vanish, not draw a line.
+  a *= 1.0 - smoothstep(0.90, 0.985, vFace);
+  // Spray churn where the curtain meets the ground: bright, turbulent base.
+  float churn = (0.5 + 0.5 * nB.g) * (1.0 - smoothstep(0.0, 0.22, vU)) * clamp(0.35 + 0.65 * uRainIntensity + 0.6 * uHeavyRain, 0.0, 1.6);
+  a *= 1.0 + 0.30 * churn;
+  // Soft dissolve at the base (over water the shaft fades into spray, not a hard edge).
+  a *= 1.0 - 0.30 * (1.0 - smoothstep(0.0, 0.16, vU));
   // Near shafts must be visible; the old 120..650 m fade erased exactly the rain under the storm.
   a *= smoothstep(30.0, 170.0, vDist);   // inside a shaft the nearest planes must not flash across the lens
   a *= 1.0 - smoothstep(14000.0, 28000.0, vDist);
@@ -880,11 +898,17 @@ void main(){
   col *= 0.90 + 0.20 * fract(vSeed * 29.7);
   // Vertical light: bright where the shaft enters the lit cloud base, dark near the ground.
   col *= mix(0.70, 1.14, vU);
+  // Curtains take the colour of the cloud deck behind them, top to bottom, and blend into
+  // the cloud base (no hard wedge where the shaft meets the deck).
+  vec3 deck = (mix(uSkyAmb, uHorizon, 0.45) * 0.85 + uSunCol * 0.07 + vec3(0.012)) * mix(0.82, 1.06, fract(vSeed * 13.1));
+  col = mix(col, deck, smoothstep(0.45, 1.0, vU) * 0.62);
   // Dense cores self-shadow; thin edges scatter more sunlight through them.
   float density = vRain * strand;
   col *= 1.0 - 0.30 * smoothstep(0.35, 1.1, density);
-  // Forward scatter: a backlit shaft glows along its sunward face.
-  col *= 1.0 + 0.95 * pow(fwd, 3.0) * (0.35 + 0.65 * (1.0 - smoothstep(0.4, 1.0, density)));
+  // Forward scatter: a backlit shaft glows along its sunward face; streaks glint most
+  // against dark backgrounds, so boost the sunward term when the deck is dark.
+  col *= 1.0 + 1.20 * pow(fwd, 3.0) * (0.35 + 0.65 * (1.0 - smoothstep(0.4, 1.0, density)));
+  col += uSunCol * pow(fwd, 6.0) * 0.10 * (1.0 - smoothstep(0.3, 0.9, density)) * streak;
   col *= 1.0 + 0.35 * pow(back, 4.0);
   col *= 1.0 - 0.18 * vHook;   // hook echo is darker / rain-wrapped
   if (uFlashOn > 0.5) col += flashLight(vec3(vWorld.x, 300.0, vWorld.y), vec3(0.0, 1.0, 0.0)) * 0.5 + uFlashCol * uFlashGlow * 0.16;

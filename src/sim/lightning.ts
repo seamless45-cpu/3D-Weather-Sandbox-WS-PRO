@@ -444,27 +444,30 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
   // enhance the surface field several-fold — so ~55% of the ideal 97 kV/m macroscopic field
   // starts an upward leader, not 100%. The rate then scales with how far past that bar the
   // total surface field has pushed, so flashes appear only where charge really piled up.
-  if (a.qgMax > 1.2e-7) {
+  // A lightning rod in the domain opens the ground gate on its own (its tip field stands
+  // out even where the ambient sheet is weak).
+  const anyRod = a.props.some((pr) => pr.type === 'rod');
+  if (a.qgMax > 1.2e-7 || anyRod) {
     a.gd.call++;
     let gBest = -1, gR = 0.55, gI = -1, gJ = -1;
     for (let ij = 0; ij < nxy; ij++) {
       const qg = a.qGround[ij];
-      if (Math.abs(qg) < 1.4e-7) continue;
-      a.gd.cand++;
-      // Total surface field: solved field at the lowest level + the sheet's near-ground
-      // self-field σ/ε0 (an observer at the surface feels the full sheet, while ez averages
-      // over the first ~300 m and dilutes it).
-      let r = (Math.abs(a.ez[ij]) + (Math.abs(qg) / EPS0) * 0.9) / a.thresholdE(0);
-      // Lightning rods: a tall grounded conductor concentrates the field at its tip
-      // (enhancement ~ h/r_tip), so an upward leader launches from a rod long before the
-      // surrounding flat ground would fire — rods attract strikes, which is the point.
+      let rodBoost = 0;
       for (const pr of a.props) {
         if (pr.type !== 'rod') continue;
         let dx = Math.abs(((ij % nx) * a.g.dx) - pr.x); dx = Math.min(dx, nx * a.g.dx - dx);
         let dz = Math.abs((Math.floor(ij / nx) * a.g.dy) - pr.z); dz = Math.min(dz, ny * a.g.dy - dz);
         const d = Math.hypot(dx, dz);
-        if (d < 900) r += (1.9 * (pr.h / 12)) * (1 - d / 900) * (1 - d / 900);
+        if (d < 900) rodBoost = Math.max(rodBoost, (1.9 * (pr.h / 12)) * (1 - d / 900) * (1 - d / 900));
       }
+      if (Math.abs(qg) < 1.4e-7 && rodBoost < 0.25) continue;
+      a.gd.cand++;
+      // Total surface field: solved field at the lowest level + the sheet's near-ground
+      // self-field σ/ε0 (an observer at the surface feels the full sheet, while ez averages
+      // over the first ~300 m and dilutes it).
+      // The rod's tip concentrates the field (enhancement ~ h/r_tip), so an upward leader
+      // launches from the rod long before flat ground would fire — rods attract strikes.
+      const r = (Math.abs(a.ez[ij]) + (Math.abs(qg) / EPS0) * 0.9) / a.thresholdE(0) + rodBoost;
       if (r > a.gd.maxR) a.gd.maxR = r;
       if (r <= gR) continue;
       if (r > 0.55) a.gd.pass++;
