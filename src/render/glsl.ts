@@ -508,7 +508,8 @@ void main(){
   if (gate < 0.02) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   if (p.y < 1400.0 && p.y < groundH(p.xz) + 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // A drop is a motion-blurred teardrop: rounded bright head, tapering tail. Flakes are short.
-  float len = mix(0.35 + 1.25 * cls, 0.16 + 0.12 * cls, flake) * (1.0 + clamp(dist * 0.025, 0.0, 2.0)) * (0.82 + 0.35 * uRainIntensity + 0.45 * uHeavyRain);
+  float len = mix(0.35 + 1.25 * cls, 0.16 + 0.12 * cls, flake) * (1.0 + clamp(dist * 0.025, 0.0, 2.0))
+    * (0.55 + 0.085 * fall) * (0.82 + 0.35 * uRainIntensity + 0.45 * uHeavyRain);
   float wid = mix(0.0035 + 0.005 * cls, 0.014 + 0.010 * cls, flake) * (1.0 + dist * 0.0007);
   vec3 dirV = normalize(vel);
   vec3 center = p - dirV * len * 0.5;
@@ -519,6 +520,9 @@ void main(){
   vDist = dist; vFlake = flake; vClass = cls; vGlint = glint; vPhase = phase; vShape = shape;
   float fwd = pow(max(dot(-toCam, uSunDir), 0.0), 8.0);
   vec3 col = uSkyAmb * 1.1 + uSunCol * (0.10 + 0.75 * fwd) + uGroundAmb * 0.4 + vec3(0.015);
+  // Each drop catches a different amount of light: brightness jitter from its phase, so the
+  // rain reads as individual glints, not a uniform wash.
+  col *= 0.82 + 0.36 * fract(phase * 7.31 + cls * 3.7);
   if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 0.0, 1.0)) * 0.8 + uFlashCol * uFlashGlow * 0.12;
   vCol = mix(col, col * vec3(1.06, 1.06, 1.12) + vec3(0.045), flake);
   vAlpha = smoothstep(0.25, 1.2, dist) * (1.0 - smoothstep(38.0, 60.0, dist)) * mix(0.68 + 0.24 * cls, 0.46, flake) * (0.90 + 0.55 * uHeavyRain) * gate * edge;
@@ -550,6 +554,9 @@ void main(){
   float shape = mix(body, crystal, vFlake);
   float blur = smoothstep(9.0, 48.0, vDist);
   shape = mix(shape, soft * 0.7, blur * 0.65);
+  // Streak break-up: a real fall streak flickers along its length (drop oscillation), so
+  // modulate by fine noise along vQ.y.
+  shape *= 0.78 + 0.36 * vnoise2(vec2(vQ.y * 21.0, vPhase * 17.0));
   float a = vAlpha * shape;
   if (a < 0.003) discard;
   a *= mix(1.0, 0.45, smoothstep(8.0, 55.0, vDist));
@@ -697,11 +704,15 @@ void main(){
   float near0 = smoothstep(4.0, 26.0, dist);
   vA = rain * edge * near0 * (0.55 + 0.55 * aDrop.w) * (1.0 - smoothstep(0.30, 0.85, hf));
   vA *= 1.0 - smoothstep(130.0, 230.0, dist);
+  // Under heavy rain the spray sheet becomes a SHEET-RAIN veil: much stronger, so the whole
+  // view softens into falling water instead of discrete puffs.
+  vA *= 1.0 + 1.1 * uHeavyRain + 0.5 * uRainIntensity;
   if (vA < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 toCam = normalize(cameraPosition - p);
   vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
   vec3 up = cross(toCam, right);
-  vec3 wp = p + right * (position.x * size) + up * (position.y * size);
+  // Vertically stretched quads: tall thin streaks read as a rain veil, not round fog puffs.
+  vec3 wp = p + right * (position.x * size * 0.42) + up * (position.y * size * 2.9);
   vQ = position.xy * 2.0;
   vec3 col = (uSkyAmb * 1.25 + uSunCol * 0.26 + uGroundAmb * 0.35 + vec3(0.02)) * vec3(0.92, 0.95, 1.0);
   if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 1.0, 0.0)) * 0.7 + uFlashCol * uFlashGlow * 0.14;
@@ -711,8 +722,10 @@ void main(){
 export const mistFrag = /* glsl */ `
 varying float vA; varying vec3 vCol; varying vec2 vQ;
 void main(){
-  float r2 = dot(vQ, vQ);
-  float a = exp(-r2 * 2.6) * vA;
+  // Anisotropic falloff matching the stretched quad: tight across, long along the fall.
+  float a = exp(-(vQ.x * vQ.x * 3.6 + vQ.y * vQ.y * 0.22)) * vA;
+  // Fine vertical striations so the veil reads as countless streaks, not one soft blob.
+  a *= 0.72 + 0.42 * vnoise2(vec2(vQ.y * 26.0, vQ.x * 2.0));
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
@@ -821,7 +834,7 @@ void main(){
   // the fine layers alias into crawling grain on distant curtains.
   vec2 nxy = vWorld / shaftP + vFlow * 0.00045;
   float lod = clamp(log2(max(1.0, vDist * uLodScale / shaftP)) + 0.3, 0.0, 5.0);
-  vec4 nA = textureLod(uNoise, vec3(nxy + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.20 - fallA), lod);
+  vec4 nA = textureLod(uNoise, vec3(nxy * 2.3 + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.05 - fallA * 1.35), lod);
   vec4 nB = textureLod(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB), lod + 1.9);
   vec4 nC = textureLod(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7), min(lod + 3.2, 5.0));
   // Sub-columns of heavier / lighter precipitation inside one shaft.
@@ -857,6 +870,9 @@ void main(){
   vec3 rainCol = (uSkyAmb * 1.05 + uSunCol * 0.24 + vec3(0.01)) * vec3(0.70, 0.76, 0.88);
   vec3 snowCol = (uSkyAmb * 1.1 + uSunCol * 0.4 + vec3(0.02)) * vec3(1.06, 1.06, 1.1);
   vec3 col = mix(rainCol, snowCol, vSnow);
+  // Each shaft gets its own brightness/hue so a rain area reads as many individual cells,
+  // not one uniform veil.
+  col *= 0.90 + 0.20 * fract(vSeed * 29.7);
   // Vertical light: bright where the shaft enters the lit cloud base, dark near the ground.
   col *= mix(0.70, 1.14, vU);
   // Dense cores self-shadow; thin edges scatter more sunlight through them.
@@ -867,6 +883,13 @@ void main(){
   col *= 1.0 + 0.35 * pow(back, 4.0);
   col *= 1.0 - 0.18 * vHook;   // hook echo is darker / rain-wrapped
   if (uFlashOn > 0.5) col += flashLight(vec3(vWorld.x, 300.0, vWorld.y), vec3(0.0, 1.0, 0.0)) * 0.5 + uFlashCol * uFlashGlow * 0.16;
+  // Atmospheric-haze integration: distant shafts must melt into the background air mass, not
+  // sit on top of it as opaque cards. Blend toward the horizon haze colour and thin out.
+  float fogF = 1.0 - exp(-vDist / max(uVis, 1.0));
+  fogF = max(fogF, smoothstep(9000.0, 19000.0, vDist) * 0.85);
+  vec3 fogc = uHorizon * 0.92 + uSkyAmb * 0.30;
+  col = mix(col, fogc, clamp(fogF, 0.0, 1.0));
+  a *= 1.0 - 0.55 * clamp(fogF, 0.0, 1.0);
   gl_FragColor = vec4(col, a);
 }`;
 
@@ -1091,6 +1114,9 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   // Billow transform: rounded lobes with sharp creases instead of evenly puffy cotton.
   float lobes = 1.0 - abs(2.0 * nC.g - 1.0);
   lobes = mix(0.5, lobes, 0.5 + 0.3 * billow);
+  // Cauliflower: inside strong updraft towers the lobes sharpen into deep creased domes
+  // (pow > 1 on the ridged field) — the signature look of a growing cumulonimbus turret.
+  float cauli = pow(1.0 - abs(2.0 * nC.g - 1.0), 1.9);
   float lowShape = cover * (0.46 + 0.58 * billow + 0.34 * lobes) * (0.84 + 0.28 * band);
   // ---- cloud types selected by the regional regime field
   // cumulus humilis: small puffy fair-weather fields with a hard ceiling
@@ -1114,8 +1140,16 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   float cumulusShape = mix(lowShape, humShape, 0.45);
   float bg = wStratus * stratusShape + wCumulus * cumulusShape + wCirrus * cirrusShape;
   bg = max(bg, 0.28 * lowShape);   // the solver's structure always shows through
-  float towerShape = cover * (0.48 + 0.60 * billow + 0.40 * lobes) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
+  float towerShape = cover * (0.48 + 0.60 * billow + 0.40 * mix(lobes, cauli, towerW)) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
   float anvilShape = cover * (0.62 + 0.46 * nA.r) * (0.84 + 0.30 * nC.r) * (1.0 - 0.12 * billow);
+  // Wind-drawn anvil fibres: at anvil heights sample the noise stretched hard along the
+  // wind (x) and compressed across it, so the ice cap breaks into streaks streaming
+  // downwind instead of a smooth dome.
+  if (anvilW > 0.02) {
+    vec4 nAn = textureLod(uNoise, vec3(np.x / (2.2 * midP), np.y / midP, np.z / (9.0 * midP)), nlod(t, 9.0 * midP));
+    float fibAn = nAn.r * 0.55 + (1.0 - abs(2.0 * nAn.g - 1.0)) * 0.45;
+    anvilShape *= 0.60 + 0.62 * fibAn;
+  }
   // Deep convection overrides the regional background only where updrafts actually build
   // towers; quiescent high regions keep their regime character (cirrus stays fibrous).
   float shape = mix(bg, towerShape, hW * (0.30 + 0.70 * towerW));

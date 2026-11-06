@@ -165,7 +165,7 @@ export class Engine {
   private chargeStage: Float32Array | null = null; private chargeCountT = 0;
   private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial; private beamM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
-  flashes: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
+  flashes: FlashVis[] = []; flashAct: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   /** Thunder shock: positional shake on a fixed random axis, smooth ~11/17 Hz rattle (see render). */
   shake: { t0: number; amp: number; axis: THREE.Vector3; phaseSeed: number } | null = null;
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
@@ -1148,7 +1148,10 @@ export class Engine {
     const fl = U.uFlash.value as THREE.Vector4[];
     for (const v of fl) v.set(0, 0, 0, 0);
     let flashSum = 0;
-    const act = [...this.flashes];
+    // Reused scratch array: copying [...this.flashes] every frame allocated garbage each frame.
+    const act = this.flashAct;
+    act.length = 0;
+    for (const f of this.flashes) act.push(f);
     act.forEach((f, i) => {
       const t = (nowMs - f.t0) / 1000;
       f.mat.uniforms.uT.value = t;
@@ -1218,8 +1221,14 @@ export class Engine {
     this.windDrift.addScaledVector(this.gustWind, dt);
     if (this.chargeVisible) this.lerpCharges(dt);
 
-    // ---- fluid dynamics: advance the shared flow field, then hand its texture to every material
-    this.fluid.step(dt, { wind: this.gustWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
+    // ---- fluid dynamics: advance the shared flow field, then hand its texture to every material.
+    // The flow evolves on storm timescales, so it is integrated at HALF the frame rate with a
+    // doubled dt: halves the cost of the ~30 tiny GPU passes per step and removes the last
+    // per-frame GPU sync source on weak GPUs (the residual "frame skip" judder), with no
+    // visible change because every consumer only samples the texture.
+    if ((this.frame & 1) === 0) {
+      this.fluid.step(Math.min(0.1, rawDt * 2), { wind: this.gustWind, tornado: U.uTornado.value, time: this.time, cheap: this.cheapMode });
+    }
     U.uFluid.value = this.fluid.texture;
 
     this.pollTimer(0, 'scene'); this.pollTimer(1, 'cloud'); this.pollTimer(2, 'comp');

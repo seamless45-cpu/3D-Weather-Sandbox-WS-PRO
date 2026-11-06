@@ -234,11 +234,18 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   precipitation efficiency), f-plane Coriolis, LWC-dependent non-inductive/inductive
   charge separation with tripole screening, and dielectric-breakdown-model lightning with branched
   channels.
-* **Rendering** — ray-marched clouds with advected Perlin-Worley billows, ice/updraft-aware towers
-  and anvils, soft cloud illumination, size-distributed raindrops and snow crystals, wind-sheared
-  six-plane cylindrical rainshafts, denoised/reprojected cloud upsampling, helical
+* **Rendering** — ray-marched clouds with advected Perlin-Worley billows, cauliflower-creased
+  updraft towers, wind-drawn fibrous anvils, ice/updraft-aware shaping, soft cloud illumination,
+  size-distributed raindrops with fall-speed-proportional motion-blur streaks and snow crystals,
+  anisotropic fall-streaked, haze-blended wind-sheared six-plane cylindrical rainshafts, a
+  sheet-rain spray veil under heavy rain, denoised/reprojected cloud upsampling, helical
   condensation funnel and debris, player-driven intercept vehicle, mitered/tapered lightning
-  ribbons, terrain, water and synthesised thunder.
+  ribbons, terrain, water and synthesised thunder. The GPU fluid field is integrated at half
+  the frame rate to keep the frame loop hitch-free.
+* **Diurnal cycle** — the mixed-layer depth deepens with daylight hours since sunrise
+  (~0.35 km at dawn to ~2.2 km by late afternoon) and nocturnal radiative cooling caps the
+  surface layer, so convection initiates in the afternoon; surface momentum drag includes
+  TKE-driven gustiness (Deacon-style).
 
 ## Notes
 
