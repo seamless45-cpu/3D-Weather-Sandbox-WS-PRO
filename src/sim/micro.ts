@@ -103,10 +103,12 @@ export function microphysics(a: Atmosphere, dt: number) {
           }
         }
       }
-      // 6. collision-coalescence (autoconversion + accretion)
+      // 6. collision-coalescence: Berry-Reinhardt-style smooth autoconversion (no hard threshold —
+      //    the rate depends on droplet number concentration Nc ~ dropletSpawn, so polluted air with
+      //    many small droplets rains out far more slowly than clean maritime air) + accretion.
       if (tqc > 1e-9) {
-        const autoThr = 5e-4 * P.dropletSpawn;                       // more droplets -> higher threshold
-        const auto = tqc > autoThr ? (1.2e-3 * (tqc - autoThr) * P.precipEfficiency) / P.dropletSpawn : 0;
+        const nc = Math.max(0.2, P.dropletSpawn);
+        const auto = (1.6e-3 * tqc * tqc * P.precipEfficiency) / (2e-4 * nc + tqc);
         const accr = tqr > 1e-9 ? 2.2 * tqc * Math.pow(tqr, 0.875) * P.precipEfficiency : 0;
         const conv = Math.min(tqc, dt * (auto + accr));
         tqc -= conv; tqr += conv;

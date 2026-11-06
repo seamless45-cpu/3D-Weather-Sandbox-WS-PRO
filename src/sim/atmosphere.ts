@@ -5,7 +5,7 @@
  * Pressure is obtained by an exact FFT/tridiagonal solve of the discrete variable-density Poisson equation.
  * Buoyancy uses virtual potential temperature and condensate loading; latent heating is applied in microphysics.
  */
-import { Grid, makeGrid, G, CP, LV, LF, SIGMA, EPS0, DOMAIN, mulberry32 } from './consts';
+import { Grid, makeGrid, G, CP, LV, LF, SIGMA, EPS, EPS0, DOMAIN, mulberry32 } from './consts';
 import { Profile, buildProfile, Environment, envForCape, qsl } from './thermo';
 import { SimParams, clampParams } from './params';
 import { Poisson } from './fft';
@@ -15,6 +15,7 @@ import { microphysics, sedimentation, chargeDecay } from './micro';
 import { chargeSeparation, emptyChargeDiagnostics, type ChargeDiagnostics } from './charging';
 import { TornadoSystem } from './tornado';
 import { tryLightning } from './lightning';
+import { radiationTendencies, surfaceEmissivity } from './radiation';
 
 export interface Stats {
   maxW: number; minW: number; maxQc: number; maxQi: number; maxQr: number; maxQg: number; maxRain: number;
@@ -31,6 +32,8 @@ export class Atmosphere {
   u!: Float32Array; v!: Float32Array; w!: Float32Array;
   th!: Float32Array; qv!: Float32Array; qc!: Float32Array; qi!: Float32Array; qr!: Float32Array; qs!: Float32Array; qg!: Float32Array;
   qh!: Float32Array; ql!: Float32Array; tke!: Float32Array; pi!: Float32Array;
+  /** Per-cell radiative temperature tendencies [K/s] (longwave / shortwave), refreshed each step. */
+  radLw!: Float32Array; radSw!: Float32Array;
   uc!: Float32Array; vc!: Float32Array; wc!: Float32Array; uc0!: Float32Array; vc0!: Float32Array; wc0!: Float32Array;
   Km!: Float32Array; Kh!: Float32Array; tmp!: Float32Array; rhs!: Float32Array;
   M0!: Float32Array; M1!: Float32Array; M2!: Float32Array; M3!: Float32Array;
@@ -82,6 +85,7 @@ export class Atmosphere {
     this.u = F(n3); this.v = F(n3); this.w = F(nxy * (nz + 1));
     this.th = F(n3); this.qv = F(n3); this.qc = F(n3); this.qi = F(n3); this.qr = F(n3); this.qs = F(n3); this.qg = F(n3);
     this.qh = F(n3); this.ql = F(n3); this.tke = F(n3); this.pi = F(n3);
+    this.radLw = F(n3); this.radSw = F(n3);
     this.uc = F(n3); this.vc = F(n3); this.wc = F(n3); this.uc0 = F(n3); this.vc0 = F(n3); this.wc0 = F(n3);
     this.Km = F(n3); this.Kh = F(n3); this.tmp = F(n3); this.rhs = F(n3);
     this.M0 = F(n3); this.M1 = F(n3); this.M2 = F(n3); this.M3 = F(n3);
@@ -401,17 +405,33 @@ export class Atmosphere {
     for (let ij = 0; ij < nxy; ij++) {
       const c = this.cols;
       const fW = c.fW[ij], fF = c.fF[ij], fR = Math.min(c.fR[ij], 1 - fF), fG = Math.max(0, 1 - fW - fF - fR);
-      const z0 = Math.exp(fW * Math.log(5e-4) + fF * Math.log(1.0) + fR * Math.log(0.15) + fG * Math.log(0.05));
-      const lnr = Math.log(zc0 / z0);
-      const Cd = (0.4 / lnr) * (0.4 / lnr);
-      const Ch = 0.8 * Cd;
+      // Monin-Obukhov surface layer: iterate u*, theta*, q* and the Obukhov length with
+      // Businger-Dyer stability functions. Over water the roughness length follows Charnock
+      // (z0 ~ alpha u*^2 / g), so it grows with the wind instead of staying fixed.
+      const z0land = Math.exp(fF * Math.log(1.0) + fR * Math.log(0.15) + fG * Math.log(0.05));
       const Ta = this.th[ij] * pr.pi[0];
       const qa = this.qv[ij];
       const Vh = Math.hypot(this.uc0[ij], this.vc0[ij]);
       const V = Math.sqrt(Vh * Vh + 0.6 + 2.5 * this.tke[ij]);
       const Ts = this.Ts[ij];
-      const dT = Ts - Ta;
-      const fs = dT > 0 ? 1 + 0.05 * Math.min(dT, 15) : Math.max(0.1, 1 / (1 + 0.4 * -dT));
+      const qss = qsl(Ts, p0);
+      let z0 = fW > 0.5 ? 5e-4 : z0land;
+      let ustar = (0.4 * V) / Math.log(zc0 / z0);
+      let tstar = (0.4 * (Ts - Ta)) / Math.log(zc0 / z0);
+      let qstar = (0.4 * (qss - qa)) / Math.log(zc0 / z0);
+      for (let it = 0; it < 4; it++) {
+        if (fW > 0.5) z0 = Math.max(1e-4, (0.014 * ustar * ustar) / G); // Charnock
+        const lnz = Math.log(zc0 / z0);
+        const L = (-Math.pow(ustar, 3) * Ta) / (0.4 * G * (tstar + 0.61 * Ta * qstar) + 1e-12);
+        const x = Math.max(-50, Math.min(50, zc0 / L));
+        const y = Math.sqrt(Math.max(0, 1 - 16 * Math.min(0, x)));
+        const psiM = x >= 0 ? -5 * x : 2 * Math.log((1 + y) / 2) + Math.log((1 + y * y) / 2) - 2 * Math.atan(y) + Math.PI / 2;
+        const psiH = x >= 0 ? -5 * x : 2 * Math.log((1 + y * y) / 2);
+        const dm = Math.max(0.5, lnz - psiM), dh = Math.max(0.5, lnz - psiH);
+        ustar = (0.4 * V) / dm;
+        tstar = (0.4 * (Ts - Ta)) / dh;
+        qstar = (0.4 * (qss - qa)) / dh;
+      }
       // shortwave: slope-aware direct beam with cloud attenuation
       const sx = -c.dhdx[ij], sy = -c.dhdy[ij];
       const nrm = Math.hypot(sx, sy, 1);
@@ -424,18 +444,20 @@ export class Atmosphere {
       const Cs = fW * 3e7 + (1 - fW) * (fF * 4e5 + fR * 5e5 + fG * 2.5e5);
       const soil = this.soilM[ij];
       const wet = fW > 0.5 ? 1 : this.surfW[ij] > 0.2 ? 1 : Math.min(1, Math.max(fF > 0.5 ? 0.35 : 0.05, soil / 0.5));
-      const H = rho * CP * Ch * V * fs * dT;
-      const qss = qsl(Ts, p0);
+      const H = rho * CP * ustar * tstar;
       const evapMul = fW > 0.5 ? this.params.lakeEvap : this.params.landEvap;
-      let LE = rho * LV * Ch * V * fs * wet * (qss - qa) * evapMul;
+      let LE = rho * LV * ustar * qstar * wet * evapMul;
       if (LE < 0) LE *= 0.3;
-      const LWdown = 5.67e-8 * Ta * Ta * Ta * Ta * (0.7 + 0.27 * (1 - tc));
+      // Downwelling longwave: Brutsaert clear-sky emissivity from boundary-layer vapour pressure,
+      // lifted toward blackbody by the column's cloud optical depth.
+      const eHpa = (qa * p0) / (EPS + qa) / 100;
+      const LWdown = surfaceEmissivity(eHpa, Ta, this.tauCol[ij]) * SIGMA * Ta * Ta * Ta * Ta;
       const LWnet = 0.97 * SIGMA * Ts * Ts * Ts * Ts - 0.97 * LWdown;
       const Gf = fW > 0.5 ? 0 : 6 * (Ts - this.Tdeep[ij]);
       this.Ts[ij] = Ts + (dt * ((1 - alb) * S - LWnet - H - LE - Gf)) / Cs;
       const noise = 1 + 0.5 * (this.rng() - 0.5); // stochastic sub-grid thermal triggering of the flux
       this.Hf[ij] = H * (H > 0 ? noise : 1); this.LEf[ij] = LE;
-      this.ustar[ij] = Math.sqrt(Cd) * V;
+      this.ustar[ij] = ustar;
       this.srcEnergy += (H + LE) * dt * area;
       evap += (LE / LV) * dt * area;
       // soil moisture / surface water budget (kg m-2)
@@ -504,15 +526,17 @@ export class Atmosphere {
       const z = g.zc[k];
       const tau = z < 1500 ? 3600 : 2400;
       const du = ((pr.u[k] - mu[k]) * dt) / tau, dv = ((pr.v[k] - mv[k]) * dt) / tau;
-      // radiative cooling (-1.5 K/day in troposphere), weak mean-theta relaxation (synoptic advection), mean-moisture advection from outside the periodic box
-      const rad = z < 12000 ? (-1.5 / 86400) * dt / pr.pi[k] : 0;
+      // Interactive broadband radiation (clear-sky LW shaped by humidity, cloud-top/base LW,
+      // water-vapour + ozone SW heating) replaces the old flat -1.5 K/day; weak mean-theta
+      // relaxation (synoptic advection) and mean-moisture advection remain.
+      const radBase = 0; void radBase;
       // Diurnal boundary-layer cycle: solar heating deepens and moistens the mixed layer
       // through the day (surface CAPE builds to its afternoon peak), nocturnal radiative
       // cooling caps the lowest levels (CAPE collapses overnight). The CAPE slider sets the
       // sounding; the sun makes the realised instability live instead of static.
       const dthDiurnal = dt * (dayH * (0.85 / 3600) * Math.max(0, 1 - z / 1500)
         - nightH * (0.6 / 3600) * Math.exp(-z / 240));
-      const dth = rad + ((pr.th[k] - mth[k]) * dt) / (z > 12500 ? 1800 : 5 * 3600) + dthDiurnal;
+      const dth = ((pr.th[k] - mth[k]) * dt) / (z > 12500 ? 1800 : 5 * 3600) + dthDiurnal;
       const dq = z < 3000
         ? ((pr.qv[k] - mq[k]) * dt) / (3 * 3600) + dt * dayH * 9e-8 * (1 - z / 3000)
         : 0;
@@ -714,6 +738,7 @@ export class Atmosphere {
     this.diffuse(this.uc, this.Km, dt, hf); this.diffuse(this.vc, this.Km, dt, hf); this.diffuse(this.wc, this.Km, dt, hf);
     this.diffuse(this.th, this.Kh, dt, 0); this.diffuse(this.qv, this.Kh, dt, 0);
     if (this.anyHydro) { this.diffuse(this.qc, this.Kh, dt, 0); this.diffuse(this.qi, this.Kh, dt, 0); }
+    radiationTendencies(this, this.sunSin);
     this.forcing(dt);
     this.facesFromCentered();
     microphysics(this, dt);

@@ -224,10 +224,14 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   5 hydrometeor species and 2 charge species; exact FFT/tridiagonal variable-density pressure
   projection (divergence removed to round-off).
 * **Physics** — Deardorff 1.5-order TKE sub-grid closure, surface energy balance (shortwave
-  with slope/cloud shading, longwave, sensible and latent fluxes, soil moisture, runoff),
-  roughness drag, terrain lifting at the lower boundary, bulk microphysics (Kessler warm rain,
-  Bergeron/WBF, riming, graupel, melting/freezing, evaporation, sedimentation with
-  adjustable precipitation efficiency), f-plane Coriolis, LWC-dependent non-inductive/inductive
+  with slope/cloud shading, Brutsaert longwave emissivity, Monin–Obukhov sensible/latent fluxes
+  with Businger–Dyer stability functions and Charnock roughness over water, soil moisture,
+  runoff), interactive broadband radiation (clear-sky longwave cooling shaped by local
+  humidity, cloud-top cooling / cloud-base warming, water-vapour near-IR and ozone shortwave
+  heating), terrain lifting at the lower boundary, bulk microphysics (Berry–Reinhardt
+  autoconversion with CCN-dependent droplet number, accretion, Bergeron/WBF, riming, graupel,
+  melting/freezing, ventilation-limited evaporation, sedimentation with adjustable
+  precipitation efficiency), f-plane Coriolis, LWC-dependent non-inductive/inductive
   charge separation with tripole screening, and dielectric-breakdown-model lightning with branched
   channels.
 * **Rendering** — ray-marched clouds with advected Perlin-Worley billows, ice/updraft-aware towers

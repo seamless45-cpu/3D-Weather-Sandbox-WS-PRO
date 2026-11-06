@@ -14,6 +14,7 @@
  */
 import { Atmosphere } from '../src/sim/atmosphere';
 import { runValidation, parcelAscent } from '../src/sim/thermo';
+import { runRadiationValidation } from '../src/sim/radiation';
 import { DEFAULT_PARAMS, SimParams, clampParams } from '../src/sim/params';
 import { Terrain } from '../src/sim/terrain';
 
@@ -48,8 +49,11 @@ if (!isFinite(cape)) {
 
 const checks = runValidation();
 for (const c of checks) console.log(c.ok ? 'PASS' : 'FAIL', c.name, c.value, c.expect);
-const failed = checks.filter((c) => !c.ok).length;
-console.log(`validation: ${checks.length - failed}/${checks.length} passed`);
+const radChecks = runRadiationValidation();
+for (const c of radChecks) console.log(c.ok ? 'PASS' : 'FAIL', c.name, c.value, c.expect);
+const allChecks = [...checks, ...radChecks];
+const failed = allChecks.filter((c) => !c.ok).length;
+console.log(`validation: ${allChecks.length - failed}/${allChecks.length} passed`);
 
 const t0 = Date.now();
 const terr = new Terrain(256);
