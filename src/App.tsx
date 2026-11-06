@@ -362,6 +362,7 @@ export default function App() {
               <div className="lbl">SPAWN AT YOUR POSITION</div>
               <div className="flex flex-wrap gap-1">
                 <button className="hbtn" onClick={() => spawnProp('rod', 12)} title="Lightning rod — concentrates the field at its tip and attracts cloud-to-ground strikes">⚡ rod</button>
+                <button className="hbtn" onClick={() => spawnProp('srod', 20)} title="SUPER lightning rod — 10× charge attraction over a 2.6 km radius; cloud-to-ground strikes terminate at its tip">⚡ super rod</button>
                 <button className="hbtn" onClick={() => spawnProp('mast', 15)} title="Tall comms mast">📡 mast</button>
                 <button className="hbtn" onClick={() => spawnProp('shed', 2.4)} title="Equipment shed">🏠 shed</button>
                 <button className="hbtn" onClick={() => spawnProp('tree', 4)} title="Tree">🌳 tree</button>

@@ -63,7 +63,7 @@ interface Tip { x: number; y: number; z: number; s: number; dx: number; dy: numb
  *  leader → CG+. The bright stages begin only after the leader has climbed into the charge
  *  (leaderEnd), not at t≈0 as for cloud-initiated flashes.
  */
-export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Polarity, groundUp = false): FlashEvent {
+export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Polarity, groundUp = false, rodTip: [number, number, number] | null = null): FlashEvent {
   const { nx, ny, nxy } = a, g = a.g;
   const rnd = a.rng;
   const k = Math.floor(ci / nxy), ij = ci % nxy, j = Math.floor(ij / nx), i = ij % nx;
@@ -106,6 +106,13 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   // into the negative charge → CG−; positive sheet → upward negative leader → CG+).
   const az = 2 * Math.PI * rnd(), horiz = 0.35 + 0.35 * rnd(), down = Math.sqrt(1 - horiz * horiz);
   let d0: [number, number, number] = [horiz * Math.cos(az), horiz * Math.sin(az), -down];
+  if (rodTip) {
+    // Rod strike: launch the descending leader straight at the rod tip — the channel must
+    // visibly terminate on the rod, not wander off and attach to open ground.
+    const hx = rodTip[0] - x, hy = rodTip[1] - y;
+    const hl = Math.hypot(hx, hy) || 1;
+    d0 = [0.82 * hx / hl, 0.82 * hy / hl, -0.57];
+  }
   if (flavor === 'anvil') d0 = [Math.cos(az), Math.sin(az), -0.18 - 0.12 * rnd()];   // flat crawler start
   if (groundUp) {
     flavor = 'norm';
@@ -188,6 +195,13 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
           // tip up until the cloud's field takes over the driving.
           wgt = Math.max(wgt, (0.9 + 1.6 * rnd()) * (0.30 + 0.70 * fwd) * (0.45 + 0.55 * vertical));
         }
+        // Rod attraction: while a rod strike is in progress, the descending leader's space
+        // charge pulls the channel toward the rod tip — real upward leaders from a tall
+        // earthed mast win the attachment race. Strong within ~1.5 km of the rod.
+        if (rodTip && tp.s === descS) {
+          const dh2 = (px - rodTip[0]) * (px - rodTip[0]) + (py - rodTip[1]) * (py - rodTip[1]);
+          if (dh2 < 6000 * 6000) wgt = Math.max(wgt, 0.6) * (1 + 9.0 * Math.exp(-dh2 / (3000 * 3000)));
+        }
         cw.push(wgt); cg.push(grad); tot += wgt;
       }
       if (tot <= 0) {
@@ -211,6 +225,17 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
       tp.x = cx[best] + (rnd() - 0.5) * jit;
       tp.y = cy[best] + (rnd() - 0.5) * jit;
       tp.z = Math.max(25, cz[best] + (rnd() - 0.5) * jit);
+      // Rod strike: the earthed mast's upward leader wins the attachment — pull the descending
+      // channel toward the rod tip once it is in the capture neighbourhood (guarantees the
+      // bolt visibly terminates ON the rod instead of attaching to open ground nearby).
+      if (rodTip && tp.s === descS && tp.z > rodTip[2] + 40) {
+        const dh = Math.hypot(tp.x - rodTip[0], tp.y - rodTip[1]);
+        if (dh < 9000) {
+          const pull = Math.min(0.16, 260.0 / Math.max(dh, 1.0));
+          tp.x += (rodTip[0] - tp.x) * pull;
+          tp.y += (rodTip[1] - tp.y) * pull;
+        }
+      }
       // Smoother heading: real channels are long arcs with kinks, not lattice random walks.
       tp.dx = 0.78 * tp.dx + 0.22 * cdx[best]; tp.dy = 0.78 * tp.dy + 0.22 * cdy[best]; tp.dz = 0.78 * tp.dz + 0.22 * cdz[best];
       const nl = Math.hypot(tp.dx, tp.dy, tp.dz) || 1; tp.dx /= nl; tp.dy /= nl; tp.dz /= nl;
@@ -224,6 +249,20 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
       // precipitation and induction), an upward streamer meets the leader far above the
       // surface — that is how real CGs close the last few hundred metres.
       if (!grounded && flavor !== 'cc' && tp.s === descS) {
+        // Rod strike: a spawned rod is a preferred attachment point — once the descending
+        // leader closes to within ~320 m horizontally of the rod and below the cloud base,
+        // the channel terminates exactly at the rod tip (the rod is earthed, so this is
+        // where the return stroke lands). rodTip = [x, zHorizontal, tipHeight].
+        if (rodTip) {
+          const dh = Math.hypot(tp.x - rodTip[0], tp.y - rodTip[1]);
+          if (dh < 620 && tp.z < rodTip[2] + 2200) {
+            nodesX.push(rodTip[0]); nodesY.push(rodTip[1]); nodesZ.push(rodTip[2]);
+            nodeGen.push(gen); nodeParent.push(tp.node); nodeOrder.push(0);
+            phiSum += gfun(rodTip[0], rodTip[1], rodTip[2]); phiCnt++;
+            grounded = true; strikeNode = nodesX.length - 1; attachGen = gen; phiCh = 0; tp.alive = false;
+            continue;
+          }
+        }
         const tGround = Math.max(0, ground(tp.x, tp.y));
         let attachDist = 70;
         if (tp.z - tGround < 700) {
@@ -279,7 +318,7 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
   // streamers rise from surface tips (grass, roughness, the charged sheet itself) and the
   // strongest one meets the leader a few hundred metres up — the last stretch of every real
   // CG is closed by this ground-launched streamer, not by the cloud leader touching soil.
-  if (grounded && !groundUp && strikeNode >= 0) {
+  if (grounded && !groundUp && strikeNode >= 0 && !rodTip) {
     const sx = nodesX[strikeNode], sy = nodesY[strikeNode], sz = nodesZ[strikeNode];
     const gz = Math.max(0, ground(sx, sy));
     const nStream = 4;
@@ -412,6 +451,10 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
           const c = k * nxy + ij;
           const q = a.qh[c] + a.ql[c];
           if (polarity === 'neg' ? q >= 0 : q <= 0) continue;   // wrong-sign charge cell
+          // Strikes always originate from cloud, not from clear air: the initiation cell
+          // must actually contain condensate/ice (a charge region without cloud is a
+          // numerical leftover, and a flash starting there reads as lightning from nowhere).
+          if (a.qc[c] + a.qi[c] < 2e-4) continue;
           const r = a.emag[c] / eth;
           if (r > bestR) {
             const jj = Math.floor(ij / nx), ii = ij % nx;
@@ -446,19 +489,27 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
   // total surface field has pushed, so flashes appear only where charge really piled up.
   // A lightning rod in the domain opens the ground gate on its own (its tip field stands
   // out even where the ambient sheet is weak).
-  const anyRod = a.props.some((pr) => pr.type === 'rod');
+  // Rods: 'rod' = standard (x1 attraction, 900 m), 'srod' = super rod (x10 attraction,
+  // 2.6 km capture radius). The tip field enhancement scales ~ h / r_tip.
+  const rods = a.props.filter((pr) => pr.type === 'rod' || pr.type === 'srod');
+  const anyRod = rods.length > 0;
   if (a.qgMax > 1.2e-7 || anyRod) {
     a.gd.call++;
     let gBest = -1, gR = 0.55, gI = -1, gJ = -1;
+    let gRod: { x: number; z: number; h: number; boost: number } | null = null;
     for (let ij = 0; ij < nxy; ij++) {
       const qg = a.qGround[ij];
-      let rodBoost = 0;
-      for (const pr of a.props) {
-        if (pr.type !== 'rod') continue;
+      let rodBoost = 0, rodB: { x: number; z: number; h: number; boost: number } | null = null;
+      for (const pr of rods) {
+        const isSuper = pr.type === 'srod';
+        const R = isSuper ? 2600 : 900, mult = isSuper ? 10 : 1;
         let dx = Math.abs(((ij % nx) * a.g.dx) - pr.x); dx = Math.min(dx, nx * a.g.dx - dx);
         let dz = Math.abs((Math.floor(ij / nx) * a.g.dy) - pr.z); dz = Math.min(dz, ny * a.g.dy - dz);
         const d = Math.hypot(dx, dz);
-        if (d < 900) rodBoost = Math.max(rodBoost, (1.9 * (pr.h / 12)) * (1 - d / 900) * (1 - d / 900));
+        if (d < R) {
+          const b = mult * (1.9 * (pr.h / 12)) * (1 - d / R) * (1 - d / R);
+          if (b > rodBoost) { rodBoost = b; rodB = { x: pr.x, z: pr.z, h: pr.h, boost: b }; }
+        }
       }
       if (Math.abs(qg) < 1.4e-7 && rodBoost < 0.25) continue;
       a.gd.cand++;
@@ -478,7 +529,7 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
         let dy = Math.abs(jj - u[1]); dy = Math.min(dy, ny - dy);
         if (dx < 6 && dy < 6) { ok = false; break; }
       }
-      if (ok) { gR = r; gBest = ij; gI = ii; gJ = jj; }
+      if (ok) { gR = r; gBest = ij; gI = ii; gJ = jj; gRod = rodB; }
       else if (r > 0.55) a.gd.blk++;
     }
     if (gBest >= 0) a.gd.sel++;
@@ -487,8 +538,57 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
     // fires readily, a marginal sheet only occasionally.
     if (gBest >= 0 && (a.gd.roll++, a.rng() < Math.min(0.55, 0.06 + Math.max(0, gR - 0.55) * 2.5) * Math.min(1, p * 1.4))) {
       used.push([gI, gJ, 0]);
-      out.push(growFlash(a, gBest, gR, a.qGround[gBest] < 0 ? 'neg' : 'pos', true));
-      a.flashCount++;
+      // Rod-dominated cell: the strike is a cloud-initiated CG that terminates at the rod
+      // tip — never a bolt appearing out of mid-air. Find the strongest negative charge
+      // cell within 6 km of the rod to launch the descending leader from the cloud.
+      if (gRod && gRod.boost >= 0.45 * gR) {
+        // Look near the rod first (10 km); if the local cloud is too weak, fall back to the
+        // strongest negative charge cell anywhere — the leader still terminates at the rod.
+        let cBest = -1, cR = 0.55;
+        for (let k = 0; k < nz; k++) {
+          const z = a.g.zc[k];
+          if (z > 8800) continue;
+          const eth = a.thresholdE(k);
+          for (let ij = 0; ij < nxy; ij++) {
+            const c = k * nxy + ij;
+            const q = a.qh[c] + a.ql[c];
+            if (q >= 0) continue;                       // negative leader needs negative charge
+            if (a.qc[c] + a.qi[c] < 2e-4) continue;      // must start inside cloud
+            const ii = ij % nx, jj = Math.floor(ij / nx);
+            let dx = Math.abs(ii * a.g.dx - gRod.x); dx = Math.min(dx, nx * a.g.dx - dx);
+            let dz = Math.abs(jj * a.g.dy - gRod.z); dz = Math.min(dz, ny * a.g.dy - dz);
+            if (Math.hypot(dx, dz) > 10000) continue;
+            const r = a.emag[c] / eth;
+            if (r > cR) { cR = r; cBest = c; }
+          }
+        }
+        if (cBest < 0) {
+          for (let k = 0; k < nz; k++) {
+            const z = a.g.zc[k];
+            if (z > 8800) continue;
+            const eth = a.thresholdE(k);
+            for (let ij = 0; ij < nxy; ij++) {
+              const c = k * nxy + ij;
+              const q = a.qh[c] + a.ql[c];
+              if (q >= 0) continue;
+              if (a.qc[c] + a.qi[c] < 2e-4) continue;
+              const r = a.emag[c] / eth;
+              if (r > cR) { cR = r; cBest = c; }
+            }
+          }
+        }
+        if (cBest >= 0) {
+          const tipH = Math.max(0, a.terrain.groundHeight(gRod.x, gRod.z)) + gRod.h;
+          out.push(growFlash(a, cBest, cR, 'neg', false, [gRod.x, gRod.z, tipH]));
+          a.flashCount++;
+        } else {
+          out.push(growFlash(a, gBest, gR, a.qGround[gBest] < 0 ? 'neg' : 'pos', true));
+          a.flashCount++;
+        }
+      } else {
+        out.push(growFlash(a, gBest, gR, a.qGround[gBest] < 0 ? 'neg' : 'pos', true));
+        a.flashCount++;
+      }
       // The return stroke dumps the local surface sheet into the channel: drain it in a
       // ~1 km patch around the strike so ground flashes self-limit — the sheet has to
       // recharge through precipitation before the same spot can fire again.
