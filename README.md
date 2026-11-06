@@ -233,7 +233,9 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   melting/freezing, ventilation-limited evaporation, sedimentation with adjustable
   precipitation efficiency), f-plane Coriolis, LWC-dependent non-inductive/inductive
   charge separation with tripole screening, and dielectric-breakdown-model lightning with branched
-  channels.
+  channels. Evaporation/sublimation of rain, snow and graupel uses a unified ventilation-corrected
+  two-resistance bulk scheme (Pruppacher & Klett form) with a latent-heat budget cap, and cloud
+  condensation rates scale with updraft strength.
 * **Rendering** — ray-marched clouds with advected Perlin-Worley billows, cauliflower-creased
   updraft towers, wind-drawn fibrous anvils, ice/updraft-aware shaping, soft cloud illumination,
   size-distributed raindrops with fall-speed-proportional motion-blur streaks and snow crystals,
@@ -242,6 +244,9 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   condensation funnel and debris, player-driven intercept vehicle, mitered/tapered lightning
   ribbons, terrain, water and synthesised thunder. The GPU fluid field is integrated at half
   the frame rate to keep the frame loop hitch-free.
+* **Storm-frame stability** — consecutive 250 ms solver snapshots are temporally blended on the
+  CPU before upload, and the adaptive march controls (step scale, step budget) are EMA-smoothed,
+  so storm load no longer steps the cloud field or pops march brightness frame to frame.
 * **Diurnal cycle** — the mixed-layer depth deepens with daylight hours since sunrise
   (~0.35 km at dawn to ~2.2 km by late afternoon) and nocturnal radiative cooling caps the
   surface layer, so convection initiates in the afternoon; surface momentum drag includes

@@ -586,10 +586,12 @@ void main(){
   float inten = clamp(pow(max(s.g, 1e-5), 0.34) * local, 0.0, 1.0);
   float ph = fract(uTime * (1.6 + 0.8 * aDrop.x) + aSeed.z * 13.0 + aDrop.z);
   // Soft gates: the old hard steps popped splashes in/out with every cloud snapshot.
+  // Splashes ring both wet ground and open water (water surface sits at y=0).
+  float onWater = step(-2.0, gh) * (1.0 - step(0.05, gh));
   float gate = (1.0 - smoothstep(inten * 0.9 - 0.06, inten * 0.9 + 0.10, fract(aSeed.z * 37.7 + aDrop.z)))
-    * smoothstep(0.003, 0.013, s.g) * step(0.0, gh);
-  float r = (0.035 + 0.16 * ph) * (0.7 + 0.7 * aDrop.x);
-  vec3 wp = vec3(xz.x + position.x * 2.0 * r, gh + 0.03, xz.y + position.y * 2.0 * r);
+    * smoothstep(0.003, 0.013, s.g) * step(-2.0, gh);
+  float r = (0.035 + 0.16 * ph) * (0.7 + 0.7 * aDrop.x) * (1.0 + 2.2 * onWater);
+  vec3 wp = vec3(xz.x + position.x * 2.0 * r, max(gh, 0.0) + 0.03, xz.y + position.y * 2.0 * r);
   vPh = ph; vP = position.xy * 2.0; vShape = aDrop.w;
   vDist = length(rel);
   vVis = gate * edge * (1.0 - smoothstep(26.0, 48.0, vDist));
@@ -1094,7 +1096,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   float wStratus = 1.0 - smoothstep(0.34, 0.50, regime);
   float wCirrus = smoothstep(0.62, 0.80, regime);
   float wCumulus = clamp(1.0 - wStratus - wCirrus, 0.0, 1.0);
-  float cover = smoothstep(0.003 + 0.011 * nR.g, 0.52 + 0.16 * nR.b, base);
+  float cover = smoothstep(0.002 + 0.008 * nR.g, 0.44 + 0.14 * nR.b, base);
   vec4 nA = textureLod(uNoise, np / broadP, nlod(t, broadP));
   // A gentle domain-periodic organisation: broad bands + cellular billows, no per-frame drift.
   float broad = 0.58 * nA.r + 0.42 * (1.0 - nA.g);
@@ -1104,7 +1106,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   vec3 np2 = np + vec3(warp.x, warp.y * 0.25, warp.y);
   vec4 nB = textureLod(uNoise, np2 / midP, nlod(t, midP));
   // Second, finer warp: this is what turns smooth blobs into lobed cauliflower with creases.
-  vec2 warp2 = (nB.ba - 0.5) * 165.0;
+  vec2 warp2 = (nB.ba - 0.5) * 115.0;
   vec3 np3 = np2 + vec3(warp2.x, warp2.y * 0.4, warp2.y);
   vec4 nC = textureLod(uNoise, np3 / midP, nlod(t, midP));
   float towerW = smoothstep(0.04, 0.82, updraft);
@@ -1117,7 +1119,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   // Cauliflower: inside strong updraft towers the lobes sharpen into deep creased domes
   // (pow > 1 on the ridged field) — the signature look of a growing cumulonimbus turret.
   float cauli = pow(1.0 - abs(2.0 * nC.g - 1.0), 1.9);
-  float lowShape = cover * (0.46 + 0.58 * billow + 0.34 * lobes) * (0.84 + 0.28 * band);
+  float lowShape = cover * (0.52 + 0.66 * billow + 0.30 * lobes) * (0.86 + 0.26 * band);
   // ---- cloud types selected by the regional regime field
   // cumulus humilis: small puffy fair-weather fields with a hard ceiling
   float humShape = cover * smoothstep(150.0, 500.0, p.y) * (1.0 - smoothstep(1700.0, 3100.0, p.y))
@@ -1140,7 +1142,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   float cumulusShape = mix(lowShape, humShape, 0.45);
   float bg = wStratus * stratusShape + wCumulus * cumulusShape + wCirrus * cirrusShape;
   bg = max(bg, 0.28 * lowShape);   // the solver's structure always shows through
-  float towerShape = cover * (0.48 + 0.60 * billow + 0.40 * mix(lobes, cauli, towerW)) * (0.84 + 0.36 * towerW) * (0.90 + 0.20 * band);
+  float towerShape = cover * (0.54 + 0.66 * billow + 0.36 * mix(lobes, cauli, towerW)) * (0.86 + 0.34 * towerW) * (0.92 + 0.18 * band);
   float anvilShape = cover * (0.62 + 0.46 * nA.r) * (0.84 + 0.30 * nC.r) * (1.0 - 0.12 * billow);
   // Wind-drawn anvil fibres: at anvil heights sample the noise stretched hard along the
   // wind (x) and compressed across it, so the ice cap breaks into streaks streaming
@@ -1158,7 +1160,7 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   if (wCirrus > 0.05) shape *= 1.0 - 0.35 * wCirrus * anvilW * (1.0 - fib);
   if (!detail) return clamp(shape, 0.0, 1.0);
   float mid = 0.60 * nC.r + 0.40 * (1.0 - nC.g);
-  shape *= 0.82 + mix(0.34, 0.22, uDenoise) * mid;
+  shape *= 0.88 + mix(0.24, 0.16, uDenoise) * mid;
   float fine = nC.b * 0.62 + nC.a * 0.38;
   if (t < 3400.0) {
     vec4 nD = textureLod(uNoise, np3 / fineP, nlod(t, fineP));
@@ -1166,11 +1168,11 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   }
   edge = 1.0 - smoothstep(0.08, 0.72, shape);
   // Erosion eats exposed edges more than cores; the lobe term carves the creases deeper.
-  float erosion = (1.0 - fine) * mix(0.14 + 0.36 * edge, 0.09 + 0.22 * edge, uDenoise) * mix(0.70, 1.05, 1.0 - iceW);
-  erosion += (1.0 - lobes) * 0.12 * edge;
+  float erosion = (1.0 - fine) * mix(0.08 + 0.22 * edge, 0.05 + 0.14 * edge, uDenoise) * mix(0.55, 0.90, 1.0 - iceW);
+  erosion += (1.0 - lobes) * 0.07 * edge;
   float d = clamp((shape - erosion) / max(0.24, 1.0 - erosion * 0.60), 0.0, 1.0);
   // Soft cutoff: hard density thresholds are what make a voxel grid read as stacked boxes.
-  return smoothstep(0.0, 0.18, d) * d;
+  return smoothstep(0.0, 0.26, d) * d;
 }
 
 float sunTau(vec3 p){
@@ -1364,6 +1366,7 @@ export const compFrag = /* glsl */ `
 uniform sampler2D uScene; uniform sampler2D uCloudRT; uniform sampler2D uCloudAux;
 uniform float uExposure; uniform float uTime; uniform vec2 uRes; uniform vec2 uCloudRes;
 uniform float uCheapUpsample; uniform float uDenoise;
+uniform float uRainIntensity; uniform float uHeavyRain; uniform float uCamCloud;
 varying vec2 vUv;
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
 
@@ -1419,6 +1422,10 @@ void main(){
     c.rgb = mix(c.rgb, (c.rgb * 2.0 + rad) / (2.0 + wsum), 0.45 * uDenoise);
   }
   vec3 col = scene * c.a + c.rgb;
+  // Looking through heavy local rain: a faint cool desaturating veil (rain haze), suppressed
+  // when the camera is inside cloud (the cloud pass already handles that murk).
+  float rainVeil = uRainIntensity * (0.35 + 0.65 * uHeavyRain) * (1.0 - uCamCloud);
+  col = mix(col, col * vec3(0.86, 0.92, 1.03) + vec3(0.006), 0.34 * rainVeil);
   col *= uExposure;
   col = aces(col);
   float vg = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.2);
