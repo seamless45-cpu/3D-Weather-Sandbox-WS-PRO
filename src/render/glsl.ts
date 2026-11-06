@@ -522,6 +522,7 @@ void main(){
   vec3 side = normalize(cross(dirV, toCam) + vec3(1e-5));
   vec3 wp = center + dirV * (position.y * len) + side * (position.x * wid * 2.0);
   vQ = position.xy * 2.0;
+  vDist = dist;
   vDist = dist; vFlake = flake; vClass = cls; vGlint = glint; vPhase = phase; vShape = shape;
   float fwd = pow(max(dot(-toCam, uSunDir), 0.0), 8.0);
   // Cool grey-blue streak body (not near-white): inside a rain core every drop's gate opens,
@@ -685,7 +686,7 @@ ${COMMON}
 ${TERRAIN_FN}
 attribute vec3 aSeed;
 attribute vec4 aDrop;   // size, phase, height fraction, tint
-varying float vA; varying vec3 vCol; varying vec2 vQ;
+varying float vA; varying vec3 vCol; varying vec2 vQ; varying float vDist;
 void main(){
   vec2 box = vec2(240.0, 240.0);
   vec2 rel = mod(aSeed.xy * box + uWindDrift * (0.20 + 0.10 * aDrop.x) - cameraPosition.xz + box * 0.5, box) - box * 0.5;
@@ -732,10 +733,13 @@ void main(){
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 export const mistFrag = /* glsl */ `
-varying float vA; varying vec3 vCol; varying vec2 vQ;
+varying float vA; varying vec3 vCol; varying vec2 vQ; varying float vDist;
 void main(){
   // Anisotropic falloff matching the stretched quad: tight across, long along the fall.
   float a = exp(-(vQ.x * vQ.x * 3.6 + vQ.y * vQ.y * 0.22)) * vA;
+  // Fragment-level near fade: mist puffs are large quads, so vertex-level fading alone left
+  // close fragments opaque — speckle grain when standing inside the rain core.
+  a *= smoothstep(6.0, 30.0, vDist);
   // Fine vertical striations so the veil reads as countless streaks, not one soft blob.
   a *= 0.72 + 0.42 * vnoise2(vec2(vQ.y * 26.0, vQ.x * 2.0));
   if (a < 0.004) discard;
@@ -758,14 +762,14 @@ uniform float uSnowLevel;
 #define SHAFT_PLANES 6.0
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
-varying vec2 vFlow; varying float vFace;
+varying vec2 vFlow; varying float vFace; varying float vY;
 void main(){
   vec2 xz = aCol.xy;
   float rain = texture(uSurf, xz / uDomain).g;
   float layer = aCol.w;
   float seed = fract(aCol.z + layer * 0.371);
   vRain = 0.0; vU = 0.0; vV = 0.0; vSeed = seed; vSnow = 0.0; vDist = 0.0;
-  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0; vFlow = vec2(0.0); vFace = 1.0;
+  vWorld = vec2(0.0); vLayer = layer; vHook = 0.0; vFlow = vec2(0.0); vFace = 1.0; vY = 0.0;
   if (rain <= 0.008 || seed > max(1.0, uPrecipDensity)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   // Wrap precipitation around the mesocyclone, leaving a dry lower inflow notch.
   vec2 tv = xz - uTornado.xy;
@@ -823,6 +827,7 @@ void main(){
   vU = h;
   vV = across * 2.0;
   vWorld = vec2(p.x, p.z);
+  vY = p.y;
   vSnow = smoothstep(uSnowLevel - 300.0, uSnowLevel + 800.0, y);
   vDist = length(cameraPosition - p);
 }`;
@@ -832,7 +837,7 @@ uniform sampler3D uNoise;
 uniform float uLodScale;   // texels-per-metre-per-pixel for the noise volume
 varying float vRain; varying float vU; varying float vV; varying float vSeed; varying float vSnow;
 varying float vDist; varying vec2 vWorld; varying float vLayer; varying float vHook;
-varying vec2 vFlow; varying float vFace;
+varying vec2 vFlow; varying float vFace; varying float vY;
 void main(){
   if (vRain < 0.01) discard;
   // Kill the edge-on artifact: a shaft plane viewed edge-on is a full-height 1-px line.
@@ -881,6 +886,11 @@ void main(){
   a *= 1.0 - 0.30 * (1.0 - smoothstep(0.0, 0.16, vU));
   // Near shafts must be visible; the old 120..650 m fade erased exactly the rain under the storm.
   a *= smoothstep(30.0, 170.0, vDist);   // inside a shaft the nearest planes must not flash across the lens
+  // Fragment-level near fade: the vertex fade above is interpolated across huge planes, so
+  // fragments much closer than their vertices stayed fully opaque and speckled (grain)
+  // whenever the camera sat inside a rain core.
+  float fDist = length(cameraPosition - vec3(vWorld.x, vY, vWorld.y));
+  a *= smoothstep(22.0, 130.0, fDist);
   a *= 1.0 - smoothstep(14000.0, 28000.0, vDist);
   // Far shafts soften their internal stripes so distant curtains read as volume, not bands.
   float far = smoothstep(2500.0, 12000.0, vDist);
@@ -1385,7 +1395,7 @@ void main(){
   b2 *= 1.0 - 0.9 * uCamCloud;   // inside cloud: trust the (cheap, short) current march
   // Even a rejected history keeps a fifth of its weight: full rejection flashed the raw
   // jittered march back in and read as grain/flicker on every snapshot tick.
-  b2 = max(b2, 0.20 * valid);
+  b2 = max(b2, mix(0.20, 0.38, uCamCloud) * valid);
   outColor = mix(vec4(L, T), hist, b2);
   outAux = vec4(tMean, T, 0.0, 1.0);
 }

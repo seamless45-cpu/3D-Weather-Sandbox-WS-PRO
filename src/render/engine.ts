@@ -830,11 +830,15 @@ export class Engine {
       const sub = new THREE.Group();
       sub.position.set(pr.x, gh, pr.z);
       sub.rotation.y = (pr.x * 0.37 + pr.z * 0.11) % (Math.PI * 2);
-      if (pr.type === 'rod') {
-        // lightning rod: base, mast, sharp tip — the sim concentrates the field at this tip
-        local(sub, new THREE.CylinderGeometry(0.5, 0.7, 0.3, 10), wood, 0, 0.15, 0);
-        local(sub, new THREE.CylinderGeometry(0.075, 0.10, pr.h, 10), rod, 0, pr.h / 2 + 0.3, 0);
-        local(sub, new THREE.CylinderGeometry(0.09, 0.09, 0.12, 10), [1.0, 0.85, 0.3], 0, pr.h + 0.36, 0);
+      if (pr.type === 'rod' || pr.type === 'srod') {
+        // lightning rod: base, mast, sharp tip — the sim concentrates the field at this tip.
+        // 'srod' is the super rod: taller, copper, with a bright corona tip (10x attraction).
+        const isSuper = pr.type === 'srod';
+        const metal = isSuper ? [0.55, 0.32, 0.16] as [number, number, number] : rod;
+        local(sub, new THREE.CylinderGeometry(isSuper ? 0.9 : 0.5, isSuper ? 1.1 : 0.7, 0.3, 10), wood, 0, 0.15, 0);
+        local(sub, new THREE.CylinderGeometry(isSuper ? 0.11 : 0.075, isSuper ? 0.15 : 0.10, pr.h, 10), metal, 0, pr.h / 2 + 0.3, 0);
+        local(sub, new THREE.CylinderGeometry(isSuper ? 0.16 : 0.09, isSuper ? 0.16 : 0.09, 0.12, 10), [1.0, 0.85, 0.3], 0, pr.h + 0.36, 0);
+        if (isSuper) local(sub, new THREE.CylinderGeometry(0.34, 0.05, 1.1, 10), [0.9, 0.75, 0.4], 0, pr.h + 0.9, 0);
       } else if (pr.type === 'shed') {
         local(sub, new THREE.BoxGeometry(3.2, 2.2, 2.6), [0.55, 0.5, 0.44], 0, 1.1, 0);
         local(sub, new THREE.BoxGeometry(3.5, 0.18, 2.9), [0.35, 0.25, 0.18], 0, 2.3, 0);
