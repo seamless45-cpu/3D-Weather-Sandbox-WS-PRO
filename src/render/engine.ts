@@ -173,6 +173,7 @@ export class Engine {
   prevCloud: Uint8Array | null = null; prevSurf: Uint8Array | null = null; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   /** Thunder shock: positional shake on a fixed random axis, smooth ~11/17 Hz rattle (see render). */
   shake: { t0: number; amp: number; axis: THREE.Vector3; phaseSeed: number } | null = null;
+  private shakeRot = new THREE.Vector3();
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
   nx = 64; nz = 48;
   offPrev = new Float32Array(32); offCur = new Float32Array(32); offVel = new Float32Array(32); offT = 0;
@@ -1127,7 +1128,7 @@ export class Engine {
     // Thunder shock offset: a fixed random axis per strike, smooth ~11/17 Hz rattle (see render).
     if (this.shake) {
       const ss = (performance.now() - this.shake.t0) / 1000;
-      if (ss > 1.3) this.shake = null;
+      if (ss > 1.3) { this.shake = null; this.shakeRot.set(0, 0, 0); }
       else {
         const env = Math.min(1, ss * 55) * Math.exp(-ss * 3.4);
         // Smooth rattle: two incommensurate sines at ~11/17 Hz — comfortably below the
@@ -1142,9 +1143,14 @@ export class Engine {
         this.camera.position.x += this.shake.axis.x * a;
         this.camera.position.y += this.shake.axis.y * a;
         this.camera.position.z += this.shake.axis.z * a;
+        // A shock wave also rolls the view slightly — positional shake alone reads as drift.
+        // Kept in a separate vector: camera.rotation persists across frames, so adding into it
+        // directly would accumulate every frame's shake on top of the last.
+        const r = a * 0.012;
+        this.shakeRot.set(this.shake.axis.z * r, this.shake.axis.x * r, this.shake.axis.y * r * 0.6);
       }
     }
-    this.camera.rotation.set(cam.pitch, cam.yaw, 0);
+    this.camera.rotation.set(cam.pitch + this.shakeRot.x, cam.yaw + this.shakeRot.y, this.shakeRot.z);
     if (Math.abs(this.camera.fov - cam.fov) > 0.01) { this.camera.fov = cam.fov; this.camera.updateProjectionMatrix(); }
     this.camera.updateMatrixWorld(true);
     // ---- solver-driven vortex and intercept vehicle
@@ -1271,7 +1277,7 @@ export class Engine {
         const near = 1 / (1 + f.dist / 2500);
         // A strike that hits (nearly) at the camera is a shock wave: shake hard.
         const closeBoost = f.dist < 400 ? 1 + (400 - f.dist) / 400 : 1;
-        const amp = Math.min(0.9, 0.42 * closeBoost * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
+        const amp = Math.min(1.6, 0.95 * closeBoost * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
         if (amp > 0.015) {
           const a = new THREE.Vector3(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
           this.shake = { t0: nowMs, amp, axis: a, phaseSeed: Math.floor(Math.random() * 4096) };

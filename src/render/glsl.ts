@@ -123,7 +123,9 @@ vec3 applyFog(vec3 col, vec3 wpos){
   float dist = length(d);
   vec3 dn = d / max(dist, 1e-3);
   float f = 1.0 - exp(-dist / uVis);
-  f = max(f, smoothstep(13500.0, 21500.0, dist));
+  // Fully haze out before the geometry edges: the terrain lattice ends at +-16 km and the
+  // water plane at +-22 km — without this the domain's square bounding edge was visible.
+  f = max(f, smoothstep(9500.0, 15500.0, dist));
   f = max(f, uCamCloud * 0.92);   // inside cloud: visibility collapses, which also hides the cheap-shadow switch
 #ifdef LOWQ
   // the low tier cannot afford a full scattering integral per surface pixel
@@ -744,7 +746,7 @@ void main(){
   // close fragments opaque — speckle grain when standing inside the rain core.
   a *= smoothstep(6.0, 30.0, vDist);
   // Fine vertical striations so the veil reads as countless streaks, not one soft blob.
-  a *= 0.72 + 0.42 * vnoise2(vec2(vQ.y * 26.0, vQ.x * 2.0));
+  a *= 0.82 + 0.26 * vnoise2(vec2(vQ.y * 26.0, vQ.x * 2.0));
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
@@ -858,14 +860,14 @@ void main(){
   // Distance-based mip LOD (the march-free equivalent of nlod in the cloud pass): without it
   // the fine layers alias into crawling grain on distant curtains.
   vec2 nxy = vWorld / shaftP + vFlow * 0.00045;
-  float lod = clamp(log2(max(1.0, vDist * uLodScale / shaftP)) + 0.3, 0.0, 5.0);
+  float lod = clamp(log2(max(1.0, vDist * uLodScale / shaftP)) + 1.1, 0.0, 5.0);
   vec4 nA = textureLod(uNoise, vec3(nxy * 2.3 + vec2(vSeed * 5.0, vSeed * 3.0), vU * 0.05 - fallA * 1.35), lod);
   vec4 nB = textureLod(uNoise, vec3(nxy * 3.7 + vec2(vSeed * 11.0, vSeed * 7.0), vU * 0.52 - fallB), lod + 1.9);
   vec4 nC = textureLod(uNoise, vec3(nxy * 9.0 - vec2(vSeed * 3.0, vSeed * 13.0), vU * 0.95 - fallB * 1.7), min(lod + 3.2, 5.0));
   // Sub-columns of heavier / lighter precipitation inside one shaft.
   // Heavier AND lighter patches within a single shaft (real curtains are not an even sheet).
   float strand = 0.30 + 0.85 * (0.55 * nB.r + 0.45 * nC.a);
-  float streak = 0.20 + 0.48 * nA.r + 0.38 * nA.g + 0.66 * (nB.r * 0.5 + nB.g * 0.5) + 0.34 * (nC.r - 0.5);
+  float streak = 0.20 + 0.48 * nA.r + 0.38 * nA.g + 0.66 * (nB.r * 0.5 + nB.g * 0.5) + 0.20 * (nC.r - 0.5);
   streak *= strand;
   // Torn edges: the fine layer erodes the silhouette where it is already thin.
   float erode = 0.5 + 0.5 * (nB.g * 0.6 + nC.g * 0.4);
@@ -893,7 +895,7 @@ void main(){
   // fragments much closer than their vertices stayed fully opaque and speckled (grain)
   // whenever the camera sat inside a rain core.
   float fDist = length(cameraPosition - vec3(vWorld.x, vY, vWorld.y));
-  a *= smoothstep(22.0, 130.0, fDist);
+  a *= smoothstep(35.0, 200.0, fDist);
   a *= 1.0 - smoothstep(14000.0, 28000.0, vDist);
   // Far shafts soften their internal stripes so distant curtains read as volume, not bands.
   float far = smoothstep(2500.0, 12000.0, vDist);
@@ -1130,6 +1132,9 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   // noise that a x7 gain amplified into cloud shimmer between frames.
   vec2 wo = windOffAt(p.y) + fluidVel(p.xz) * 4.5;
   vec3 np = p + vec3(wo.x, 0.0, wo.y) + uCloudSeed;
+  // Slow domain-periodic churn boil: growing turrets visibly roil and breathe instead of
+  // being a static texture advected with the wind (constant per-frame offset keeps tiling).
+  np += vec3(6.0, 1.1, 3.0) * uTime * 0.8;
   // ---- regional regime: one very-broad periodic field gives different parts of the domain
   // different cloud character (stratus decks, cumulus fields, fibrous cirrus) and varies the
   // coverage threshold / warp strength per region — so the domain never repeats one structure.
@@ -1198,6 +1203,9 @@ float cloudDensity(vec3 p, float t, out float rainD, out float iceF, out float e
   // towers; quiescent high regions keep their regime character (cirrus stays fibrous).
   float shape = mix(bg, towerShape, hW * (0.30 + 0.70 * towerW));
   shape = mix(shape, anvilShape, anvilW);
+  // Real cloud bases are flat (condensation level): calm the lowest sliver of each column so
+  // the underside reads as a level deck instead of noise dipping to the ground.
+  shape *= mix(0.78, 1.0, smoothstep(0.03, 0.13, base));
   // the cirrus regime shears the anvil top into wind-drawn ice fibres, not smooth blobs
   if (wCirrus > 0.05) shape *= 1.0 - 0.35 * wCirrus * anvilW * (1.0 - fib);
   if (!detail) return clamp(shape, 0.0, 1.0);
@@ -1325,14 +1333,14 @@ void main(){
       float hF = clamp(p.y / 9000.0, 0.0, 1.0);
       // one-tap vertical occlusion: how much cloud sits above this sample
       float aoU = 1.0;
-      if (uCheapLight < 0.5 && d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 1.7);
+      if (uCheapLight < 0.5 && d > 0.03 && (i & 1) == 0) aoU = exp(-sampleCloud(p + vec3(0.0, 1100.0, 0.0)).r * 2.3);
       // one-tap directional (side) shading: denser cloud toward the sun means this face is
       // turned away from the light — the single biggest cue that separates real cumulus
       // from uniformly lit cotton wool.
       float sideShade = 1.0;
       if (uCheapLight < 0.5 && (i & 1) == 0) {
         float dSun = sampleCloud(p + uSunDir * 430.0).r;
-        sideShade = mix(0.70, 1.16, smoothstep(-0.30, 0.30, d - dSun));
+        sideShade = mix(0.56, 1.24, smoothstep(-0.30, 0.30, d - dSun));
       }
       float hDark = mix(0.34, 1.0, smoothstep(0.02, 0.46, hF));
       hDark *= 1.0 - 0.36 * smoothstep(0.06, 0.75, rainD);   // precipitation darkens the base
