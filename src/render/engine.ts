@@ -155,6 +155,7 @@ export class Engine {
   /** Crown-splash impact droplets ejected off wet ground under heavy rain. */
   dropMesh!: THREE.Mesh;
   funnelMesh: THREE.Mesh; debrisPoints: THREE.Points; vehicleGroup: THREE.Group;
+  propsGroup!: THREE.Group;
   /** Deployed weather-station mast (anemometer/vane/shield/gauge) beside the truck. */
   stationGroup: THREE.Group | null = null;
   /** GPU stable-fluids flow field; clouds/shafts/rain sample its velocity texture. */
@@ -349,6 +350,9 @@ export class Engine {
     }, { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
     this.vehicleGroup = this.buildVehicle(mk(T.vehicleVert, T.vehicleFrag), this.lampM, this.beamM);
     this.vehicleGroup.visible = false; this.vehicleGroup.renderOrder = 4; this.scene.add(this.vehicleGroup);
+    // player-spawned props (lightning rod, shed, tree, mast) — functional ones also live in the sim
+    this.propsGroup = new THREE.Group();
+    this.scene.add(this.propsGroup);
     // ---- weather station: instrument mast deployed beside the truck
     this.stationGroup = this.buildStation(mk(T.vehicleVert, T.vehicleFrag));
     this.stationGroup.visible = false; this.stationGroup.renderOrder = 4; this.scene.add(this.stationGroup);
@@ -671,6 +675,22 @@ export class Engine {
       if (z < 0) steerGroups.push(steer);
       spinGroups.push(spin);
     }
+    // ---- extra body detail: fenders, grille slats, wipers, rear bumper + tailgate, side
+    //      steps, roof air dam and marker pods — reads as a real chase truck, not a box.
+    for (const sx of [-1, 1]) {
+      part(new THREE.BoxGeometry(0.42, 0.16, 1.5), body, sx * 1.02, 1.42, -1.55);   // front fender
+      part(new THREE.BoxGeometry(0.42, 0.16, 1.5), body, sx * 1.02, 1.42, 1.55);    // rear fender
+    }
+    for (let gx = -0.6; gx <= 0.6; gx += 0.24) part(new THREE.BoxGeometry(0.07, 0.34, 0.03), steel, gx, 1.35, -2.40); // grille slats
+    part(new THREE.BoxGeometry(0.06, 0.02, 0.7), dark, -0.45, 1.98, -1.18, 0, 0, -0.12);  // wiper L
+    part(new THREE.BoxGeometry(0.06, 0.02, 0.7), dark, 0.45, 1.98, -1.18, 0, 0, -0.12);   // wiper R
+    part(new THREE.BoxGeometry(2.2, 0.22, 0.3), steel, 0, 0.95, 2.42);                   // rear bumper
+    part(new THREE.BoxGeometry(2.0, 0.85, 0.1), body, 0, 1.35, 2.32);                    // tailgate
+    part(new THREE.BoxGeometry(0.08, 0.12, 2.6), dark, -1.08, 0.42, 0.35);               // side step L
+    part(new THREE.BoxGeometry(0.08, 0.12, 2.6), dark, 1.08, 0.42, 0.35);                // side step R
+    part(new THREE.BoxGeometry(1.6, 0.12, 0.5), dark, 0, 2.72, -1.05);                   // roof air dam
+    for (const mx of [-0.85, -0.28, 0.28, 0.85]) part(new THREE.BoxGeometry(0.14, 0.07, 0.14), [1.0, 0.6, 0.1], mx, 2.7, -0.35, 0, 0, 0, lamp); // marker pods
+
     group.userData = { rotor, dish, probe, steerGroups, spinGroups };
     return group;
   }
@@ -784,6 +804,51 @@ export class Engine {
     this.heavyRain = Math.min(1, (typeof s.heavyRain === 'number' ? s.heavyRain : Math.min(1, rain / 55)) * 1.35);
     const load = Math.min(1, 0.45 * Math.min(1, cf / 0.5) + 0.4 * Math.min(1, cores / 8) + 0.15 * Math.min(1, rain / 80));
     this.stormLoad += (load - this.stormLoad) * 0.45;
+  }
+
+  /** Rebuild the spawned-props group from the spawner UI list. */
+  setProps(list: { x: number; z: number; type: string; h: number }[]) {
+    const g = this.propsGroup;
+    while (g.children.length) { const c = g.children.pop()!; c.traverse((o) => (o as THREE.Mesh).geometry?.dispose()); }
+    const mat = new THREE.ShaderMaterial({ vertexShader: T.vehicleVert, fragmentShader: T.vehicleFrag, uniforms: { ...this.U } });
+    const local = (sub: THREE.Group, geo: THREE.BufferGeometry, col: [number, number, number], x: number, y: number, z: number) => {
+      const n = geo.getAttribute('position').count;
+      const cc = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { cc[i * 3] = col[0]; cc[i * 3 + 1] = col[1]; cc[i * 3 + 2] = col[2]; }
+      geo.setAttribute('aColor', new THREE.BufferAttribute(cc, 3));
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set(x, y, z);
+      sub.add(m);
+    };
+    const rod = [0.75, 0.77, 0.8] as [number, number, number];
+    const wood = [0.42, 0.30, 0.18] as [number, number, number];
+    const leaf = [0.16, 0.30, 0.12] as [number, number, number];
+    for (const pr of list) {
+      const gh = Math.max(0, this.terrain.groundHeight(pr.x, pr.z));
+      const sub = new THREE.Group();
+      sub.position.set(pr.x, gh, pr.z);
+      sub.rotation.y = (pr.x * 0.37 + pr.z * 0.11) % (Math.PI * 2);
+      if (pr.type === 'rod') {
+        // lightning rod: base, mast, sharp tip — the sim concentrates the field at this tip
+        local(sub, new THREE.CylinderGeometry(0.5, 0.7, 0.3, 10), wood, 0, 0.15, 0);
+        local(sub, new THREE.CylinderGeometry(0.05, 0.07, pr.h, 10), rod, 0, pr.h / 2 + 0.3, 0);
+        local(sub, new THREE.CylinderGeometry(0.09, 0.09, 0.12, 10), [1.0, 0.85, 0.3], 0, pr.h + 0.36, 0);
+      } else if (pr.type === 'shed') {
+        local(sub, new THREE.BoxGeometry(3.2, 2.2, 2.6), [0.55, 0.5, 0.44], 0, 1.1, 0);
+        local(sub, new THREE.BoxGeometry(3.5, 0.18, 2.9), [0.35, 0.25, 0.18], 0, 2.3, 0);
+        local(sub, new THREE.BoxGeometry(0.9, 1.8, 0.08), wood, 0, 0.9, 1.32);
+      } else if (pr.type === 'tree') {
+        local(sub, new THREE.CylinderGeometry(0.12, 0.2, 1.6, 8), wood, 0, 0.8, 0);
+        local(sub, new THREE.CylinderGeometry(0.9, 0.2, 2.6, 8), leaf, 0, 2.8, 0);
+      } else if (pr.type === 'mast') {
+        local(sub, new THREE.CylinderGeometry(0.06, 0.09, pr.h * 0.8, 8), rod, 0, pr.h * 0.4, 0);
+        local(sub, new THREE.BoxGeometry(0.9, 0.06, 0.06), rod, 0, pr.h * 0.8, 0);
+        local(sub, new THREE.CylinderGeometry(0.16, 0.16, 0.1, 8), [0.9, 0.2, 0.1], 0, pr.h * 0.8 + 0.08, 0);
+      } else {
+        local(sub, new THREE.BoxGeometry(1, 1, 1), rod, 0, 0.5, 0);
+      }
+      g.add(sub);
+    }
   }
 
   /** Place the player-driven intercept vehicle from the controller's pose (yaw/pitch/roll). */
@@ -1039,7 +1104,10 @@ export class Engine {
     const mixK = Math.min(1, rawDt * 6);
     U.uCheapShadows.value += (cheap - U.uCheapShadows.value) * mixK;
     // Heavy rain must get denser, not thinner: storm load only trims in the emergency cheap path.
-    const density = Math.max(1.0, (1.0 + 0.7 * this.heavyRain - 0.04 * this.stormLoad) * (this.cheapMode ? 0.96 : 1));
+    // Standing inside the precipitation core the full particle count is both the lag source
+    // and the artificial screen-fill: thin the local particle field with the local rain rate.
+    const coreCull = 1 - 0.45 * Math.min(1, this.rainAtCam / 45);
+    const density = Math.max(0.55, (1.0 + 0.7 * this.heavyRain - 0.04 * this.stormLoad) * (this.cheapMode ? 0.96 : 1) * coreCull);
     U.uPrecipDensity.value += (density - U.uPrecipDensity.value) * Math.min(1, rawDt * 4);
     this.cloudMat.uniforms.uDetail.value = this.cheapMode ? 0 : 1;
     this.cloudMat.uniforms.uCheapLight.value = cheap;

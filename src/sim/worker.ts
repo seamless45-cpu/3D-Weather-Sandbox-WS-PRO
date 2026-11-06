@@ -355,6 +355,7 @@ ctx.onmessage = (ev: MessageEvent) => {
     case 'charges': showCharges = !!m.enabled; break;
     case 'radar': radarReq = { cx: m.cx || 0, cz: m.cz || 0, on: !!m.on }; break;
     case 'cam': cam = { x: m.x, z: m.z }; break;
+    case 'props': if (atm) atm.setProps(m.props || []); break;
     case 'diag': {
       const nextStride = m.field === 'cape' ? 2 : 4;
       if (nextStride !== capeStride) { capeStride = nextStride; capeM = null; lastCape = -1; }

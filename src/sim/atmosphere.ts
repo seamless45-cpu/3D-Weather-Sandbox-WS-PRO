@@ -59,6 +59,9 @@ export class Atmosphere {
   sunriseT = -1; prevSin = 0;
   anyHydro = false; chargeMax = 0; flashEvents: any[] = [];
   tornado = new TornadoSystem(); chargeDiag: ChargeDiagnostics = emptyChargeDiagnostics();
+  /** Player-spawned props (lightning rods attract ground-initiated lightning, etc.). */
+  props: { x: number; z: number; type: string; h: number }[] = [];
+  setProps(list: { x: number; z: number; type: string; h: number }[]) { this.props = list.slice(0, 64); }
   precipCum = 0; iceGroundCum = 0; evapCum = 0; nudgeWater = 0; w0Total = 0; mse0 = 0; srcEnergy = 0; flashCount = 0;
   stats: Stats; sunSin = 0; sunDirV: [number, number, number] = [0, 1, 0]; cflRate = 0;
   lastLightningT = -1e9;
@@ -593,7 +596,13 @@ export class Atmosphere {
       for (let ij = 0; ij < nxy; ij++) {
         const c = k * nxy + ij;
         const thv = this.th[c] * (1 + 0.61 * this.qv[c]);
-        const b = G * ((thv - pr.thv[k]) / pr.thv[k] - (this.qc[c] + this.qi[c] + this.qr[c] + this.qs[c] + this.qg[c]));
+        let b = G * ((thv - pr.thv[k]) / pr.thv[k] - (this.qc[c] + this.qi[c] + this.qr[c] + this.qs[c] + this.qg[c]));
+        // Entrainment dilution: rising parcels mix with dry environmental air and lose
+        // buoyancy (real updrafts are 10-30% diluted); downdrafts evaporatively cooled
+        // are diluted a little less. This is what caps real updraft speeds below the
+        // theoretical CAPE limit.
+        const wUp = this.wc[c];
+        b *= 1 - (b > 0 ? 0.24 * Math.min(1, wUp / 22) : 0.10 * Math.min(1, -wUp / 14));
         B[c] = b; s += b;
       }
       s /= nxy;
@@ -749,6 +758,7 @@ export class Atmosphere {
     const hf = Math.min(0.02 * this.g.dx * this.g.dx / dt, 400);
     this.diffuse(this.uc, this.Km, dt, hf); this.diffuse(this.vc, this.Km, dt, hf); this.diffuse(this.wc, this.Km, dt, hf);
     this.diffuse(this.th, this.Kh, dt, 0); this.diffuse(this.qv, this.Kh, dt, 0);
+    this.diffuse(this.tke, this.Kh, dt, 0);   // sub-grid TKE is transported by the same mixing
     if (this.anyHydro) { this.diffuse(this.qc, this.Kh, dt, 0); this.diffuse(this.qi, this.Kh, dt, 0); }
     radiationTendencies(this, this.sunSin);
     this.forcing(dt);

@@ -454,7 +454,17 @@ export function tryLightning(a: Atmosphere): FlashEvent[] {
       // Total surface field: solved field at the lowest level + the sheet's near-ground
       // self-field σ/ε0 (an observer at the surface feels the full sheet, while ez averages
       // over the first ~300 m and dilutes it).
-      const r = (Math.abs(a.ez[ij]) + (Math.abs(qg) / EPS0) * 0.9) / a.thresholdE(0);
+      let r = (Math.abs(a.ez[ij]) + (Math.abs(qg) / EPS0) * 0.9) / a.thresholdE(0);
+      // Lightning rods: a tall grounded conductor concentrates the field at its tip
+      // (enhancement ~ h/r_tip), so an upward leader launches from a rod long before the
+      // surrounding flat ground would fire — rods attract strikes, which is the point.
+      for (const pr of a.props) {
+        if (pr.type !== 'rod') continue;
+        let dx = Math.abs(((ij % nx) * a.g.dx) - pr.x); dx = Math.min(dx, nx * a.g.dx - dx);
+        let dz = Math.abs((Math.floor(ij / nx) * a.g.dy) - pr.z); dz = Math.min(dz, ny * a.g.dy - dz);
+        const d = Math.hypot(dx, dz);
+        if (d < 900) r += (1.9 * (pr.h / 12)) * (1 - d / 900) * (1 - d / 900);
+      }
       if (r > a.gd.maxR) a.gd.maxR = r;
       if (r <= gR) continue;
       if (r > 0.55) a.gd.pass++;
