@@ -56,6 +56,19 @@ export default function App() {
   const [radarOn, setRadarOn] = useState(false);
   const [radarMode, setRadarMode] = useState<RadarMode>('ref');
   const [stationOn, setStationOn] = useState(false);
+  const [propsOn, setPropsOn] = useState(false);
+  const [props, setProps] = useState<{ id: number; x: number; z: number; type: string; h: number }[]>([]);
+  const propId = useRef(1);
+  const spawnProp = (type: string, h: number) => {
+    const p = rtRef.current?.player;
+    if (!p) return;
+    setProps((list) => [...list, { id: propId.current++, x: p.x, z: p.z, type, h }]);
+  };
+  useEffect(() => {
+    const plain = props.map(({ x, z, type, h }) => ({ x, z, type, h }));
+    rtRef.current?.worker.postMessage({ type: 'props', props: plain });
+    rtRef.current?.engine.setProps(plain);
+  }, [props]);
   const radarRef = useRef<HTMLCanvasElement>(null);
   const radarDataRef = useRef<any>(null);
 
@@ -344,6 +357,20 @@ export default function App() {
           )}
 
           {/* advanced radar scope */}
+          {propsOn && (
+            <div className="hud absolute right-1.5 top-12 z-10 flex flex-col gap-1 px-2 py-1.5">
+              <div className="lbl">SPAWN AT YOUR POSITION</div>
+              <div className="flex flex-wrap gap-1">
+                <button className="hbtn" onClick={() => spawnProp('rod', 12)} title="Lightning rod — concentrates the field at its tip and attracts cloud-to-ground strikes">⚡ rod</button>
+                <button className="hbtn" onClick={() => spawnProp('mast', 15)} title="Tall comms mast">📡 mast</button>
+                <button className="hbtn" onClick={() => spawnProp('shed', 2.4)} title="Equipment shed">🏠 shed</button>
+                <button className="hbtn" onClick={() => spawnProp('tree', 4)} title="Tree">🌳 tree</button>
+                <button className="hbtn" onClick={() => setProps((l) => l.slice(0, -1))} title="Remove last prop">✕ undo</button>
+                <button className="hbtn" onClick={() => setProps([])} title="Remove all props">clear</button>
+              </div>
+              <div className="lbl">{props.length} prop{props.length === 1 ? '' : 's'} placed</div>
+            </div>
+          )}
           {radarOn && (
             <div className="hud absolute right-1.5 top-[34px] z-10 w-[268px] p-1.5">
               <div className="mb-1 flex items-center justify-between">
@@ -365,6 +392,7 @@ export default function App() {
             {SPEEDS.map((v) => <button key={v} className={`hbtn ${speed === v ? 'on' : ''}`} onClick={() => setSpeed(v)}>{v}×</button>)}
             <button className={`hbtn ${envOpen ? 'on' : ''}`} onClick={() => setEnvOpen((o) => !o)} title="Environment and microphysics controls">⚙ env</button>
             <button className={`hbtn ${chargesOn ? 'on' : ''}`} onClick={() => setChargesOn((c) => !c)} title="Show charge particles: + positive (red) / − negative (blue)">± charges</button>
+            <button className={`hbtn ${propsOn ? 'on' : ''}`} onClick={() => setPropsOn((o) => !o)} title="Spawn props at your position (the lightning rod attracts strikes)">＋ props</button>
             <button className={`hbtn ${radarOn ? 'on' : ''}`} onClick={() => { setRadarOn((r) => !r); setDiagOn(false); }} title="Advanced radar: reflectivity and radial velocity scope centred on the truck">📡 radar</button>
             <button className={`hbtn ${stationOn ? 'on' : ''}`} onClick={() => setStationOn((o) => !o)} title="Weather station: live surface observations at your position">☂ met</button>
             <button className={`hbtn ${vehicleMode === 'vehicle' ? 'on' : ''}`} onClick={() => rtRef.current?.player.toggleVehicle()} title="Enter / exit the intercept vehicle">🚙 {vehicleMode === 'vehicle' ? 'exit' : 'drive'}</button>

@@ -252,6 +252,12 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
 * **Storm-frame stability** — consecutive 250 ms solver snapshots are temporally blended on the
   CPU before upload, and the adaptive march controls (step scale, step budget) are EMA-smoothed,
   so storm load no longer steps the cloud field or pops march brightness frame to frame.
+* **More physics** — entrainment dilution of buoyancy in updrafts/downdrafts (caps updrafts
+  below the theoretical CAPE limit) and sub-grid TKE vertical transport join the radiation,
+  Monin–Obukhov and evaporation schemes.
+* **Props spawner** — the ＋ props panel spawns functional props at your position: a lightning
+  rod (concentrates the electric field at its tip, so the solver's ground-initiated gate fires
+  there — it genuinely attracts CG strikes), a comms mast, a shed and trees.
 * **Diurnal cycle** — the mixed-layer depth deepens with daylight hours since sunrise
   (~0.35 km at dawn to ~2.2 km by late afternoon) and nocturnal radiative cooling caps the
   surface layer, so convection initiates in the afternoon; surface momentum drag includes

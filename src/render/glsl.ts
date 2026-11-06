@@ -703,12 +703,15 @@ void main(){
   // Edge fade before the wrap radius, overhead fade, no-rain fade.
   vec2 cell = abs(rel) / (box * 0.5);
   float edge = 1.0 - smoothstep(0.80, 0.99, max(cell.x, cell.y));
-  float near0 = smoothstep(4.0, 26.0, dist);
+  // Standing INSIDE the core: quads centred on the camera would fill the whole screen as
+  // one flat veil (the artificial look) — fade them out hard at point-blank range.
+  float near0 = smoothstep(7.0, 32.0, dist);
   vA = rain * edge * near0 * (0.55 + 0.55 * aDrop.w) * (1.0 - smoothstep(0.30, 0.85, hf));
   vA *= 1.0 - smoothstep(130.0, 230.0, dist);
   // Under heavy rain the spray sheet becomes a SHEET-RAIN veil: much stronger, so the whole
   // view softens into falling water instead of discrete puffs.
   vA *= 1.0 + 1.1 * uHeavyRain + 0.5 * uRainIntensity;
+  vA = min(vA, 0.5);   // cap: no full-screen whiteout inside the core
   if (vA < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec3 toCam = normalize(cameraPosition - p);
   vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), toCam) + vec3(1e-5));
@@ -795,7 +798,7 @@ void main(){
   // outward so the assembly reads as a cylinder rather than six flat cards.
   float az = (layer / SHAFT_PLANES) * 2.0 * PI + seed * 0.35;
   vec3 right = vec3(cos(az), 0.0, sin(az));
-  float width = mix(230.0, 1050.0, pow(h, 1.25)) * (0.62 + 0.85 * fract(seed * 13.7)) + depth * 0.075;
+  float width = mix(230.0, 1050.0, pow(h, 1.25)) * (0.62 + 0.85 * fract(seed * 13.7)) * (0.62 + 0.75 * clamp(rain * 2.4, 0.0, 1.0)) + depth * 0.075;
   // Ragged silhouette: two octaves of row noise bend the width, so no edge is ever straight.
   float rowN = vnoise2(vec2(seed * 149.0, h * 5.0 + uTime * 0.045)) - 0.5;
   float rowN2 = vnoise2(vec2(seed * 61.0 + 7.3, h * 11.0 - uTime * 0.06)) - 0.5;
@@ -857,7 +860,7 @@ void main(){
   float a = vRain * streak * edge * topFade * botFade * tendril * mix(0.62, 1.08, vU) * (0.66 + 0.44 * body) * planeGain;
   a *= clamp(0.72 + 0.85 * uRainIntensity + 0.95 * uHeavyRain, 0.72, 2.65);
   // Near shafts must be visible; the old 120..650 m fade erased exactly the rain under the storm.
-  a *= smoothstep(16.0, 140.0, vDist);
+  a *= smoothstep(30.0, 170.0, vDist);   // inside a shaft the nearest planes must not flash across the lens
   a *= 1.0 - smoothstep(14000.0, 28000.0, vDist);
   // Far shafts soften their internal stripes so distant curtains read as volume, not bands.
   float far = smoothstep(2500.0, 12000.0, vDist);
