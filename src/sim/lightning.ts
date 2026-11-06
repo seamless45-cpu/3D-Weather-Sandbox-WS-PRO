@@ -275,6 +275,25 @@ export function growFlash(a: Atmosphere, ci: number, ratio: number, polarity: Po
     gen += need;
   }
 
+  // Upward connecting leader: when the descending stepped leader nears the ground, upward
+  // streamers rise from surface tips (grass, roughness, the charged sheet itself) and the
+  // strongest one meets the leader a few hundred metres up — the last stretch of every real
+  // CG is closed by this ground-launched streamer, not by the cloud leader touching soil.
+  if (grounded && !groundUp && strikeNode >= 0) {
+    const sx = nodesX[strikeNode], sy = nodesY[strikeNode], sz = nodesZ[strikeNode];
+    const gz = Math.max(0, ground(sx, sy));
+    const nStream = 4;
+    let parent = strikeNode;
+    for (let f = 1; f <= nStream; f++) {
+      const fr = f / nStream;
+      const px = sx + (rnd() - 0.5) * 34 * fr, py = sy + (rnd() - 0.5) * 34 * fr;
+      const pz = gz + (sz - gz) * fr * fr;   // streamer accelerates upward: quadratic rise
+      nodesX.push(px); nodesY.push(py); nodesZ.push(Math.max(5, pz));
+      nodeGen.push(attachGen); nodeParent.push(parent); nodeOrder.push(1);
+      parent = nodesX.length - 1;
+    }
+  }
+
   // Graph distance from the strike (or initiation) drives return-stroke propagation and width taper.
   const n = nodesX.length;
   const root = grounded ? strikeNode : 0;

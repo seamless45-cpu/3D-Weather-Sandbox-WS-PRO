@@ -38,7 +38,7 @@ modern browser. It is the whole app inlined into one file and runs straight from
 Then pick an initial environment and press **▶ enter simulation**. Press **V** in the simulation to
 enter or leave the intercept vehicle; **W/S** throttle, **A/D** steer, **Space** is the handbrake and
 **P** deploys the roof probe. The first storms typically
-appear after ~3 simulated hours of daytime heating, so run at a time-lapse speed of ×15 or
+appear after ~3 simulated hours of daytime heating, so run at a time-lapse speed of ×15 or higher (up to ×1200)
 higher if you do not want to wait in real time.
 
 ### Render quality (phones and integrated GPUs)
@@ -241,7 +241,12 @@ so `N` must be 8, 16, 32, 64, 128, … The app uses 64 (desktop) or 32 (mobile/c
   size-distributed raindrops with fall-speed-proportional motion-blur streaks and snow crystals,
   anisotropic fall-streaked, haze-blended wind-sheared six-plane cylindrical rainshafts, a
   sheet-rain spray veil under heavy rain, denoised/reprojected cloud upsampling, helical
-  condensation funnel and debris, player-driven intercept vehicle, mitered/tapered lightning
+  condensation funnel and debris, a 30,000 K blue-white localized flash (tight inverse-square
+  point lights at the channel ends plus a hotter bolt core), DBM lightning with stepped leaders
+  closed by an upward connecting streamer from the ground, distance-delayed multi-segment
+  thunder with a near-field crack and a violent camera shake when a strike hits at the camera,
+  player-driven intercept vehicle that drives along its own heading (decoupled camera look)
+  and faces its actual velocity, mitered/tapered lightning
   ribbons, terrain, water and synthesised thunder. The GPU fluid field is integrated at half
   the frame rate to keep the frame loop hitch-free.
 * **Storm-frame stability** — consecutive 250 ms solver snapshots are temporally blended on the

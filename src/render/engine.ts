@@ -249,7 +249,8 @@ export class Engine {
       uTime: { value: 0 }, uSunDir: { value: new V3(0, 1, 0) }, uSunCol: { value: new V3(1, 1, 1) }, uSkyAmb: { value: new V3(0.2, 0.3, 0.5) },
       uHorizon: { value: new V3(0.5, 0.6, 0.8) }, uGroundAmb: { value: new V3(0.2, 0.2, 0.2) }, uTwilight: { value: 0 },
       uDomain: { value: DOMAIN }, uVis: { value: 30000 }, uSkyScale: { value: 14 }, uCloud: { value: this.cloudTex },
-      uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, uFlashCol: { value: new V3(0.82, 0.88, 1.0) },
+      uFlash: { value: Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 0, 0)) }, // Lightning channel ~30,000 K: peak in the UV, visible as an intense blue-white.
+      uFlashCol: { value: new V3(0.60, 0.71, 1.0) },
       uFlashOn: { value: 0 },
       uWind: { value: this.gustWind }, uWindDrift: { value: this.windDrift },
       uHeight: { value: hTex }, uM: { value: terrain.M }, uSpacing: { value: terrain.spacing },
@@ -1183,8 +1184,10 @@ export class Engine {
       f.mat.uniforms.uT.value = t;
       const lum = Engine.flashLum(f.ev, t);
       if (i < 3) {
-        fl[i * 2].set(f.cloudPos.x, f.cloudPos.y, f.cloudPos.z, 11 * lum);
-        fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 15 * lum);
+        // A 30,000 K channel is blindingly bright up close: strong inverse-square point
+        // lights at the cloud and strike ends (tight radius in flashLight), not a flat glow.
+        fl[i * 2].set(f.cloudPos.x, f.cloudPos.y, f.cloudPos.z, 30 * lum);
+        fl[i * 2 + 1].set(f.groundPos.x, f.groundPos.y, f.groundPos.z, 46 * lum);
       }
       flashSum += (lum * 7) / (1 + (f.dist * f.dist) / (3500 * 3500));
       // Thunder shock: the sound wave reaches the camera at dist / 340 s — start a smooth
@@ -1192,7 +1195,9 @@ export class Engine {
       if (!f.shook && t >= f.dist / 340) {
         f.shook = true;
         const near = 1 / (1 + f.dist / 2500);
-        const amp = Math.min(0.4, 0.42 * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
+        // A strike that hits (nearly) at the camera is a shock wave: shake hard.
+        const closeBoost = f.dist < 400 ? 1 + (400 - f.dist) / 400 : 1;
+        const amp = Math.min(0.9, 0.42 * closeBoost * near * Math.min(1, 0.35 + f.ev.chargeC / 8));
         if (amp > 0.015) {
           const a = new THREE.Vector3(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
           this.shake = { t0: nowMs, amp, axis: a, phaseSeed: Math.floor(Math.random() * 4096) };

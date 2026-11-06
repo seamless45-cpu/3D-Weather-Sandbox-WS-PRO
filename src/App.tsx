@@ -9,7 +9,7 @@ import { Player, LIGHT_TYPES } from './controls';
 import { AudioEngine } from './audio';
 import { drawSkewT, drawSlice, drawRadar, radarRaster, RadarMode } from './ui/draw';
 
-const SPEEDS = [1, 5, 15, 30, 60];
+const SPEEDS = [1, 5, 15, 30, 60, 120, 1200];
 const FIELDS: [string, string][] = [['w', 'W'], ['cloud', 'CLD'], ['precip', 'PCP'], ['T', 'T'], ['RH', 'RH'], ['E', 'E-FLD'], ['thp', "θ'"], ['p', "P'"], ['zeta', 'ζ'], ['cape', 'CAPE']];
 const f0 = (x: number, d = 0) => (x === undefined || x === null || isNaN(x) ? '—' : x.toFixed(d));
 const km = (m: number) => (isNaN(m) ? '—' : (m / 1000).toFixed(2));
@@ -226,21 +226,6 @@ export default function App() {
     if (skewRef.current && s.sounding) drawSkewT(skewRef.current, s.sounding);
   });
 
-  const reset = () => {
-    send({ type: 'reset', params });
-    rtRef.current?.engine.reset();
-    const eng = rtRef.current?.engine;
-    if (eng) {
-      eng.stormLoad = 0; eng.cheapMode = false;
-      eng.U.uPrecipDensity.value = 1; eng.U.uCheapShadows.value = 0;
-      eng.U.uRainIntensity.value = 0; eng.U.uFlashGlow.value = 0; eng.U.uFlashOn.value = 0;
-      eng.U.uHeavyRain.value = 0; eng.U.uTornado.value.set(16000, 16000, 220, 0);
-      eng.tornado = null; eng.vehiclePose = null; eng.heavyRain = 0;
-    }
-    rtRef.current?.engine.flashes.slice().forEach((f) => (rtRef.current!.engine as any).removeFlash(f));
-    setLastFlash(null);
-  };
-
   const player = rtRef.current?.player;
   const sd = s?.sounding;
   const st = s?.stats;
@@ -382,7 +367,6 @@ export default function App() {
             <button className={`hbtn ${chargesOn ? 'on' : ''}`} onClick={() => setChargesOn((c) => !c)} title="Show charge particles: + positive (red) / − negative (blue)">± charges</button>
             <button className={`hbtn ${radarOn ? 'on' : ''}`} onClick={() => { setRadarOn((r) => !r); setDiagOn(false); }} title="Advanced radar: reflectivity and radial velocity scope centred on the truck">📡 radar</button>
             <button className={`hbtn ${stationOn ? 'on' : ''}`} onClick={() => setStationOn((o) => !o)} title="Weather station: live surface observations at your position">☂ met</button>
-            <button className="hbtn" onClick={reset} title="Reset to clear sky with the current parameters">⟲ clear</button>
             <button className={`hbtn ${vehicleMode === 'vehicle' ? 'on' : ''}`} onClick={() => rtRef.current?.player.toggleVehicle()} title="Enter / exit the intercept vehicle">🚙 {vehicleMode === 'vehicle' ? 'exit' : 'drive'}</button>
             <button className={`hbtn ${diagOn ? 'on' : ''}`} onClick={() => { setDiagOn((d) => !d); setRadarOn(false); }}>diag</button>
             <button className={`hbtn ${sound ? 'on' : ''}`} onClick={() => setSound((d) => !d)}>♪</button>
