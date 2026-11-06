@@ -113,7 +113,7 @@ vec3 flashLight(vec3 p, vec3 n){
     vec3 d = f.xyz - p;
     float r2 = dot(d, d);
     vec3 L = d * inversesqrt(r2 + 1.0);
-    float att = f.w / (1.0 + r2 / 1.44e6);
+    float att = f.w / (1.0 + r2 / 6.5e5);   // ~800 m scale: localized, blinding up close
     acc += att * (0.35 + 0.65 * max(dot(n, L), 0.0));
   }
   return acc * uFlashCol;
@@ -1008,7 +1008,7 @@ void main(){
   // what reads as realism on camera.
   float strobe = vLum * vFlicker * vBead;
   float after = vHalo * (0.85 + 0.15 * vBead);
-  vec3 c = hot * core * (15.0 * strobe + 1.6 * after)
+  vec3 c = hot * core * (26.0 * strobe + 1.9 * after)
     + mix(blue, hot, core) * glow * (3.0 * strobe + 1.15 * after)
     + violet * halo * (0.55 * strobe + 0.95 * after);
   c *= endFade;
@@ -1396,7 +1396,7 @@ vec4 cloudSample(vec2 uv){
     float d = texture(uCloudAux, uv + CLOUD_OFF[i] * tx).r;
     // depth similarity keeps the silhouette crisp; transmittance jump rejects cloud/sky bleed
     float w = CLOUD_W[i] / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
-    w *= 1.0 - 0.75 * smoothstep(0.12, 0.5, abs(c.a - c0.a));
+    w *= 1.0 - 0.35 * smoothstep(0.18, 0.65, abs(c.a - c0.a));
     acc += c * w; wsum += w;
   }
   return acc / wsum;
@@ -1416,7 +1416,7 @@ void main(){
       vec4 q = texture(uCloudRT, uv);
       float d = texture(uCloudAux, uv).r;
       float w = CLOUD_W[i] / (1.0 + pow(abs(d - d0) / max(120.0, 0.06 * d0), 2.0));
-      w *= 1.0 - 0.75 * smoothstep(0.12, 0.5, abs(q.a - c.a));
+      w *= 1.0 - 0.35 * smoothstep(0.18, 0.65, abs(q.a - c.a));
       rad += q.rgb * w; wsum += w;
     }
     c.rgb = mix(c.rgb, (c.rgb * 2.0 + rad) / (2.0 + wsum), 0.45 * uDenoise);

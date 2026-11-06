@@ -249,15 +249,17 @@ export class Player {
     // front wheels follow the same (smoothed) input.
     const steerRate = steer * (0.95 - 0.58 * Math.min(1, Math.abs(v.speed) / 42));
     v.heading += steerRate * dt;
-    this.yaw += steerRate * dt;
+    // The camera look (this.yaw) is decoupled from the truck: the vehicle drives along its
+    // OWN heading and mouse-look only aims the camera — the truck no longer drives in the
+    // camera direction while its model faces a fixed heading.
     // Angle normalisation — NOT wrap(): DOMAIN (32000) is not a multiple of 2π, so the old
     // domain wrap snapped a negative yaw ~15° away from the camera every frame (the truck
     // stopped facing where you look).
     v.heading = wrapAngle(v.heading);
     v.steer += (steer - v.steer) * Math.min(1, dt * 8);
 
-    const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
-    const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
+    const fx = -Math.sin(v.heading), fz = -Math.cos(v.heading);
+    const rx = Math.cos(v.heading), rz = -Math.sin(v.heading);
     // Grip model: split the velocity into forward and lateral components so the truck can
     // understeer, break traction under the handbrake and be pushed sideways by the vortex.
     let fwd = v.vx * fx + v.vz * fz;
@@ -340,6 +342,16 @@ export class Player {
 
     v.speed = fwd;
     v.vx = fx * fwd + rx * lat; v.vz = fz * fwd + rz * lat;
+
+    // The body faces where it is actually going: at speed, the heading chases the velocity
+    // vector (slides, gust shoves and handbrake drifts visibly swing the nose) instead of
+    // staring in one fixed direction.
+    const sp2 = Math.hypot(v.vx, v.vz);
+    if (sp2 > 4) {
+      const vAng = Math.atan2(-v.vx, -v.vz);
+      const d = wrapAngle(vAng - v.heading);
+      v.heading = wrapAngle(v.heading + d * Math.min(1, dt * 1.4));
+    }
 
     // ---- suspension: pitch from longitudinal slope + squat/dive, roll from cross slope +
     // cornering lean, and a springy bounce over rough ground.
