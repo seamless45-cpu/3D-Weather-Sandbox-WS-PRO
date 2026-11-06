@@ -765,7 +765,14 @@ export class Atmosphere {
     this.diffuse(this.uc, this.Km, dt, hf); this.diffuse(this.vc, this.Km, dt, hf); this.diffuse(this.wc, this.Km, dt, hf);
     this.diffuse(this.th, this.Kh, dt, 0); this.diffuse(this.qv, this.Kh, dt, 0);
     this.diffuse(this.tke, this.Kh, dt, 0);   // sub-grid TKE is transported by the same mixing
-    if (this.anyHydro) { this.diffuse(this.qc, this.Kh, dt, 0); this.diffuse(this.qi, this.Kh, dt, 0); }
+    // Sub-grid mixing acts on every hydrometeor and charge species — diffusing only cloud
+    // water/ice left rain, snow, graupel and charge as unrealistically speckled grid-scale
+    // blobs that aliased into grain in the rendered clouds.
+    if (this.anyHydro) {
+      this.diffuse(this.qc, this.Kh, dt, 0); this.diffuse(this.qi, this.Kh, dt, 0);
+      this.diffuse(this.qr, this.Kh, dt, 0); this.diffuse(this.qs, this.Kh, dt, 0); this.diffuse(this.qg, this.Kh, dt, 0);
+    }
+    if (this.chargeMax > 1e-16) { this.diffuse(this.qh, this.Kh, dt, 0); this.diffuse(this.ql, this.Kh, dt, 0); }
     radiationTendencies(this, this.sunSin);
     this.forcing(dt);
     this.facesFromCentered();

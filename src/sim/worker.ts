@@ -137,7 +137,7 @@ function buildCharges(a: Atmosphere): Float32Array {
     if (aq < 2e-10) continue;
     count++; if (aq > maxQ) maxQ = aq;
   }
-  const MAXCH = 6000;
+  const MAXCH = 4200;
   const stride = Math.max(1, Math.ceil(count / MAXCH));
   const out = new Float32Array(Math.ceil(count / stride) * 5);
   let n = 0, seen = 0;
@@ -147,7 +147,9 @@ function buildCharges(a: Atmosphere): Float32Array {
       const q = qh[c] + ql[c];
       if (!cellOk(c, q)) continue;
       const aq = Math.abs(q);
-      if (aq < 2e-10) continue;
+      // Only show significant pockets (>= 7% of the peak): the old field drew every weak
+      // cell, which read as uniform grain speckle over the whole cloud when viewed from below.
+      if (aq < Math.max(2e-10, 0.07 * maxQ)) continue;
       if ((seen++ % stride) !== 0) continue;
       const i = ij % nx, j = (ij / nx) | 0;
       const o = n * 5;
