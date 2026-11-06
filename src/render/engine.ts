@@ -820,7 +820,9 @@ export class Engine {
       m.position.set(x, y, z);
       sub.add(m);
     };
-    const rod = [0.75, 0.77, 0.8] as [number, number, number];
+    // Dark galvanized steel: a pale rod a few metres from the camera renders as a stark
+    // full-height white line; dark metal reads as an actual mast at any distance.
+    const rod = [0.34, 0.37, 0.42] as [number, number, number];
     const wood = [0.42, 0.30, 0.18] as [number, number, number];
     const leaf = [0.16, 0.30, 0.12] as [number, number, number];
     for (const pr of list) {
@@ -831,7 +833,7 @@ export class Engine {
       if (pr.type === 'rod') {
         // lightning rod: base, mast, sharp tip — the sim concentrates the field at this tip
         local(sub, new THREE.CylinderGeometry(0.5, 0.7, 0.3, 10), wood, 0, 0.15, 0);
-        local(sub, new THREE.CylinderGeometry(0.05, 0.07, pr.h, 10), rod, 0, pr.h / 2 + 0.3, 0);
+        local(sub, new THREE.CylinderGeometry(0.075, 0.10, pr.h, 10), rod, 0, pr.h / 2 + 0.3, 0);
         local(sub, new THREE.CylinderGeometry(0.09, 0.09, 0.12, 10), [1.0, 0.85, 0.3], 0, pr.h + 0.36, 0);
       } else if (pr.type === 'shed') {
         local(sub, new THREE.BoxGeometry(3.2, 2.2, 2.6), [0.55, 0.5, 0.44], 0, 1.1, 0);

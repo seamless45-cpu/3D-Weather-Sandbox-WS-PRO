@@ -524,10 +524,12 @@ void main(){
   vQ = position.xy * 2.0;
   vDist = dist; vFlake = flake; vClass = cls; vGlint = glint; vPhase = phase; vShape = shape;
   float fwd = pow(max(dot(-toCam, uSunDir), 0.0), 8.0);
-  vec3 col = uSkyAmb * 1.1 + uSunCol * (0.10 + 0.75 * fwd) + uGroundAmb * 0.4 + vec3(0.015);
+  // Cool grey-blue streak body (not near-white): inside a rain core every drop's gate opens,
+  // and bright end-on heads read as white dots speckled over the ground.
+  vec3 col = uSkyAmb * 0.82 + uSunCol * (0.08 + 0.42 * fwd) + uGroundAmb * 0.30 + vec3(0.012);
   // Each drop catches a different amount of light: brightness jitter from its phase, so the
   // rain reads as individual glints, not a uniform wash.
-  col *= 0.82 + 0.36 * fract(phase * 7.31 + cls * 3.7);
+  col *= 0.72 + 0.30 * fract(phase * 7.31 + cls * 3.7);
   if (uFlashOn > 0.5) col += flashLight(p, vec3(0.0, 0.0, 1.0)) * 0.8 + uFlashCol * uFlashGlow * 0.12;
   vCol = mix(col, col * vec3(1.06, 1.06, 1.12) + vec3(0.045), flake);
   vAlpha = smoothstep(0.25, 1.2, dist) * (1.0 - smoothstep(38.0, 60.0, dist)) * mix(0.68 + 0.24 * cls, 0.46, flake) * (0.90 + 0.55 * uHeavyRain) * gate * edge;
@@ -550,7 +552,7 @@ void main(){
   // Off-centre specular glint: the cue that this is a refracting drop, not a white line.
   float glint = pow(max(0.0, 1.0 - length(vec2((across - 0.16) * 2.4, (along - 0.50) * 1.7))), 12.0) * vGlint;
   vec3 rainCol = vCol * (0.62 + 0.55 * pow(1.0 - min(1.0, abs(across)), 2.0));
-  rainCol += vec3(1.0, 0.98, 0.92) * glint * (0.35 + 0.65 * vClass / 1.5);
+  rainCol += vec3(0.85, 0.88, 0.95) * glint * (0.16 + 0.30 * vClass / 1.5);
   // Six-arm crystal for frozen precipitation; rotation varies per flake.
   float ang = atan(along, across) + vShape * 6.2831 + vPhase;
   float arms = pow(abs(cos(ang * 3.0)), 22.0) * (1.0 - smoothstep(0.18, 0.92, rr));
@@ -600,7 +602,7 @@ void main(){
   vPh = ph; vP = position.xy * 2.0; vShape = aDrop.w;
   vDist = length(rel);
   vVis = gate * edge * (1.0 - smoothstep(26.0, 48.0, vDist));
-  vCol = (uSkyAmb * 0.85 + uSunCol * 0.3 + vec3(0.01)) * 1.3;
+  vCol = (uSkyAmb * 0.62 + uSunCol * 0.16 + vec3(0.006)) * 0.9;
   if (uFlashOn > 0.5) vCol += flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6 + uFlashCol * uFlashGlow * 0.10;
   gl_Position = gate > 0.05 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
 }`;
@@ -613,7 +615,7 @@ void main(){
   float ring = smoothstep(0.48, 0.72, rr) * (1.0 - smoothstep(0.72, 0.98, rr)) * (0.65 + 0.35 * spikes);
   float mist = (1.0 - smoothstep(0.0, 0.95, rr)) * 0.10;
   float droplets = smoothstep(0.82, 0.98, rr) * (0.5 + 0.5 * spikes) * 0.07;
-  float a = (ring * 0.34 + mist * 1.25 + droplets * 1.3) * (1.0 - vPh) * (1.0 - vPh) * 0.85 * vVis * (1.0 + 0.85 * uHeavyRain);
+  float a = (ring * 0.22 + mist * 0.8 + droplets * 0.85) * (1.0 - vPh) * (1.0 - vPh) * 0.7 * vVis * (1.0 + 0.6 * uHeavyRain);
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol, a);
 }`;
@@ -656,7 +658,7 @@ void main(){
   vec3 wp = vec3(xz.x + drift.x, gh + h + 0.02, xz.y + drift.y);
   vPh = ph; vP = position.xy * 2.0;
   vVis = gate * edge * (1.0 - smoothstep(24.0, 46.0, length(rel))) * (1.0 - smoothstep(0.82, 1.0, ph));
-  vCol = (uSkyAmb * 0.95 + uSunCol * 0.35 + vec3(0.02)) * 1.4;
+  vCol = (uSkyAmb * 0.66 + uSunCol * 0.18 + vec3(0.008)) * 0.9;
   if (uFlashOn > 0.5) vCol += flashLight(wp, vec3(0.0, 1.0, 0.0)) * 0.6 + uFlashCol * uFlashGlow * 0.10;
   gl_Position = vVis > 0.02 ? projectionMatrix * viewMatrix * vec4(wp, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
 }`;
@@ -667,8 +669,8 @@ void main(){
   float a = (1.0 - smoothstep(0.30, 0.92, rr)) * vVis;
   // Sun glint near the droplet centre sells the crown sparkle.
   float glint = exp(-rr * rr * 14.0);
-  vec3 c = vCol * (0.7 + 0.75 * glint);
-  a *= 0.55 + 0.45 * (1.0 - vPh);
+  vec3 c = vCol * (0.7 + 0.35 * glint);
+  a *= 0.40 + 0.35 * (1.0 - vPh);
   if (a < 0.004) discard;
   gl_FragColor = vec4(c, a);
 }`;
