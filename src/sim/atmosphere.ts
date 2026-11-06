@@ -55,6 +55,8 @@ export class Atmosphere {
   poisP!: Poisson; poisE!: Poisson;
   bufX: Float32Array; fluxX: Float32Array; fluxPlane: Float32Array;
   time = 11 * 3600; dt = 4; step_n = 0; rng: () => number;
+  /** Diurnal boundary-layer state: sunrise time [s] and previous sin(elevation) for crossing detection. */
+  sunriseT = -1; prevSin = 0;
   anyHydro = false; chargeMax = 0; flashEvents: any[] = [];
   tornado = new TornadoSystem(); chargeDiag: ChargeDiagnostics = emptyChargeDiagnostics();
   precipCum = 0; iceGroundCum = 0; evapCum = 0; nudgeWater = 0; w0Total = 0; mse0 = 0; srcEnergy = 0; flashCount = 0;
@@ -148,7 +150,7 @@ export class Atmosphere {
       this.soilM[ij] = water ? 1 : Math.max(0.1, Math.min(0.9, 0.55 - h / 700 + (r() - 0.5) * 0.3));
       this.surfW[ij] = 0;
     }
-    this.time = 11 * 3600; this.step_n = 0; this.dt = 4;
+    this.time = 11 * 3600; this.step_n = 0; this.dt = 4; this.sunriseT = -1; this.prevSin = 0;
     this.precipCum = 0; this.iceGroundCum = 0; this.evapCum = 0; this.nudgeWater = 0; this.srcEnergy = 0; this.flashCount = 0;
     this.anyHydro = false; this.chargeMax = 0; this.lastLightningT = -1e9;
     this.qGround.fill(0); this.qgMax = 0;
@@ -398,6 +400,9 @@ export class Atmosphere {
     const pr = this.prof, g = this.g;
     const sun = sunState(this.time);
     this.sunSin = sun.sinElev; this.sunDirV = sun.dir;
+    // Detect the sunrise crossing once so the daytime heating depth can grow through the day.
+    if (this.prevSin <= 0 && sun.sinElev > 0) this.sunriseT = this.time;
+    this.prevSin = sun.sinElev;
     const p0 = pr.pSfc;
     const rho = this.rhoC[0], zc0 = g.zc[0];
     const area = g.dx * g.dy;
@@ -508,7 +513,9 @@ export class Atmosphere {
       this.qv[ij] += (this.LEf[ij] * dt) / (rho0 * LV * dz0);
       if (this.qv[ij] < 0) this.qv[ij] = 0;
       const us = this.ustar[ij];
-      const cd = (us * us) / Math.max(1, Math.hypot(this.uc0[ij], this.vc0[ij]) + 0.5);
+      // Deacon-style gustiness: sub-grid TKE surges the effective wind in the drag law, so
+      // gusty boundary layers erode momentum faster near the surface than the mean wind alone.
+      const cd = (us * us) / Math.max(1, Math.hypot(this.uc0[ij], this.vc0[ij]) + 0.5 + 0.8 * Math.sqrt(this.tke[ij]));
       const f = 1 / (1 + (dt * cd) / dz0);
       this.uc[ij] *= f; this.vc[ij] *= f;
       // surface-driven sub-grid TKE
@@ -534,11 +541,16 @@ export class Atmosphere {
       // through the day (surface CAPE builds to its afternoon peak), nocturnal radiative
       // cooling caps the lowest levels (CAPE collapses overnight). The CAPE slider sets the
       // sounding; the sun makes the realised instability live instead of static.
-      const dthDiurnal = dt * (dayH * (0.85 / 3600) * Math.max(0, 1 - z / 1500)
+      // The mixed-layer depth zi grows with daylight hours since sunrise (~350 m at sunrise
+      // to ~2.2 km by late afternoon) — real PBLs deepen as surface heating accumulates,
+      // which is why convection fires in the afternoon rather than at dawn.
+      const dayHrs = this.sunriseT > 0 ? Math.min(8, Math.max(0, (this.time - this.sunriseT) / 3600)) : 0;
+      const zi = 350 + 235 * dayHrs;
+      const dthDiurnal = dt * (dayH * (0.85 / 3600) * Math.max(0, 1 - z / zi)
         - nightH * (0.6 / 3600) * Math.exp(-z / 240));
       const dth = ((pr.th[k] - mth[k]) * dt) / (z > 12500 ? 1800 : 5 * 3600) + dthDiurnal;
-      const dq = z < 3000
-        ? ((pr.qv[k] - mq[k]) * dt) / (3 * 3600) + dt * dayH * 9e-8 * (1 - z / 3000)
+      const dq = z < zi * 2
+        ? ((pr.qv[k] - mq[k]) * dt) / (3 * 3600) + dt * dayH * 9e-8 * Math.max(0, 1 - z / (zi * 2))
         : 0;
       const sponge = z > 12500 ? 0.012 * Math.pow((z - 12500) / 2500, 2) : 0;
       const sf = 1 / (1 + sponge * dt);
