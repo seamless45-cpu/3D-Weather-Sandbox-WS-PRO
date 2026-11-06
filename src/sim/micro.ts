@@ -3,6 +3,7 @@
 import type { Atmosphere } from './atmosphere';
 import { CP, LV, LF, LS, RV, T0 } from './consts';
 import { qsl, qsi } from './thermo';
+import { rainEvapRate, iceSublimRate } from './evap';
 
 export const rhoFac = (rho: number) => Math.min(1.8, Math.sqrt(1.2 / rho));
 export const vtRain = (rhoq: number, rf: number) => Math.min(9.5, 0.4 + 4.6 * Math.pow(rhoq * 1000, 0.2)) * rf;
@@ -79,10 +80,14 @@ export function microphysics(a: Atmosphere, dt: number) {
       //    edges in subsaturated air erode over seconds instead of vanishing in one step,
       //    which feathers cloud boundaries and keeps small cumulus alive realistically.
       if (T >= 233.15) {
+        // Cloud formation rate follows the vertical motion: strong updrafts condense fast
+        // (crisp growing turrets), weak motion relaxes slowly (soft edges, no popping).
+        const wUp = a.wc[idx];
+        const condRate = 2.2 * (1 + 0.45 * Math.min(2.5, Math.abs(wUp) / 8));
         for (let it = 0; it < 2; it++) {
           const q = qsl(T, p);
           let dq = (tqv - q) / (1 + (LV * LV * q) / (CP * RV * T * T));
-          if (dq < 0) dq = -Math.min(-dq, tqc * Math.min(1, dt * 2.2));
+          if (dq < 0) dq = -Math.min(-dq, tqc * Math.min(1, dt * condRate));
           tqv -= dq; tqc += dq; T += (LV / CP) * dq;
         }
       } else {
@@ -91,14 +96,14 @@ export function microphysics(a: Atmosphere, dt: number) {
           const dq = (tqv - q) / (1 + (LS * LS * q) / (CP * RV * T * T));
           tqv -= dq; tqi += dq; T += (LS / CP) * dq;
         }
-        // 5b. sublimation of snow/graupel in subsaturated air (anvil edges, virga): slow,
-        //     ventilation-limited mass loss with the latent cooling that goes with it.
+        // 5b. sublimation of snow/graupel in subsaturated air (anvil edges, virga): the
+        //     shared ice-scheme rate — ventilation-corrected, thermodynamically capped,
+        //     with the latent cooling that goes with it.
         if (tqs + tqg > 1e-9 && tqv < q) {
-          const deficit = 1 - tqv / Math.max(1e-9, q);
-          const lim = Math.max(0, (q - tqv) / (1 + (LS * LS * q) / (CP * RV * T * T)));
-          const e = Math.min(0.05 * deficit * dt * (tqs + tqg), tqs + tqg, lim);
+          const tot = tqs + tqg;
+          const e = Math.min(dt * iceSublimRate(T, p, tqv, tot, rho, 0.9, P.evaporation), tot);
           if (e > 1e-12) {
-            const fS = tqs / (tqs + tqg);
+            const fS = tqs / tot;
             tqs -= e * fS; tqg -= e * (1 - fS); tqv += e; T -= (LS / CP) * e;
           }
         }
@@ -126,17 +131,12 @@ export function microphysics(a: Atmosphere, dt: number) {
           tqc -= tot; tqs += 0.4 * rs2; tqg += 0.6 * rs2 + rg2; T += LFc * tot;
         }
       }
-      // 8. rain evaporation below cloud base / in dry air (strong source of evaporative cooling)
+      // 8. rain evaporation below cloud base / in dry air (strong source of evaporative
+      //    cooling that drives cold pools and gust fronts): shared rain-scheme rate with
+      //    terminal-velocity ventilation and latent-heat budget cap.
       if (tqr > 1e-9) {
-        const q = qsl(T, p);
-        if (tqv < q) {
-          const rr = rho * tqr;
-          let ev = (((1.6 + 124.9 * Math.pow(rr, 0.2046)) * Math.pow(rr, 0.525)) / (2.55e8 / (p * q) + 5.4e5)) * ((q - tqv) / (rho * q));
-          ev *= 2.2 * P.evaporation;
-          const lim = (q - tqv) / (1 + (LV * LV * q) / (CP * RV * T * T));
-          const e = Math.min(ev * dt, tqr, lim);
-          tqr -= e; tqv += e; T -= (LV / CP) * e;
-        }
+        const e = Math.min(dt * rainEvapRate(T, p, tqv, tqr, rho, vtRain(rho * tqr, rhoFac(rho)), P.evaporation), tqr);
+        if (e > 0) { tqr -= e; tqv += e; T -= (LV / CP) * e; }
       }
       // Charge separation is applied in charging.ts after the whole column is updated.
       qv[idx] = tqv < 0 ? 0 : tqv; qc[idx] = tqc < 0 ? 0 : tqc; qi[idx] = tqi < 0 ? 0 : tqi;

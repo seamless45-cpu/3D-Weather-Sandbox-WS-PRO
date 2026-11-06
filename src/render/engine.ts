@@ -165,7 +165,11 @@ export class Engine {
   private chargeStage: Float32Array | null = null; private chargeCountT = 0;
   private probeT = 0; private wheelSpin = 0; private lampM!: THREE.ShaderMaterial; private beamM!: THREE.ShaderMaterial;
   tornado: any = null; vehiclePose: any = null; heavyRain = 0; chargeTripole = 0; denoise = 1;
-  flashes: FlashVis[] = []; flashAct: FlashVis[] = []; frame = 0; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
+  flashes: FlashVis[] = []; flashAct: FlashVis[] = []; frame = 0;
+  /** EMA-smoothed adaptive march controls (raw changes popped the step length/brightness). */
+  stepScaleSm = 1; maxStepsSm = 96;
+  /** Previous cloud/surface snapshots, for CPU blending between the 250 ms worker ticks. */
+  prevCloud: Uint8Array | null = null; prevSurf: Uint8Array | null = null; prevVP = new THREE.Matrix4(); lastAng = [0, 0];
   /** Thunder shock: positional shake on a fixed random axis, smooth ~11/17 Hz rattle (see render). */
   shake: { t0: number; amp: number; axis: THREE.Vector3; phaseSeed: number } | null = null;
   exposure = 1; expoTarget = 1; time = 0; lastSimTime = 9 * 3600;
@@ -374,7 +378,7 @@ export class Engine {
     const cq = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.cloudMat); cq.frustumCulled = false; this.cloudScene.add(cq);
     this.compMat = new THREE.ShaderMaterial({
       vertexShader: S.fsVert, fragmentShader: S.compFrag, depthTest: false, depthWrite: false,
-      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uCheapUpsample: { value: 0 }, uDenoise: { value: 1 } },
+      uniforms: { uScene: { value: null }, uCloudRT: { value: null }, uCloudAux: { value: null }, uExposure: { value: 1 }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) }, uCloudRes: { value: new THREE.Vector2(1, 1) }, uCheapUpsample: { value: 0 }, uDenoise: { value: 1 }, uRainIntensity: U.uRainIntensity, uHeavyRain: U.uHeavyRain, uCamCloud: U.uCamCloud },
     });
     const cp = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.compMat); cp.frustumCulled = false; this.compScene.add(cp);
     this.resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
@@ -727,8 +731,30 @@ export class Engine {
 
   /** Apply a simulation snapshot to the GPU resources. */
   applySnapshot(s: any, realNow: number) {
-    (this.cloudTex.image.data as Uint8Array).set(s.cloud); this.cloudTex.needsUpdate = true;
-    (this.surfTex.image.data as Uint8Array).set(s.surf); this.surfTex.needsUpdate = true;
+    const cd = this.cloudTex.image.data as Uint8Array;
+    if (this.prevCloud && this.prevCloud.length === s.cloud.length && s.cloud.length === cd.length) {
+      // Temporal blend of consecutive solver snapshots (k=0.45 toward the new one): the
+      // cloud field then evolves continuously instead of jumping every 250 ms tick.
+      const k = 0.45, n = cd.length;
+      for (let i = 0; i < n; i++) cd[i] = this.prevCloud[i] * (1 - k) + s.cloud[i] * k;
+      this.prevCloud.set(cd);
+    } else {
+      cd.set(s.cloud);
+      if (!this.prevCloud || this.prevCloud.length !== cd.length) this.prevCloud = new Uint8Array(cd.length);
+      this.prevCloud.set(cd);
+    }
+    this.cloudTex.needsUpdate = true;
+    const sd = this.surfTex.image.data as Uint8Array;
+    if (this.prevSurf && this.prevSurf.length === s.surf.length && s.surf.length === sd.length) {
+      const k = 0.45, n = sd.length;
+      for (let i = 0; i < n; i++) sd[i] = this.prevSurf[i] * (1 - k) + s.surf[i] * k;
+      this.prevSurf.set(sd);
+    } else {
+      sd.set(s.surf);
+      if (!this.prevSurf || this.prevSurf.length !== sd.length) this.prevSurf = new Uint8Array(sd.length);
+      this.prevSurf.set(sd);
+    }
+    this.surfTex.needsUpdate = true;
     const dtr = Math.max(0.03, realNow - this.offT);
     for (let i = 0; i < 32; i++) {
       // Keep offCur *continuous*: choose the equivalent target nearest the current value.
@@ -1293,7 +1319,7 @@ export class Engine {
     if (!this.adaptive) { this.lowTimer = 0; this.highTimer = 0; }
     const uMax = this.cloudMat.uniforms.uMaxSteps;
     const stepCap = Math.max(24, Math.round(this.q.steps * (1 - 0.15 * this.stormLoad)));
-    if (uMax.value > stepCap) uMax.value = stepCap;
+    if (this.maxStepsSm > stepCap) this.maxStepsSm = stepCap;
     const stepFloor = Math.max(16, Math.floor(stepCap * 0.65));
     // A degrade step may run at most every 4.5 s; an upgrade only after 10 s of headroom
     // AND at most every 14 s — and every action starts a fresh cooldown. This breaks the
@@ -1311,7 +1337,7 @@ export class Engine {
       } else {
         this.cheapMode = true;
         this.dynStep = Math.max(this.dynStep, 2.0);
-        uMax.value = Math.min(uMax.value, stepFloor);
+        this.maxStepsSm = Math.min(this.maxStepsSm, stepFloor);
         this.lowTimer = 0;
         this.lastAdaptAct = nowMs;
       }
@@ -1322,7 +1348,7 @@ export class Engine {
       this.lastSpike = nowMs;
       this.cheapMode = true;
       this.dynStep = Math.min(3.2, this.dynStep + 0.5);
-      uMax.value = Math.max(16, uMax.value - 8);
+      this.maxStepsSm = Math.max(16, this.maxStepsSm - 8);
       if (this.cloudScale > this.q.minCloudScale) {
         this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.08);
         this.rebuildCloud();
@@ -1336,11 +1362,11 @@ export class Engine {
       // instead of shrinking the whole screen first (the old zero-profile fallback did that).
       const cloudBound = p.cloud > 0 ? p.cloud > p.scene * 1.15 : true;
       if (cloudBound) {
-        if (uMax.value > stepFloor) uMax.value = Math.max(stepFloor, uMax.value - 4);
+        if (this.maxStepsSm > stepFloor) this.maxStepsSm = Math.max(stepFloor, this.maxStepsSm - 4);
         else if (this.dynStep < 3.2) this.dynStep = Math.min(3.2, this.dynStep + 0.4);
         else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
       } else {
-        if (uMax.value > stepFloor) uMax.value = Math.max(stepFloor, uMax.value - 4);
+        if (this.maxStepsSm > stepFloor) this.maxStepsSm = Math.max(stepFloor, this.maxStepsSm - 4);
         else if (this.prScale > 0.4) { this.prScale = Math.max(0.4, this.prScale - 0.12); this.resize(this.cssW, this.cssH); }
         else if (this.cloudScale > this.q.minCloudScale) { this.cloudScale = Math.max(this.q.minCloudScale, this.cloudScale - 0.07); this.rebuildCloud(); }
       }
@@ -1349,14 +1375,21 @@ export class Engine {
     }
     if (this.highTimer > 10 && canUpgrade) {
       if (this.cheapMode) this.cheapMode = false;
-      else if (uMax.value < stepCap) uMax.value = Math.min(stepCap, uMax.value + 2);
+      else if (this.maxStepsSm < stepCap) this.maxStepsSm = Math.min(stepCap, this.maxStepsSm + 2);
       else if (this.cloudScale < this.q.cloudScale) { this.cloudScale = Math.min(this.q.cloudScale, this.cloudScale + 0.06); this.rebuildCloud(); }
       else if (this.dynStep > 1) this.dynStep = Math.max(1, this.dynStep - 0.15);
       else if (this.prScale < 1) { this.prScale = Math.min(1, this.prScale + 0.1); this.resize(this.cssW, this.cssH); }
       this.highTimer = 0;
       this.lastAdaptAct = nowMs; this.lastUpgrade = nowMs;
     }
-    this.cloudMat.uniforms.uStepScale.value = this.q.stepScale * Math.max(this.dynStep, 1 + 0.28 * this.stormLoad);
+    // EMA the march controls: instantaneous dynStep/stormLoad/uMaxSteps changes popped the
+    // step length and march budget, which read as brightness flicker during storms.
+    const stepTarget = this.q.stepScale * Math.max(this.dynStep, 1 + 0.28 * this.stormLoad);
+    this.stepScaleSm += (stepTarget - this.stepScaleSm) * Math.min(1, rawDt * 3);
+    this.cloudMat.uniforms.uStepScale.value = this.stepScaleSm;
+    const maxStepsTarget = Math.max(24, Math.round(this.q.steps * (1 - 0.15 * this.stormLoad)));
+    this.maxStepsSm += (Math.min(this.maxStepsSm, maxStepsTarget) - this.maxStepsSm) * Math.min(1, rawDt * 3);
+    uMax.value = this.maxStepsSm;
   }
   private rebuildCloud() {
     const pr = this.renderer.getPixelRatio();
@@ -1368,8 +1401,8 @@ export class Engine {
     this.frame = 0; this.denoise = 0;
     for (let i = 0; i < 32; i++) { this.offCur[i] = 0; this.offVel[i] = 0; }
     this.windDrift.set(0, 0); this.localWind.set(0, 0); this.windTarget.set(0, 0);
-    if (this.cloudTex) { (this.cloudTex.image.data as Uint8Array).fill(0); this.cloudTex.needsUpdate = true; }
-    if (this.surfTex) { (this.surfTex.image.data as Uint8Array).fill(0); this.surfTex.needsUpdate = true; }
+    if (this.cloudTex) { (this.cloudTex.image.data as Uint8Array).fill(0); this.cloudTex.needsUpdate = true; this.prevCloud = null; }
+    if (this.surfTex) { (this.surfTex.image.data as Uint8Array).fill(0); this.surfTex.needsUpdate = true; this.prevSurf = null; }
   }
   dispose() { this.fluid.dispose(); this.renderer.dispose(); }
 }
