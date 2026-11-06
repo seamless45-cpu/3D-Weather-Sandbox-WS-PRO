@@ -52,14 +52,13 @@ export interface ParamSpec {
 /** Single source of truth for the UI sliders (order = display order). */
 export const PARAM_SPECS: ParamSpec[] = [
   { key: 'cape', label: 'CAPE', unit: 'J/kg', min: 0, max: 12000, step: 50, decimals: 0, hint: 'surface instability: the fuel for convection' },
-  { key: 'lakeEvap', label: 'Lake evaporation', unit: '×', min: 0.1, max: 3, step: 0.05, decimals: 2, hint: 'moisture supplied by lakes and rivers' },
-  { key: 'landEvap', label: 'Land evaporation', unit: '×', min: 0.05, max: 3, step: 0.05, decimals: 2, hint: 'evapotranspiration from soil and vegetation' },
-  { key: 'dropletSpawn', label: 'Droplet spawn', unit: '×', min: 0.2, max: 4, step: 0.05, decimals: 2, hint: 'CCN concentration: more, smaller droplets → slower rain' },
-  { key: 'freezing', label: 'Freezing rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'supercooled water → ice / rain → graupel' },
-  { key: 'evaporation', label: 'Evaporation rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'rain evaporating below cloud base (cold pools, virga)' },
-  { key: 'precipEfficiency', label: 'Precip efficiency', unit: '×', min: 0.2, max: 3, step: 0.05, decimals: 2, hint: 'collision-coalescence, accretion and riming → heavier rain cores' },
-  { key: 'chargeRate', label: 'Charge separation', unit: '×', min: 0.1, max: 3, step: 0.05, decimals: 2, hint: 'mixed-phase charging, inductive charging and screening layers' },
-  { key: 'melting', label: 'Melting rate', unit: '×', min: 0.1, max: 4, step: 0.05, decimals: 2, hint: 'snow/graupel melting below the 0 °C level' },
+  { key: 'lakeEvap', label: 'Lake evaporation', unit: '×', min: 0.1, max: 12, step: 0.05, decimals: 2, hint: 'moisture supplied by lakes and rivers' },
+  { key: 'landEvap', label: 'Land evaporation', unit: '×', min: 0.05, max: 12, step: 0.05, decimals: 2, hint: 'evapotranspiration from soil and vegetation' },
+  { key: 'dropletSpawn', label: 'Droplet spawn', unit: '×', min: 0.2, max: 12, step: 0.05, decimals: 2, hint: 'CCN concentration: more, smaller droplets → slower rain' },
+  { key: 'freezing', label: 'Freezing rate', unit: '×', min: 0.1, max: 12, step: 0.05, decimals: 2, hint: 'supercooled water → ice / rain → graupel' },
+  { key: 'evaporation', label: 'Evaporation rate', unit: '×', min: 0.1, max: 12, step: 0.05, decimals: 2, hint: 'rain evaporating below cloud base (cold pools, virga)' },
+  { key: 'chargeRate', label: 'Charge separation', unit: '×', min: 0.1, max: 12, step: 0.05, decimals: 2, hint: 'mixed-phase charging, inductive charging and screening layers' },
+  { key: 'melting', label: 'Melting rate', unit: '×', min: 0.1, max: 12, step: 0.05, decimals: 2, hint: 'snow/graupel melting below the 0 °C level' },
   { key: 'precipTempC', label: 'Precipitation threshold', unit: '°C', min: -20, max: 20, step: 0.5, decimals: 1, hint: 'below this temperature precipitation falls as snow/hail' },
 ];
 
@@ -70,15 +69,15 @@ export function clampParams(p: Partial<SimParams>): SimParams {
   const d = DEFAULT_PARAMS;
   const num = (v: unknown, fb: number) => (typeof v === 'number' && isFinite(v) ? v : fb);
   return {
-    lakeEvap: clamp(num(p.lakeEvap, d.lakeEvap), 0.1, 3),
-    landEvap: clamp(num(p.landEvap, d.landEvap), 0.05, 3),
+    lakeEvap: clamp(num(p.lakeEvap, d.lakeEvap), 0.1, 12),
+    landEvap: clamp(num(p.landEvap, d.landEvap), 0.05, 12),
     cape: clamp(num(p.cape, d.cape), 0, 12000),
-    dropletSpawn: clamp(num(p.dropletSpawn, d.dropletSpawn), 0.2, 4),
-    freezing: clamp(num(p.freezing, d.freezing), 0.1, 4),
-    evaporation: clamp(num(p.evaporation, d.evaporation), 0.1, 4),
+    dropletSpawn: clamp(num(p.dropletSpawn, d.dropletSpawn), 0.2, 12),
+    freezing: clamp(num(p.freezing, d.freezing), 0.1, 12),
+    evaporation: clamp(num(p.evaporation, d.evaporation), 0.1, 12),
     precipEfficiency: clamp(num(p.precipEfficiency, d.precipEfficiency), 0.2, 6),
-    chargeRate: clamp(num(p.chargeRate, d.chargeRate), 0.1, 3),
-    melting: clamp(num(p.melting, d.melting), 0.1, 4),
+    chargeRate: clamp(num(p.chargeRate, d.chargeRate), 0.1, 12),
+    melting: clamp(num(p.melting, d.melting), 0.1, 12),
     precipTempC: clamp(num(p.precipTempC, d.precipTempC), -20, 20),
   };
 }

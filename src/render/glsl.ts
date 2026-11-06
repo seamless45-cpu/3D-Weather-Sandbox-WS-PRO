@@ -471,7 +471,10 @@ void main(){
   vec3 rel0 = mod(seed - cameraPosition + size * 0.5, size) - size * 0.5;
   float flake = smoothstep(uSnowLevel - 250.0, uSnowLevel + 500.0, cameraPosition.y + rel0.y);
   // Marshall-Palmer-ish size distribution: small drops drift more, big drops fall faster.
-  float fall = mix(4.0 + 7.0 * cls + rnd * 0.8, 0.9 + 0.9 * cls + rnd * 0.4, flake);
+  // Terminal velocity from drop diameter (Gunn–Kinzer fit): small drizzle ~2-4 m/s,
+  // large drops ~8-9 m/s — the old linear-in-class law made drizzle fall too fast.
+  float dmm = 0.7 + 2.6 * cls;
+  float fall = mix(9.65 * (1.0 - exp(-pow(dmm / 1.77, 1.4))) + rnd * 0.5, 0.9 + 0.9 * cls + rnd * 0.4, flake);
   float windResp = mix(1.35, 0.68, clamp(cls / 1.5, 0.0, 1.0));
   vec3 vel = vec3(uWind.x * windResp, -fall, uWind.y * windResp);   // for drop orientation only
   // Advection: horizontal drift comes from the integrated wind (constant per-drop response),
@@ -1485,39 +1488,42 @@ void main(){
 export const chargeVert = /* glsl */ `
 ${COMMON}
 attribute vec2 aQ;   // x = signed magnitude (sign * 0..1), y = phase
-varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW;
+varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW; varying float vDist;
 void main(){
   vSign = sign(aQ.x);
   vMag = clamp(abs(aQ.x), 0.0, 1.0);
   vPhase = aQ.y;
   vec4 mv = viewMatrix * vec4(position, 1.0);
   float dist = length(mv.xyz);
+  vDist = dist;
   // Gentle bob so the field reads as suspended charge, not a static decal.
   vec3 wp = position;
-  wp.y += sin(uTime * 1.3 + aQ.y * 6.2831) * 6.0;
+  wp.y += sin(uTime * 0.9 + aQ.y * 6.2831) * 3.0;
   vW = wp;
-  gl_PointSize = clamp((7.0 + 17.0 * vMag) * (1500.0 / max(dist, 1.0)), 3.0, 90.0);
+  gl_PointSize = clamp((5.0 + 15.0 * vMag) * (1500.0 / max(dist, 1.0)), 2.0, 70.0);
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`;
 
 export const chargeFrag = /* glsl */ `
 ${COMMON}
-varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW;
+varying float vSign; varying float vMag; varying float vPhase; varying vec3 vW; varying float vDist;
 void main(){
   vec2 q = gl_PointCoord * 2.0 - 1.0;
-  float aa = 0.12;
-  // '+' = horizontal AND vertical bars, '−' = horizontal bar only.
-  float barH = (1.0 - smoothstep(0.14 - aa, 0.14 + aa, abs(q.y))) * (1.0 - smoothstep(0.58 - aa, 0.58 + aa, abs(q.x)));
-  float barV = (1.0 - smoothstep(0.14 - aa, 0.14 + aa, abs(q.x))) * (1.0 - smoothstep(0.58 - aa, 0.58 + aa, abs(q.y)));
-  float glyph = vSign > 0.0 ? max(barH, barV) : barH;
-  float glow = exp(-dot(q, q) * 2.6) * 0.30;
-  float tw = 0.78 + 0.22 * sin(uTime * 2.4 + vPhase * 6.2831);
-  vec3 pos = vec3(1.0, 0.30, 0.24);
-  vec3 neg = vec3(0.30, 0.62, 1.0);
+  float r2 = dot(q, q);
+  if (r2 > 1.0) discard;
+  // Soft glow + tight core: charge pockets are diffuse volumes, not hard ± glyphs. The old
+  // glyph bars aliased into white grain speckle over the whole sky when viewed from below.
+  float glow = exp(-r2 * 3.2);
+  float core = exp(-r2 * 14.0);
+  float tw = 0.88 + 0.12 * sin(uTime * 1.1 + vPhase * 6.2831);
+  vec3 pos = vec3(1.0, 0.34, 0.22);
+  vec3 neg = vec3(0.35, 0.62, 1.0);
   vec3 col = mix(neg, pos, step(0.0, vSign));
-  col = mix(col, vec3(1.0), glyph * 0.65);
+  col = mix(col, vec3(1.0), core * 0.35 * step(0.45, vMag));   // only strong cores whiten slightly
   if (uFlashOn > 0.5) col += flashLight(vW, vec3(0.0, 1.0, 0.0)) * 0.2;
-  float a = (glyph * 0.95 + glow) * (0.35 + 0.65 * vMag) * tw;
+  float a = (glow * 0.55 + core * 0.45) * (0.25 + 0.75 * vMag) * tw;
+  // Distance fades: no point-sprite popping near the lens or glittering at the domain edge.
+  a *= smoothstep(250.0, 900.0, vDist) * (1.0 - smoothstep(28000.0, 44000.0, vDist));
   if (a < 0.02) discard;
   gl_FragColor = vec4(col, a);
 }`;
